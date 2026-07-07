@@ -470,11 +470,11 @@ __global__ static void indexed_attention_cache_f32_kernel(
         const float *cache_k,
         const float *cache_v,
         const int64_t *indices,
+        const int *index_count,
         float *out_tokens,
         int Hq,
         int Hkv,
         int Tq,
-        int Nkv,
         int Tk,
         int D,
         float scale) {
@@ -486,6 +486,9 @@ __global__ static void indexed_attention_cache_f32_kernel(
     int hq = row / Tq;
     int group = Hq / Hkv;
     int hk = hq / group;
+    int Nkv = *index_count;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
 
     const float *qrow = q + (((int64_t)hq * Tq + tq) * D);
     const float *kbase = cache_k + (int64_t)hk * Tk * D;
@@ -2442,11 +2445,9 @@ extern "C" int world_cuda_transformer_probe(
                 collect_cache_indices_kernel<<<1, 1>>>(
                     cache->mask_written, cache->indices, cache->index_count, cache->capacity);
                 TRY_CUDA2(cudaGetLastError());
-                int h_index_count = 0;
-                TRY_CUDA2(cudaMemcpy(&h_index_count, cache->index_count, sizeof(int), cudaMemcpyDeviceToHost));
                 indexed_attention_cache_f32_kernel<<<cfg->n_heads * T, 256>>>(
-                    d_q, cache->k, cache->v, cache->indices, d_attn,
-                    cfg->n_heads, cfg->n_kv_heads, T, h_index_count, cache->capacity, d_head,
+                    d_q, cache->k, cache->v, cache->indices, cache->index_count, d_attn,
+                    cfg->n_heads, cfg->n_kv_heads, T, cache->capacity, d_head,
                     1.0f / sqrtf((float)d_head));
             }
             TRY_CUDA2(cudaGetLastError());

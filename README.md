@@ -154,6 +154,9 @@ Notes:
 - Controller conditioning vectors are projected once per generated frame for
   each control-conditioned layer, then reused across all scheduler and cache
   passes for that frame.
+- Indexed cache attention now consumes the cache index count directly from GPU
+  memory, avoiding a per-layer host round trip between index collection and
+  attention launch.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across
