@@ -99,8 +99,9 @@ The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the PyTorch controller layout
 `[mouse_x, mouse_y, buttons..., scroll]`, using Owl-Control/Windows virtual key
 codes for the button indices. CUDA generation runs on a worker thread while the
-raylib main thread keeps polling input and presenting the latest decoded frame
-from each generated chunk.
+raylib main thread keeps polling input. When a new decoded chunk arrives, the
+frontend presents its frames once in order and then holds on the last frame until
+the next chunk arrives.
 
 Run the current standalone image probe:
 

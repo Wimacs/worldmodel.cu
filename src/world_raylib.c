@@ -285,6 +285,11 @@ static int ray_write_ppm_frames(const char *path, const unsigned char *rgb, int 
     return 0;
 }
 
+static float playback_interval_seconds(float generation_seconds, int frames) {
+    if (frames <= 0 || generation_seconds <= 0.0f) return 1.0f / 60.0f;
+    return generation_seconds / (float)frames;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
@@ -510,6 +515,9 @@ int main(int argc, char **argv) {
 
     float last_generation_seconds = warm_seconds;
     int chunk_id = 0;
+    int playback_frame = rgb_frames - 1;
+    float playback_timer = 0.0f;
+    float playback_interval = playback_interval_seconds(warm_seconds, rgb_frames);
     float *frame_control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
     if (!frame_control) {
         pthread_mutex_lock(&shared.mutex);
@@ -528,13 +536,32 @@ int main(int argc, char **argv) {
             last_generation_seconds = shared.generation_seconds;
             chunk_id = shared.produced_chunks;
             shared.ready = 0;
-            UpdateTexture(texture, display_rgb + (size_t)(rgb_frames - 1) * frame_bytes);
+            playback_frame = 0;
+            playback_timer = 0.0f;
+            playback_interval = playback_interval_seconds(last_generation_seconds, rgb_frames);
+            UpdateTexture(texture, display_rgb);
         }
         pthread_mutex_unlock(&shared.mutex);
         if (failed) break;
 
+        if (playback_frame < rgb_frames - 1) {
+            playback_timer += GetFrameTime();
+            if (playback_timer >= playback_interval) {
+                int advance = (int)(playback_timer / playback_interval);
+                playback_timer -= (float)advance * playback_interval;
+                playback_frame += advance;
+                if (playback_frame >= rgb_frames - 1) {
+                    playback_frame = rgb_frames - 1;
+                    playback_timer = 0.0f;
+                }
+                UpdateTexture(texture, display_rgb + (size_t)playback_frame * frame_bytes);
+            }
+        }
+
         char title[256];
-        snprintf(title, sizeof(title), "worldmodel.cu | latest chunk %d | gen %.2fs | %.2f rgb fps", chunk_id, last_generation_seconds, rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
+        snprintf(title, sizeof(title), "worldmodel.cu | chunk %d | frame %d/%d | gen %.2fs | %.2f rgb fps",
+                 chunk_id, playback_frame + 1, rgb_frames, last_generation_seconds,
+                 rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
         SetWindowTitle(title);
 
         BeginDrawing();
