@@ -144,7 +144,10 @@ Notes:
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
-- `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
+- In the standalone transformer path, each layer's Q/K/V projection weights are
+  copied to GPU as one resident concatenated matrix, so QKV projection is one
+  cuBLAS GEMM before `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World
+  OrthoRoPE, and V layout.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across

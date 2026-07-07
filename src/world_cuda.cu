@@ -251,6 +251,80 @@ __global__ static void qkv_separate_rms_rope_f32_kernel(
     }
 }
 
+__global__ static void qkv_fused_rms_rope_f32_kernel(
+        const float *qkv_raw,
+        float *q,
+        float *k,
+        float *v,
+        const int64_t *x_pos,
+        const int64_t *y_pos,
+        const int64_t *t_pos,
+        const float *xy,
+        const float *inv_t,
+        int T,
+        int n_heads,
+        int n_kv_heads,
+        int d_head,
+        int width,
+        int height,
+        float eps) {
+    extern __shared__ float sh[];
+    float *vals = sh;
+    float *red = sh + d_head;
+
+    int t = blockIdx.x;
+    int role = blockIdx.y;
+    int tid = threadIdx.x;
+    int q_dim = n_heads * d_head;
+    int kv_dim = n_kv_heads * d_head;
+    int qkv_dim = q_dim + 2 * kv_dim;
+    int half = d_head / 2;
+    int d_xy = d_head / 8;
+    const float *row = qkv_raw + (int64_t)t * qkv_dim;
+
+    if (role < n_heads + n_kv_heads) {
+        int is_k = role >= n_heads;
+        int h = is_k ? role - n_heads : role;
+        const float *src = is_k ? row + q_dim + h * d_head : row + h * d_head;
+
+        float sum = 0.0f;
+        for (int d = tid; d < d_head; d += blockDim.x) {
+            float z = src[d];
+            vals[d] = z;
+            sum += z * z;
+        }
+        red[tid] = sum;
+        __syncthreads();
+
+        for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+            if (tid < step) red[tid] += red[tid + step];
+            __syncthreads();
+        }
+
+        float inv = rsqrtf(red[0] / (float)d_head + eps);
+        float *dst = is_k
+            ? k + (((int64_t)h * T + t) * d_head)
+            : q + (((int64_t)h * T + t) * d_head);
+
+        for (int p = tid; p < half; p += blockDim.x) {
+            float phase = wm_rope_phase(p, x_pos[t], y_pos[t], t_pos[t], xy, inv_t, width, height, d_xy);
+            float c = cosf(phase);
+            float s = sinf(phase);
+            float a = vals[2 * p] * inv;
+            float b = vals[2 * p + 1] * inv;
+            dst[p] = a * c - b * s;
+            dst[half + p] = b * c + a * s;
+        }
+    } else {
+        int h = role - n_heads - n_kv_heads;
+        const float *src = row + q_dim + kv_dim + h * d_head;
+        float *dst = v + (((int64_t)h * T + t) * d_head);
+        for (int d = tid; d < d_head; d += blockDim.x) {
+            dst[d] = src[d];
+        }
+    }
+}
+
 __global__ static void current_frame_attention_f32_kernel(
         const float *q,
         const float *k,
@@ -859,9 +933,7 @@ typedef struct {
     float *attn_cond_s_weight;
     float *attn_cond_b_weight;
     float *attn_cond_g_weight;
-    float *q_proj_weight;
-    float *k_proj_weight;
-    float *v_proj_weight;
+    float *qkv_proj_weight;
     float *out_proj_weight;
     float v_lamb;
     float *mlp_cond_s_weight;
@@ -900,9 +972,7 @@ static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_laye
         cudaFree(layers[i].attn_cond_s_weight);
         cudaFree(layers[i].attn_cond_b_weight);
         cudaFree(layers[i].attn_cond_g_weight);
-        cudaFree(layers[i].q_proj_weight);
-        cudaFree(layers[i].k_proj_weight);
-        cudaFree(layers[i].v_proj_weight);
+        cudaFree(layers[i].qkv_proj_weight);
         cudaFree(layers[i].out_proj_weight);
         cudaFree(layers[i].mlp_cond_s_weight);
         cudaFree(layers[i].mlp_cond_b_weight);
@@ -973,6 +1043,24 @@ fail:
     return 1;
 }
 
+static int copy_qkv_proj_to_device(float **dst, const WorldLayerWeights *src, int D, int kv_dim) {
+    *dst = NULL;
+    size_t q_elems = (size_t)D * D;
+    size_t kv_elems = (size_t)kv_dim * D;
+    size_t total = q_elems + 2 * kv_elems;
+    float *host = (float *)malloc(total * sizeof(float));
+    if (!host) {
+        fprintf(stderr, "failed to allocate fused QKV host weight\n");
+        return 1;
+    }
+    memcpy(host, src->q_proj_weight, q_elems * sizeof(float));
+    memcpy(host + q_elems, src->k_proj_weight, kv_elems * sizeof(float));
+    memcpy(host + q_elems + kv_elems, src->v_proj_weight, kv_elems * sizeof(float));
+    int rc = copy_f32_to_device(dst, host, total);
+    free(host);
+    return rc;
+}
+
 static int copy_world_layers_to_device(
         DeviceWorldLayerWeights **dst_layers,
         const WorldLayerWeights *src_layers,
@@ -996,9 +1084,7 @@ static int copy_world_layers_to_device(
         if (copy_f32_to_device(&dl->mlp_cond_s_weight, src->mlp_cond_s_weight, (size_t)D * D)) goto fail;
         if (copy_f32_to_device(&dl->mlp_cond_b_weight, src->mlp_cond_b_weight, (size_t)D * D)) goto fail;
         if (copy_f32_to_device(&dl->mlp_cond_g_weight, src->mlp_cond_g_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->q_proj_weight, src->q_proj_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->k_proj_weight, src->k_proj_weight, (size_t)kv_dim * D)) goto fail;
-        if (copy_f32_to_device(&dl->v_proj_weight, src->v_proj_weight, (size_t)kv_dim * D)) goto fail;
+        if (copy_qkv_proj_to_device(&dl->qkv_proj_weight, src, D, kv_dim)) goto fail;
         if (copy_f32_to_device(&dl->out_proj_weight, src->out_proj_weight, (size_t)D * D)) goto fail;
         if (src->has_ctrl) {
             if (copy_f32_to_device(&dl->ctrl_fc1_x_weight, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
@@ -2073,6 +2159,7 @@ extern "C" int world_cuda_transformer_probe(
     size_t patch_weight_elems = (size_t)D * C * ph * pw;
     size_t token_elems = (size_t)T * D;
     size_t kv_token_elems = (size_t)T * kv_dim;
+    size_t qkv_token_elems = token_elems + 2 * kv_token_elems;
     size_t q_rope_elems = (size_t)cfg->n_heads * T * d_head;
     size_t kv_rope_elems = (size_t)cfg->n_kv_heads * T * d_head;
     size_t out_norm_weight_elems = (size_t)2 * D * D;
@@ -2133,9 +2220,7 @@ extern "C" int world_cuda_transformer_probe(
     float *d_g1 = NULL;
     float *d_tokens = NULL;
     float *d_norm = NULL;
-    float *d_q_raw = NULL;
-    float *d_k_raw = NULL;
-    float *d_v_raw = NULL;
+    float *d_qkv_raw = NULL;
     float *d_q = NULL;
     float *d_k = NULL;
     float *d_v = NULL;
@@ -2202,9 +2287,7 @@ extern "C" int world_cuda_transformer_probe(
     TRY_CUDA2(cudaMalloc((void **)&d_g1, (size_t)D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_tokens, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_norm, token_elems * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_q_raw, token_elems * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_k_raw, kv_token_elems * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_v_raw, kv_token_elems * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_qkv_raw, qkv_token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_q, q_rope_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_k, kv_rope_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_v, kv_rope_elems * sizeof(float)));
@@ -2317,15 +2400,13 @@ extern "C" int world_cuda_transformer_probe(
 
             ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens, d_s0, d_b0, d_norm, T, D, 1.0e-6f);
             TRY_CUDA2(cudaGetLastError());
-            TRY_LINEAR2(d_norm, lw->q_proj_weight, d_q_raw, T, D, D);
-            TRY_LINEAR2(d_norm, lw->k_proj_weight, d_k_raw, T, D, kv_dim);
-            TRY_LINEAR2(d_norm, lw->v_proj_weight, d_v_raw, T, D, kv_dim);
+            TRY_LINEAR2(d_norm, lw->qkv_proj_weight, d_qkv_raw, T, D, D + 2 * kv_dim);
 
             {
                 dim3 grid(T, cfg->n_heads + 2 * cfg->n_kv_heads);
                 size_t smem = (size_t)(d_head + 256) * sizeof(float);
-                qkv_separate_rms_rope_f32_kernel<<<grid, 256, smem>>>(
-                    d_q_raw, d_k_raw, d_v_raw,
+                qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
+                    d_qkv_raw,
                     d_q, d_k, d_v,
                     d_x_pos, d_y_pos, d_t_pos, d_xy_table, d_inv_t,
                     T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, 1.0e-6f);
@@ -2476,9 +2557,7 @@ cleanup_device:
     cudaFree(d_g1);
     cudaFree(d_tokens);
     cudaFree(d_norm);
-    cudaFree(d_q_raw);
-    cudaFree(d_k_raw);
-    cudaFree(d_v_raw);
+    cudaFree(d_qkv_raw);
     cudaFree(d_q);
     cudaFree(d_k);
     cudaFree(d_v);
