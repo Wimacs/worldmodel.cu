@@ -622,8 +622,16 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
     with tempfile.TemporaryDirectory(prefix="world_rollout2_probe_") as td:
         prefix = str(Path(td) / "dump")
         control_np = _control_vector(cfg)
-        control_path = Path(td) / "control.f32"
-        control_np.tofile(control_path)
+        idx_np = np.arange(control_np.size, dtype=np.float32)
+        control_seq_np = np.stack(
+            [
+                control_np,
+                (-0.35 * control_np + 0.08 * np.sin(idx_np * 0.11)).astype(np.float32),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        control_path = Path(td) / "control_seq.f32"
+        control_seq_np.tofile(control_path)
         subprocess.run(
             [
                 str(exe),
@@ -642,7 +650,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 "--frame-idx",
                 str(start_frame_idx),
                 "--cache-pass",
-                "--control",
+                "--control-seq",
                 str(control_path),
                 "--dump-prefix",
                 prefix,
@@ -701,12 +709,15 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 )
         state = _load_required_tensors(names, device)
 
-        control = torch.from_numpy(control_np).to(device).view(1, 1, -1)
-        ctrl_emb = F.linear(
-            F.silu(F.linear(control, state["ctrl_emb.mlp.fc1.weight"])),
-            state["ctrl_emb.mlp.fc2.weight"],
-        ).reshape(d_model)
-        ctrl_norm = F.rms_norm(ctrl_emb, (d_model,), eps=1.0e-6)
+        control_seq = torch.from_numpy(control_seq_np).to(device)
+        ctrl_norms = []
+        for frame_ordinal in range(frames):
+            control = control_seq[frame_ordinal].view(1, 1, -1)
+            ctrl_emb = F.linear(
+                F.silu(F.linear(control, state["ctrl_emb.mlp.fc1.weight"])),
+                state["ctrl_emb.mlp.fc2.weight"],
+            ).reshape(d_model)
+            ctrl_norms.append(F.rms_norm(ctrl_emb, (d_model,), eps=1.0e-6))
 
         idx = torch.arange(tpf, device=device, dtype=torch.long)
         y_pos = idx.div(width, rounding_mode="floor").contiguous()
@@ -730,7 +741,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
             pinned = int(cfg["global_pinned_dilation"] if is_global else 1)
             caches.append((cache_k, cache_v, written, ring_length, pinned))
 
-        def run_reference(latent, step_sigma, current_frame_idx, frozen, emit_velocity):
+        def run_reference(latent, step_sigma, frame_ordinal, current_frame_idx, frozen, emit_velocity):
             cond = F.linear(
                 F.silu(F.linear(_noise_embedding(step_sigma, device), state["denoise_step_emb.mlp.fc1.weight"])),
                 state["denoise_step_emb.mlp.fc2.weight"],
@@ -794,7 +805,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
 
                 if f"{p}.ctrl_mlpfusion.fc1_x.weight" in state:
                     ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=1.0e-6), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
-                    ctrl_hidden = ctrl_hidden + F.linear(ctrl_norm, state[f"{p}.ctrl_mlpfusion.fc1_c.weight"])
+                    ctrl_hidden = ctrl_hidden + F.linear(ctrl_norms[frame_ordinal], state[f"{p}.ctrl_mlpfusion.fc1_c.weight"])
                     tokens = tokens + F.linear(F.silu(ctrl_hidden), state[f"{p}.ctrl_mlpfusion.fc2.weight"])
 
                 mlp_in = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
@@ -822,8 +833,10 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
         for frame_ordinal in range(frames):
             current_frame_idx = start_frame_idx + frame_ordinal
             latent = torch.from_numpy(_lcg_latent((1, c, h, w), seed + frame_ordinal)).to(device)
-            final_tokens, final_latent_out, final_latent = run_reference(latent, sigma, current_frame_idx, True, True)
-            run_reference(final_latent[None], 0.0, current_frame_idx, False, False)
+            final_tokens, final_latent_out, final_latent = run_reference(
+                latent, sigma, frame_ordinal, current_frame_idx, True, True
+            )
+            run_reference(final_latent[None], 0.0, frame_ordinal, current_frame_idx, False, False)
 
         _assert_close(
             "rollout_transformer_tokens",

@@ -2164,21 +2164,24 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_world_layers_to_device(&d_layers, weights->layers, layers_to_run, D, kv_dim, mlp_hidden)) goto cleanup_device;
     if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head)) goto cleanup_device;
 
-    TRY_CUDA2(cudaMemcpy(d_control_input, weights->control_input, (size_t)ctrl_dim * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_xy_table, h_xy, (size_t)d_xy * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_inv_t, h_inv_t, (size_t)d_t * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUBLAS2(cublasCreate(&handle));
 
-    TRY_LINEAR2(d_control_input, d_ctrl_emb_fc1_w, d_ctrl_emb_hidden, 1, ctrl_dim, mlp_hidden);
-    silu_f32_kernel<<<div_up_i64(mlp_hidden, 256), 256>>>(d_ctrl_emb_hidden, d_ctrl_emb_hidden, mlp_hidden);
-    TRY_CUDA2(cudaGetLastError());
-    TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
-    rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
-    TRY_CUDA2(cudaGetLastError());
-
     for (int frame_ordinal = 0; frame_ordinal < frames_to_run; ++frame_ordinal) {
         int current_frame_idx = frame_idx + frame_ordinal;
         int frame_timestamp = current_frame_idx * frame_stride;
+        TRY_CUDA2(cudaMemcpy(
+            d_control_input,
+            weights->control_inputs + (size_t)frame_ordinal * ctrl_dim,
+            (size_t)ctrl_dim * sizeof(float),
+            cudaMemcpyHostToDevice));
+        TRY_LINEAR2(d_control_input, d_ctrl_emb_fc1_w, d_ctrl_emb_hidden, 1, ctrl_dim, mlp_hidden);
+        silu_f32_kernel<<<div_up_i64(mlp_hidden, 256), 256>>>(d_ctrl_emb_hidden, d_ctrl_emb_hidden, mlp_hidden);
+        TRY_CUDA2(cudaGetLastError());
+        TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
+        rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
+        TRY_CUDA2(cudaGetLastError());
         fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal);
         fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
         TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));

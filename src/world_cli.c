@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -248,6 +248,7 @@ int main(int argc, char **argv) {
     const char *weights = NULL;
     const char *vae_weights = NULL;
     const char *control_path = NULL;
+    const char *control_seq_path = NULL;
     const char *dump_prefix = NULL;
     const char *out_path = NULL;
     unsigned int seed = 1234;
@@ -267,6 +268,8 @@ int main(int argc, char **argv) {
             vae_weights = argv[++i];
         } else if (strcmp(argv[i], "--control") == 0 && i + 1 < argc) {
             control_path = argv[++i];
+        } else if (strcmp(argv[i], "--control-seq") == 0 && i + 1 < argc) {
+            control_seq_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
@@ -337,6 +340,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid --frame-idx %d, expected >= 0\n", frame_idx);
         return 1;
     }
+    if (control_path && control_seq_path) {
+        fprintf(stderr, "--control and --control-seq are mutually exclusive\n");
+        return 1;
+    }
     if (frames_to_run > 1 && !cache_pass) {
         fprintf(stderr, "--frames %d: enabling --cache-pass so generated frame history persists in KV cache\n", frames_to_run);
         cache_pass = 1;
@@ -368,7 +375,7 @@ int main(int argc, char **argv) {
     float *denoise_fc2_weight = NULL;
     float *ctrl_emb_fc1_weight = NULL;
     float *ctrl_emb_fc2_weight = NULL;
-    float *control_input = NULL;
+    float *control_inputs = NULL;
     float *out_norm_fc_weight = NULL;
     float *unpatchify_weight = NULL;
     float *unpatchify_bias = NULL;
@@ -397,12 +404,26 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    if (control_path) {
-        if (read_f32_file_exact(control_path, (size_t)ctrl_dim, &control_input)) goto cleanup;
+    size_t control_elems = (size_t)frames_to_run * (size_t)ctrl_dim;
+    if (control_seq_path) {
+        if (read_f32_file_exact(control_seq_path, control_elems, &control_inputs)) goto cleanup;
+    } else if (control_path) {
+        float *control_one = NULL;
+        if (read_f32_file_exact(control_path, (size_t)ctrl_dim, &control_one)) goto cleanup;
+        control_inputs = (float *)malloc(control_elems * sizeof(float));
+        if (!control_inputs) {
+            fprintf(stderr, "failed to allocate broadcast control input\n");
+            free(control_one);
+            goto cleanup;
+        }
+        for (int frame = 0; frame < frames_to_run; ++frame) {
+            memcpy(control_inputs + (size_t)frame * ctrl_dim, control_one, (size_t)ctrl_dim * sizeof(float));
+        }
+        free(control_one);
     } else {
-        control_input = (float *)calloc((size_t)ctrl_dim, sizeof(float));
-        if (!control_input) {
-            fprintf(stderr, "failed to allocate zero control input\n");
+        control_inputs = (float *)calloc(control_elems, sizeof(float));
+        if (!control_inputs) {
+            fprintf(stderr, "failed to allocate zero control inputs\n");
             goto cleanup;
         }
     }
@@ -465,7 +486,7 @@ int main(int argc, char **argv) {
             denoise_fc2_weight,
             ctrl_emb_fc1_weight,
             ctrl_emb_fc2_weight,
-            control_input,
+            control_inputs,
             layers,
             layers_to_run,
             out_norm_fc_weight,
@@ -531,7 +552,7 @@ int main(int argc, char **argv) {
         denoise_fc2_weight,
         ctrl_emb_fc1_weight,
         ctrl_emb_fc2_weight,
-        control_input,
+        control_inputs,
         layer0_cond_bias,
         layer0_attn_cond_s_weight,
         layer0_attn_cond_b_weight,
@@ -557,7 +578,7 @@ cleanup:
     free(denoise_fc2_weight);
     free(ctrl_emb_fc1_weight);
     free(ctrl_emb_fc2_weight);
-    free(control_input);
+    free(control_inputs);
     free(out_norm_fc_weight);
     free(unpatchify_weight);
     free(unpatchify_bias);

@@ -42,11 +42,14 @@ cmake --build build -j
 Run the current standalone image probe:
 
 ```sh
-./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frames 2 --frame-idx 3 --cache-pass --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
+./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frames 2 --frame-idx 3 --cache-pass --control-seq controls_seq.f32 --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
 Pass `--control controls.f32` to provide one little-endian float32 controller
-vector of length `n_buttons + 3`; if omitted, the executable uses zeros.
+vector of length `n_buttons + 3`; it is broadcast to every generated frame. Pass
+`--control-seq controls_seq.f32` to provide `frames * (n_buttons + 3)` float32
+values, one controller vector per generated latent frame. If omitted, the
+executable uses zeros.
 Pass `--frame-idx N` to set the temporal RoPE position and per-layer cache
 bucket for the first generated latent frame. Pass `--frames N` to generate N
 latent frames in one process while keeping the per-layer KV caches alive between
@@ -123,7 +126,9 @@ Notes:
   `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
   conversion, TAEHV direct conv/MemBlock/TGrow/upsample decode, pixel shuffle,
-  and 4-frame PPM output.
+  and 4-frame PPM output. Multi-frame standalone rollout recomputes the
+  controller embedding from the current frame's control vector before each
+  denoise/cache pass pair.
   `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
   two-layer transformer + latent output + one-step scheduler update + VAE PPM
   decode path against PyTorch reference math for all 4 decoded frames.

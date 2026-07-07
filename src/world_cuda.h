@@ -112,7 +112,7 @@ typedef struct {
     const float *denoise_fc2_weight;
     const float *ctrl_emb_fc1_weight;
     const float *ctrl_emb_fc2_weight;
-    const float *control_input;
+    const float *control_inputs;
     const WorldLayerWeights *layers;
     int n_layers;
     const float *out_norm_fc_weight;
