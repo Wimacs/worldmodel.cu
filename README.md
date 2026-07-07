@@ -148,6 +148,9 @@ Notes:
   copied to GPU as one resident concatenated matrix, so QKV projection is one
   cuBLAS GEMM before `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World
   OrthoRoPE, and V layout.
+- The standalone layer conditioning heads also keep the six attention/MLP
+  scale-bias-gate projection matrices as one resident GPU matrix, reducing the
+  per-layer conditioning projection from six cuBLAS GEMMs to one.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across

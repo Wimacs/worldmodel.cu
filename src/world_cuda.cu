@@ -930,15 +930,10 @@ static int copy_f32_to_device(float **dst, const float *src, size_t n) {
 
 typedef struct {
     float *cond_bias;
-    float *attn_cond_s_weight;
-    float *attn_cond_b_weight;
-    float *attn_cond_g_weight;
+    float *cond_proj_weight;
     float *qkv_proj_weight;
     float *out_proj_weight;
     float v_lamb;
-    float *mlp_cond_s_weight;
-    float *mlp_cond_b_weight;
-    float *mlp_cond_g_weight;
     float *ctrl_fc1_x_weight;
     float *ctrl_fc1_c_weight;
     float *ctrl_fc2_weight;
@@ -969,14 +964,9 @@ static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_laye
     if (!layers) return;
     for (int i = 0; i < n_layers; ++i) {
         cudaFree(layers[i].cond_bias);
-        cudaFree(layers[i].attn_cond_s_weight);
-        cudaFree(layers[i].attn_cond_b_weight);
-        cudaFree(layers[i].attn_cond_g_weight);
+        cudaFree(layers[i].cond_proj_weight);
         cudaFree(layers[i].qkv_proj_weight);
         cudaFree(layers[i].out_proj_weight);
-        cudaFree(layers[i].mlp_cond_s_weight);
-        cudaFree(layers[i].mlp_cond_b_weight);
-        cudaFree(layers[i].mlp_cond_g_weight);
         cudaFree(layers[i].ctrl_fc1_x_weight);
         cudaFree(layers[i].ctrl_fc1_c_weight);
         cudaFree(layers[i].ctrl_fc2_weight);
@@ -1043,6 +1033,26 @@ fail:
     return 1;
 }
 
+static int copy_cond_proj_to_device(float **dst, const WorldLayerWeights *src, int D) {
+    *dst = NULL;
+    size_t block = (size_t)D * D;
+    size_t total = 6 * block;
+    float *host = (float *)malloc(total * sizeof(float));
+    if (!host) {
+        fprintf(stderr, "failed to allocate fused cond projection host weight\n");
+        return 1;
+    }
+    memcpy(host + 0 * block, src->attn_cond_s_weight, block * sizeof(float));
+    memcpy(host + 1 * block, src->attn_cond_b_weight, block * sizeof(float));
+    memcpy(host + 2 * block, src->attn_cond_g_weight, block * sizeof(float));
+    memcpy(host + 3 * block, src->mlp_cond_s_weight, block * sizeof(float));
+    memcpy(host + 4 * block, src->mlp_cond_b_weight, block * sizeof(float));
+    memcpy(host + 5 * block, src->mlp_cond_g_weight, block * sizeof(float));
+    int rc = copy_f32_to_device(dst, host, total);
+    free(host);
+    return rc;
+}
+
 static int copy_qkv_proj_to_device(float **dst, const WorldLayerWeights *src, int D, int kv_dim) {
     *dst = NULL;
     size_t q_elems = (size_t)D * D;
@@ -1078,12 +1088,7 @@ static int copy_world_layers_to_device(
         dl->has_ctrl = src->has_ctrl;
         dl->v_lamb = src->v_lamb ? src->v_lamb[0] : 0.0f;
         if (copy_f32_to_device(&dl->cond_bias, src->cond_bias, (size_t)D)) goto fail;
-        if (copy_f32_to_device(&dl->attn_cond_s_weight, src->attn_cond_s_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->attn_cond_b_weight, src->attn_cond_b_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->attn_cond_g_weight, src->attn_cond_g_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->mlp_cond_s_weight, src->mlp_cond_s_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->mlp_cond_b_weight, src->mlp_cond_b_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_device(&dl->mlp_cond_g_weight, src->mlp_cond_g_weight, (size_t)D * D)) goto fail;
+        if (copy_cond_proj_to_device(&dl->cond_proj_weight, src, D)) goto fail;
         if (copy_qkv_proj_to_device(&dl->qkv_proj_weight, src, D, kv_dim)) goto fail;
         if (copy_f32_to_device(&dl->out_proj_weight, src->out_proj_weight, (size_t)D * D)) goto fail;
         if (src->has_ctrl) {
@@ -2212,12 +2217,7 @@ extern "C" int world_cuda_transformer_probe(
     float *d_unpatch_w = NULL;
     float *d_unpatch_b = NULL;
     float *d_latent_out = NULL;
-    float *d_s0 = NULL;
-    float *d_b0 = NULL;
-    float *d_g0 = NULL;
-    float *d_s1 = NULL;
-    float *d_b1 = NULL;
-    float *d_g1 = NULL;
+    float *d_layer_mod = NULL;
     float *d_tokens = NULL;
     float *d_norm = NULL;
     float *d_qkv_raw = NULL;
@@ -2279,12 +2279,7 @@ extern "C" int world_cuda_transformer_probe(
     TRY_CUDA2(cudaMalloc((void **)&d_out_mod, (size_t)2 * D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_final_tokens, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_latent_out, latent_elems * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_s0, (size_t)D * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_b0, (size_t)D * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_g0, (size_t)D * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_s1, (size_t)D * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_b1, (size_t)D * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_g1, (size_t)D * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_layer_mod, (size_t)6 * D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_tokens, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_norm, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_qkv_raw, qkv_token_elems * sizeof(float)));
@@ -2391,12 +2386,13 @@ extern "C" int world_cuda_transformer_probe(
 
             add_bias_silu_f32_kernel<<<div_up_i64(D, 256), 256>>>(d_cond, lw->cond_bias, d_cond_act, D);
             TRY_CUDA2(cudaGetLastError());
-            TRY_LINEAR2(d_cond_act, lw->attn_cond_s_weight, d_s0, 1, D, D);
-            TRY_LINEAR2(d_cond_act, lw->attn_cond_b_weight, d_b0, 1, D, D);
-            TRY_LINEAR2(d_cond_act, lw->attn_cond_g_weight, d_g0, 1, D, D);
-            TRY_LINEAR2(d_cond_act, lw->mlp_cond_s_weight, d_s1, 1, D, D);
-            TRY_LINEAR2(d_cond_act, lw->mlp_cond_b_weight, d_b1, 1, D, D);
-            TRY_LINEAR2(d_cond_act, lw->mlp_cond_g_weight, d_g1, 1, D, D);
+            TRY_LINEAR2(d_cond_act, lw->cond_proj_weight, d_layer_mod, 1, D, 6 * D);
+            float *d_s0 = d_layer_mod;
+            float *d_b0 = d_layer_mod + D;
+            float *d_g0 = d_layer_mod + 2 * D;
+            float *d_s1 = d_layer_mod + 3 * D;
+            float *d_b1 = d_layer_mod + 4 * D;
+            float *d_g1 = d_layer_mod + 5 * D;
 
             ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens, d_s0, d_b0, d_norm, T, D, 1.0e-6f);
             TRY_CUDA2(cudaGetLastError());
@@ -2549,12 +2545,7 @@ cleanup_device:
     cudaFree(d_unpatch_w);
     cudaFree(d_unpatch_b);
     cudaFree(d_latent_out);
-    cudaFree(d_s0);
-    cudaFree(d_b0);
-    cudaFree(d_g0);
-    cudaFree(d_s1);
-    cudaFree(d_b1);
-    cudaFree(d_g1);
+    cudaFree(d_layer_mod);
     cudaFree(d_tokens);
     cudaFree(d_norm);
     cudaFree(d_qkv_raw);
