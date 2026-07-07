@@ -171,6 +171,27 @@ def test_masked_attention_matches_torch_gqa_written_mask(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=3e-5, atol=3e-5)
 
 
+def test_indexed_attention_matches_masked_attention_reference(wm_cuda):
+    torch.manual_seed(11)
+    b, hq, hkv, tq, tk, d = 1, 8, 2, 9, 17, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
+    indices = torch.tensor([0, 3, 4, 9, 16], device="cuda", dtype=torch.long)
+    scale = d ** -0.5
+
+    y = wm_cuda.indexed_attention(q, k, v, indices, scale)
+
+    group = hq // hkv
+    k_gqa = k.repeat_interleave(group, dim=1)
+    v_gqa = v.repeat_interleave(group, dim=1)
+    scores = torch.einsum("bhtd,bhkd->bhtk", q, k_gqa[:, :, indices, :]) * scale
+    probs = torch.softmax(scores, dim=-1)
+    ref = torch.einsum("bhtn,bhnd->bhtd", probs, v_gqa[:, :, indices, :])
+
+    torch.testing.assert_close(y, ref, rtol=3e-5, atol=3e-5)
+
+
 def _ref_kv_cache_upsert(cache_k, cache_v, written, k, v, frame_idx, ring_length, pinned_dilation, frozen):
     t = k.shape[2]
     bucket = (frame_idx + (pinned_dilation - 1)) // pinned_dilation
@@ -284,6 +305,7 @@ if __name__ == "__main__":
         test_ortho_rope_matches_world_formula,
         test_qkv_rms_rope_matches_split_reference,
         test_masked_attention_matches_torch_gqa_written_mask,
+        test_indexed_attention_matches_masked_attention_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_patchify_matches_torch_conv2d_layout,

@@ -20,18 +20,35 @@ Implemented CUDA ops:
 Run parity tests:
 
 ```sh
-python worldmodel.cu/test_worldmodel_kernels.py
+python test_worldmodel_kernels.py
 ```
 
 The test file is also pytest-compatible:
 
 ```sh
-python -m pytest -q worldmodel.cu/test_worldmodel_kernels.py
+python -m pytest -q test_worldmodel_kernels.py
+```
+
+Run a real-weight latent generation smoke test:
+
+```sh
+python generate_smoke.py --model-dir ../Waypoint-1.5-1B --steps 4 --output smoke_latent.pt
+```
+
+The smoke runner loads Waypoint safetensors, initializes KV caches, samples a
+latent tensor, and runs the scheduler through the WorldDiT path. It also has an
+optional final cache write pass:
+
+```sh
+python generate_smoke.py --model-dir ../Waypoint-1.5-1B --steps 1 --cache-pass
 ```
 
 Notes:
 
 - Kernels currently target float32 parity first.
+- `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
+  kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
+  linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
 - `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
 - `masked_attention` is an online-softmax GQA written-mask kernel. It is a
   correctness-oriented bridge toward the real ring-cache/block-mask attention.

@@ -315,6 +315,75 @@ __global__ void masked_attention_f32_kernel(
     }
 }
 
+__global__ void indexed_attention_f32_kernel(
+        const float *q,
+        const float *k,
+        const float *v,
+        const int64_t *indices,
+        float *out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        int D,
+        float scale) {
+    __shared__ float red[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int tq = row % Tq;
+    int hq = (row / Tq) % Hq;
+    int b = row / (Tq * Hq);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+
+    const float *qrow = q + (((int64_t)b * Hq + hq) * Tq + tq) * D;
+    const float *kbase = k + ((int64_t)b * Hkv + hk) * Tk * D;
+    const float *vbase = v + ((int64_t)b * Hkv + hk) * Tk * D;
+    float *orow = out + (((int64_t)b * Hq + hq) * Tq + tq) * D;
+
+    float acc = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        float partial = 0.0f;
+        const float *krow = kbase + (int64_t)tk * D;
+        for (int d = tid; d < D; d += blockDim.x) {
+            partial += qrow[d] * krow[d];
+        }
+
+        red[tid] = partial;
+        __syncthreads();
+
+        for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+            if (tid < step) {
+                red[tid] += red[tid + step];
+            }
+            __syncthreads();
+        }
+
+        float score = red[0] * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+
+        if (tid < D) {
+            acc = acc * alpha + beta * vbase[(int64_t)tk * D + tid];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+        __syncthreads();
+    }
+
+    if (tid < D) {
+        orow[tid] = Nkv > 0 ? acc / l : 0.0f;
+    }
+}
+
 __global__ void kv_cache_upsert_copy_f32_kernel(
         float *cache_k,
         float *cache_v,
@@ -741,6 +810,58 @@ torch::Tensor masked_attention_cuda(
     return out;
 }
 
+torch::Tensor indexed_attention_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F32(k);
+    WM_CHECK_F32(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == k.size(3), "D mismatch");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int D = (int)q.size(3);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(D > 0 && D <= 256, "indexed_attention currently supports 1 <= D <= 256");
+
+    auto out = torch::empty_like(q);
+    indexed_attention_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        out.data_ptr<float>(),
+        B,
+        Hq,
+        Hkv,
+        Tq,
+        Nkv,
+        Tk,
+        D,
+        (float)scale);
+    check_last_cuda_error("indexed_attention_f32");
+    return out;
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -931,6 +1052,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");
     m.def("qkv_rms_rope", &qkv_rms_rope_cuda, "WorldModel fused QKV split + RMSNorm + OrthoRoPE (CUDA, f32)", py::arg("qkv"), py::arg("x_pos"), py::arg("y_pos"), py::arg("t_pos"), py::arg("xy"), py::arg("inv_t"), py::arg("n_heads"), py::arg("n_kv_heads"), py::arg("width"), py::arg("height"), py::arg("eps") = 1.0e-6);
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
+    m.def("indexed_attention", &indexed_attention_cuda, "WorldModel indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
     m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
