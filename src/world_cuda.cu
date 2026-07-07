@@ -2013,7 +2013,7 @@ struct WorldCudaRuntime {
     float *d_unpatch_w;
     float *d_unpatch_b;
     float *d_latent_out;
-    float *d_layer_mod;
+    float *d_layer_mod_table;
     float *d_tokens;
     float *d_norm;
     float *d_qkv_raw;
@@ -2129,6 +2129,32 @@ static int indexed_attention_cache_d64_cublas(
     return 0;
 }
 
+static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
+    if (!rt || !rt->d_layer_mod_table) return 1;
+    const WorldConfig *cfg = &rt->cfg;
+    for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+        int is_cache_pass = pass_idx >= rt->steps_to_run;
+        float sigma_step = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx];
+
+        fill_noise_embedding(rt->h_noise, sigma_step);
+        CUDA_OK(cudaMemcpy(rt->d_noise, rt->h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
+        if (row_major_linear(rt->handle, rt->d_noise, rt->d_denoise_fc1, rt->d_noise_hidden, 1, 512, rt->mlp_hidden)) return 1;
+        silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_noise_hidden, rt->d_noise_hidden, rt->mlp_hidden);
+        CUDA_OK(cudaGetLastError());
+        if (row_major_linear(rt->handle, rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D)) return 1;
+
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
+            float *dst = rt->d_layer_mod_table + ((int64_t)pass_idx * rt->layers_to_run + layer_idx) * (6 * rt->D);
+            add_bias_silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, lw->cond_bias, rt->d_cond_act, rt->D);
+            CUDA_OK(cudaGetLastError());
+            if (row_major_linear(rt->handle, rt->d_cond_act, lw->cond_proj_weight, dst, 1, rt->D, 6 * rt->D)) return 1;
+        }
+    }
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static double monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2166,7 +2192,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_unpatch_w);
     cudaFree(rt->d_unpatch_b);
     cudaFree(rt->d_latent_out);
-    cudaFree(rt->d_layer_mod);
+    cudaFree(rt->d_layer_mod_table);
     cudaFree(rt->d_tokens);
     cudaFree(rt->d_norm);
     cudaFree(rt->d_qkv_raw);
@@ -2268,6 +2294,7 @@ extern "C" int world_cuda_runtime_create(
     size_t patch_row_elems = (size_t)rt->T * rt->C * rt->ph * rt->pw;
     size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
+    size_t layer_mod_table_elems = (size_t)rt->total_passes * layers_to_run * 6 * rt->D;
     const char *cublas_attn_env = NULL;
     int cublas_attn_max_tokens = 0;
     int cublas_attn_supported = 1;
@@ -2313,7 +2340,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_out_mod, (size_t)2 * rt->D * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_final_tokens, rt->token_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_latent_out, rt->latent_elems * sizeof(float)));
-    RT_CUDA(cudaMalloc((void **)&rt->d_layer_mod, (size_t)6 * rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_layer_mod_table, layer_mod_table_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_tokens, rt->token_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_norm, rt->token_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_qkv_raw, qkv_token_elems * sizeof(float)));
@@ -2377,6 +2404,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUBLAS(cublasCreate(&rt->handle));
     RT_CUBLAS(cublasSetMathMode(rt->handle, CUBLAS_TF32_TENSOR_OP_MATH));
+    if (precompute_runtime_layer_mods(rt)) goto fail;
     RT_CUDA(cudaEventCreate(&rt->ev_step_start));
     RT_CUDA(cudaEventCreate(&rt->ev_after_setup));
     RT_CUDA(cudaEventCreate(&rt->ev_after_transformer));
@@ -2470,13 +2498,6 @@ extern "C" int world_cuda_runtime_step_rgb(
         float next_sigma = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx + 1];
         float dsigma = next_sigma - sigma_step;
 
-        fill_noise_embedding(rt->h_noise, sigma_step);
-        STEP_CUDA(cudaMemcpy(rt->d_noise, rt->h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
-        STEP_LINEAR(rt->d_noise, rt->d_denoise_fc1, rt->d_noise_hidden, 1, 512, rt->mlp_hidden);
-        silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_noise_hidden, rt->d_noise_hidden, rt->mlp_hidden);
-        STEP_CUDA(cudaGetLastError());
-        STEP_LINEAR(rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D);
-
         int patch_elems = rt->C * rt->ph * rt->pw;
         patchify_im2row_f32_kernel<<<div_up_i64((int64_t)rt->T * patch_elems, 256), 256>>>(
             rt->d_latent, rt->d_patch_rows, rt->C, rt->H, rt->W, rt->ph, rt->pw, cfg->height, cfg->width);
@@ -2489,15 +2510,13 @@ extern "C" int world_cuda_runtime_step_rgb(
             const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
             DeviceWorldLayerCache *cache = &rt->d_caches[layer_idx];
 
-            add_bias_silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, lw->cond_bias, rt->d_cond_act, rt->D);
-            STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR(rt->d_cond_act, lw->cond_proj_weight, rt->d_layer_mod, 1, rt->D, 6 * rt->D);
-            float *d_s0 = rt->d_layer_mod;
-            float *d_b0 = rt->d_layer_mod + rt->D;
-            float *d_g0 = rt->d_layer_mod + 2 * rt->D;
-            float *d_s1 = rt->d_layer_mod + 3 * rt->D;
-            float *d_b1 = rt->d_layer_mod + 4 * rt->D;
-            float *d_g1 = rt->d_layer_mod + 5 * rt->D;
+            float *d_layer_mod = rt->d_layer_mod_table + ((int64_t)pass_idx * rt->layers_to_run + layer_idx) * (6 * rt->D);
+            float *d_s0 = d_layer_mod;
+            float *d_b0 = d_layer_mod + rt->D;
+            float *d_g0 = d_layer_mod + 2 * rt->D;
+            float *d_s1 = d_layer_mod + 3 * rt->D;
+            float *d_b1 = d_layer_mod + 4 * rt->D;
+            float *d_g1 = d_layer_mod + 5 * rt->D;
 
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, 1.0e-6f);
             STEP_CUDA(cudaGetLastError());
