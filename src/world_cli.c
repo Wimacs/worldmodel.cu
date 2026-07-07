@@ -12,10 +12,10 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--seed N] [--sigma X] [--dump-prefix PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--seed N] [--sigma X] [--layers N] [--dump-prefix PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
-            "then starts the generation path through layer0 Q/K/V RoPE.\n",
+            "then runs the WorldDiT latent path.\n",
             argv0);
 }
 
@@ -57,12 +57,59 @@ static int load_required_f32(const SafeTensors *st, const char *name, const int6
     return 0;
 }
 
+static int load_optional_f32(const SafeTensors *st, const char *name, const int64_t *shape, int ndim, float **out) {
+    const SafeTensorEntry *e = safetensors_find(st, name);
+    if (!e) {
+        *out = NULL;
+        return 0;
+    }
+    return load_required_f32(st, name, shape, ndim, out);
+}
+
+static int load_layer_f32(const SafeTensors *st, int layer, const char *suffix, const int64_t *shape, int ndim, float **out) {
+    char name[256];
+    int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) return 1;
+    return load_required_f32(st, name, shape, ndim, out);
+}
+
+static int load_optional_layer_f32(const SafeTensors *st, int layer, const char *suffix, const int64_t *shape, int ndim, float **out) {
+    char name[256];
+    int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) return 1;
+    return load_optional_f32(st, name, shape, ndim, out);
+}
+
+static void free_layer_weights(WorldLayerWeights *layers, int n_layers) {
+    if (!layers) return;
+    for (int i = 0; i < n_layers; ++i) {
+        free((void *)layers[i].cond_bias);
+        free((void *)layers[i].attn_cond_s_weight);
+        free((void *)layers[i].attn_cond_b_weight);
+        free((void *)layers[i].attn_cond_g_weight);
+        free((void *)layers[i].q_proj_weight);
+        free((void *)layers[i].k_proj_weight);
+        free((void *)layers[i].v_proj_weight);
+        free((void *)layers[i].out_proj_weight);
+        free((void *)layers[i].v_lamb);
+        free((void *)layers[i].mlp_cond_s_weight);
+        free((void *)layers[i].mlp_cond_b_weight);
+        free((void *)layers[i].mlp_cond_g_weight);
+        free((void *)layers[i].ctrl_fc1_x_weight);
+        free((void *)layers[i].ctrl_fc2_weight);
+        free((void *)layers[i].dit_mlp_fc1_weight);
+        free((void *)layers[i].dit_mlp_fc2_weight);
+    }
+    free(layers);
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
     const char *dump_prefix = NULL;
     unsigned int seed = 1234;
     float sigma = 1.0f;
+    int layers_to_run = -1;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -73,6 +120,8 @@ int main(int argc, char **argv) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
             sigma = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
+            layers_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
             dump_prefix = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -101,6 +150,11 @@ int main(int argc, char **argv) {
 
     WorldConfig cfg;
     if (world_config_load(&cfg, config_path)) return 1;
+    if (layers_to_run < 0) layers_to_run = cfg.n_layers;
+    if (layers_to_run <= 0 || layers_to_run > cfg.n_layers) {
+        fprintf(stderr, "invalid --layers %d, expected 1..%d\n", layers_to_run, cfg.n_layers);
+        return 1;
+    }
     world_config_print(&cfg);
 
     SafeTensors st;
@@ -136,6 +190,7 @@ int main(int argc, char **argv) {
     float *layer0_ctrl_fc2_weight = NULL;
     float *layer0_dit_mlp_fc1_weight = NULL;
     float *layer0_dit_mlp_fc2_weight = NULL;
+    WorldLayerWeights *layers = NULL;
     int rc = 1;
 
     if (load_required_f32(&st, "patchify.weight", patch_shape, 4, &patchify_weight)) {
@@ -147,6 +202,44 @@ int main(int argc, char **argv) {
     if (load_required_f32(&st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &denoise_fc2_weight)) {
         goto cleanup;
     }
+
+    if (layers_to_run != 1) {
+        layers = (WorldLayerWeights *)calloc((size_t)layers_to_run, sizeof(*layers));
+        if (!layers) {
+            fprintf(stderr, "failed to allocate layer weights\n");
+            goto cleanup;
+        }
+        for (int layer = 0; layer < layers_to_run; ++layer) {
+            WorldLayerWeights *lw = &layers[layer];
+            if (load_layer_f32(&st, layer, "mlp_cond_head.bias_in", d_shape, 1, (float **)&lw->cond_bias)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->attn_cond_s_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->attn_cond_b_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->attn_cond_g_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn.q_proj.weight", dxd_shape, 2, (float **)&lw->q_proj_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn.k_proj.weight", kv_proj_shape, 2, (float **)&lw->k_proj_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn.v_proj.weight", kv_proj_shape, 2, (float **)&lw->v_proj_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn.out_proj.weight", dxd_shape, 2, (float **)&lw->out_proj_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "attn.v_lamb", NULL, 0, (float **)&lw->v_lamb)) goto cleanup;
+            if (load_layer_f32(&st, layer, "mlp_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->mlp_cond_s_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "mlp_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->mlp_cond_b_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->mlp_cond_g_weight)) goto cleanup;
+            if (load_optional_layer_f32(&st, layer, "ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_x_weight)) goto cleanup;
+            lw->has_ctrl = lw->ctrl_fc1_x_weight != NULL;
+            if (lw->has_ctrl && load_layer_f32(&st, layer, "ctrl_mlpfusion.fc2.weight", dxd_shape, 2, (float **)&lw->ctrl_fc2_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "dit_mlp.fc1.weight", hidden_d_shape, 2, (float **)&lw->dit_mlp_fc1_weight)) goto cleanup;
+            if (load_layer_f32(&st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) goto cleanup;
+        }
+        WorldModelProbeWeights model = {
+            patchify_weight,
+            denoise_fc1_weight,
+            denoise_fc2_weight,
+            layers,
+            layers_to_run,
+        };
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, sigma, seed, dump_prefix);
+        goto cleanup;
+    }
+
     if (load_required_f32(&st, "transformer.blocks.0.mlp_cond_head.bias_in", d_shape, 1, &layer0_cond_bias)) {
         goto cleanup;
     }
@@ -234,6 +327,7 @@ cleanup:
     free(layer0_ctrl_fc2_weight);
     free(layer0_dit_mlp_fc1_weight);
     free(layer0_dit_mlp_fc2_weight);
+    free_layer_weights(layers, layers_to_run);
     safetensors_close(&st);
     return rc;
 }

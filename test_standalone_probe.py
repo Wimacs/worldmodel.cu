@@ -137,6 +137,8 @@ def test_standalone_layer0_probe_matches_pytorch():
                 str(seed),
                 "--sigma",
                 str(sigma),
+                "--layers",
+                "1",
                 "--dump-prefix",
                 prefix,
             ],
@@ -276,5 +278,151 @@ def test_standalone_layer0_probe_matches_pytorch():
         )
 
 
+def test_standalone_two_layer_transformer_matches_pytorch():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not WEIGHTS_PATH.exists():
+        pytest.skip(f"missing Waypoint weights: {WEIGHTS_PATH}")
+
+    cfg = _load_config()
+    exe = _build_executable()
+    seed = 1234
+    sigma = 1.0
+    layers = 2
+    device = torch.device("cuda")
+
+    with tempfile.TemporaryDirectory(prefix="world_transformer2_probe_") as td:
+        prefix = str(Path(td) / "dump")
+        subprocess.run(
+            [
+                str(exe),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--seed",
+                str(seed),
+                "--sigma",
+                str(sigma),
+                "--layers",
+                str(layers),
+                "--dump-prefix",
+                prefix,
+            ],
+            check=True,
+            cwd=str(ROOT),
+        )
+
+        c = cfg["channels"]
+        d_model = cfg["d_model"]
+        n_heads = cfg["n_heads"]
+        n_kv_heads = cfg["n_kv_heads"]
+        ph, pw = int(cfg["patch"][0]), int(cfg["patch"][1])
+        height, width = cfg["height"], cfg["width"]
+        h, w = height * ph, width * pw
+        tpf = height * width
+        d_head = d_model // n_heads
+        kv_dim = n_kv_heads * d_head
+
+        names = [
+            "patchify.weight",
+            "denoise_step_emb.mlp.fc1.weight",
+            "denoise_step_emb.mlp.fc2.weight",
+        ]
+        for layer in range(layers):
+            p = f"transformer.blocks.{layer}"
+            names.extend(
+                [
+                    f"{p}.mlp_cond_head.bias_in",
+                    f"{p}.attn_cond_head.cond_proj.0.weight",
+                    f"{p}.attn_cond_head.cond_proj.1.weight",
+                    f"{p}.attn_cond_head.cond_proj.2.weight",
+                    f"{p}.attn.q_proj.weight",
+                    f"{p}.attn.k_proj.weight",
+                    f"{p}.attn.v_proj.weight",
+                    f"{p}.attn.out_proj.weight",
+                    f"{p}.attn.v_lamb",
+                    f"{p}.mlp_cond_head.cond_proj.0.weight",
+                    f"{p}.mlp_cond_head.cond_proj.1.weight",
+                    f"{p}.mlp_cond_head.cond_proj.2.weight",
+                    f"{p}.dit_mlp.fc1.weight",
+                    f"{p}.dit_mlp.fc2.weight",
+                ]
+            )
+            if layer % int(cfg["ctrl_conditioning_period"]) == 0:
+                names.extend(
+                    [
+                        f"{p}.ctrl_mlpfusion.fc1_x.weight",
+                        f"{p}.ctrl_mlpfusion.fc2.weight",
+                    ]
+                )
+        state = _load_required_tensors(names, device)
+
+        latent = torch.from_numpy(_lcg_latent((1, c, h, w), seed)).to(device)
+        cond = F.linear(
+            F.silu(F.linear(_noise_embedding(sigma, device), state["denoise_step_emb.mlp.fc1.weight"])),
+            state["denoise_step_emb.mlp.fc2.weight"],
+        )
+        tokens = F.conv2d(latent, state["patchify.weight"], bias=None, stride=(ph, pw))
+        tokens = tokens.permute(0, 2, 3, 1).reshape(tpf, d_model).contiguous()
+
+        idx = torch.arange(tpf, device=device, dtype=torch.long)
+        y_pos = idx.div(width, rounding_mode="floor").contiguous()
+        x_pos = idx.remainder(width).contiguous()
+        t_pos = torch.zeros_like(idx)
+        xy, inv_t = _world_rope_tables(d_head, height, width, device)
+        v_first = None
+
+        for layer in range(layers):
+            p = f"transformer.blocks.{layer}"
+            cond_act = F.silu(cond.reshape(d_model) + state[f"{p}.mlp_cond_head.bias_in"])
+            s0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.0.weight"])
+            b0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.1.weight"])
+            g0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.2.weight"])
+            s1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.0.weight"])
+            b1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.1.weight"])
+            g1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.2.weight"])
+
+            norm = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s0) + b0
+            q_raw = F.linear(norm, state[f"{p}.attn.q_proj.weight"])
+            k_raw = F.linear(norm, state[f"{p}.attn.k_proj.weight"])
+            v_raw = F.linear(norm, state[f"{p}.attn.v_proj.weight"])
+            q = q_raw.view(1, tpf, n_heads, d_head).permute(0, 2, 1, 3).contiguous()
+            k = k_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
+            v = v_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
+            q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+            k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+            v = v[0]
+            if v_first is None:
+                v_first = v
+            else:
+                v = torch.lerp(v, v_first, state[f"{p}.attn.v_lamb"].float())
+
+            group = n_heads // n_kv_heads
+            scores = torch.einsum("htd,hkd->htk", q, k.repeat_interleave(group, dim=0)) * (d_head ** -0.5)
+            probs = torch.softmax(scores, dim=-1)
+            attn_heads = torch.einsum("htk,hkd->htd", probs, v.repeat_interleave(group, dim=0))
+            attn = attn_heads.permute(1, 0, 2).reshape(tpf, d_model).contiguous()
+            tokens = tokens + F.linear(attn, state[f"{p}.attn.out_proj.weight"]) * g0
+
+            if f"{p}.ctrl_mlpfusion.fc1_x.weight" in state:
+                ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=1.0e-6), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
+                tokens = tokens + F.linear(F.silu(ctrl_hidden), state[f"{p}.ctrl_mlpfusion.fc2.weight"])
+
+            mlp_in = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+            mlp_out = F.linear(
+                F.silu(F.linear(mlp_in, state[f"{p}.dit_mlp.fc1.weight"])),
+                state[f"{p}.dit_mlp.fc2.weight"],
+            )
+            tokens = tokens + mlp_out * g1
+
+        _assert_close(
+            "transformer_tokens_2_layers",
+            _read_dump(prefix, "transformer_tokens", (tpf, d_model)),
+            tokens,
+            rtol=1.2e-3,
+            atol=1.2e-3,
+        )
+
+
 if __name__ == "__main__":
     test_standalone_layer0_probe_matches_pytorch()
+    test_standalone_two_layer_transformer_matches_pytorch()
