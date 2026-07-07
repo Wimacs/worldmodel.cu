@@ -160,6 +160,8 @@ Notes:
 - The standalone transformer alternates two token buffers between layers and
   aliases the no-controller path, removing per-layer device-to-device token
   copies.
+- When value residuals are enabled, layer 0 writes V directly into the resident
+  residual buffer, avoiding the separate first-layer V copy.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across

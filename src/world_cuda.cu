@@ -2410,22 +2410,21 @@ extern "C" int world_cuda_transformer_probe(
             ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens_cur, d_s0, d_b0, d_norm, T, D, 1.0e-6f);
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_norm, lw->qkv_proj_weight, d_qkv_raw, T, D, D + 2 * kv_dim);
+            float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? d_v_first : d_v;
 
             {
                 dim3 grid(T, cfg->n_heads + 2 * cfg->n_kv_heads);
                 size_t smem = (size_t)(d_head + 256) * sizeof(float);
                 qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
                     d_qkv_raw,
-                    d_q, d_k, d_v,
+                    d_q, d_k, d_v_cur,
                     d_x_pos, d_y_pos, d_t_pos, d_xy_table, d_inv_t,
                     T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, 1.0e-6f);
             }
             TRY_CUDA2(cudaGetLastError());
 
             if (cfg->value_residual) {
-                if (layer_idx == 0) {
-                    TRY_CUDA2(cudaMemcpy(d_v_first, d_v, kv_rope_elems * sizeof(float), cudaMemcpyDeviceToDevice));
-                } else {
+                if (layer_idx != 0) {
                     lerp_inplace_f32_kernel<<<div_up_i64((int64_t)kv_rope_elems, 256), 256>>>(
                         d_v, d_v_first, lw->v_lamb, (int64_t)kv_rope_elems);
                     TRY_CUDA2(cudaGetLastError());
@@ -2441,7 +2440,7 @@ extern "C" int world_cuda_transformer_probe(
                     cache->written, cache->mask_written, cache->capacity, T, base, write_step);
                 TRY_CUDA2(cudaGetLastError());
                 kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * T * d_head, 256), 256>>>(
-                    cache->k, cache->v, d_k, d_v, cache->written,
+                    cache->k, cache->v, d_k, d_v_cur, cache->written,
                     cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
                 TRY_CUDA2(cudaGetLastError());
                 collect_cache_indices_kernel<<<1, 1>>>(
