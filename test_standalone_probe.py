@@ -78,6 +78,11 @@ def _read_ppm(path):
     return arr.reshape(height, width, 3).copy()
 
 
+def _frame_path(path, frame_idx):
+    p = Path(path)
+    return p.with_name(f"{p.stem}.{frame_idx}{p.suffix}")
+
+
 def _load_required_tensors(names, device):
     out = {}
     with safe_open(str(WEIGHTS_PATH), framework="pt", device="cpu") as f:
@@ -501,6 +506,19 @@ def test_standalone_two_layer_transformer_matches_pytorch():
         if diff.max() > 3 or diff.mean() > 0.2:
             raise AssertionError(f"vae_decode_ppm max_diff={diff.max()} mean_diff={diff.mean():.6f}")
         print(f"vae_decode_ppm: ok max_abs={diff.max()} mean_abs={diff.mean():.6g}")
+
+        for frame_idx in range(4):
+            actual_frame = _read_ppm(_frame_path(out_path, frame_idx))
+            frame_diff = np.abs(actual_frame.astype(np.int16) - ref_rgb[frame_idx].astype(np.int16))
+            if frame_diff.max() > 3 or frame_diff.mean() > 0.2:
+                raise AssertionError(
+                    f"vae_decode_frame{frame_idx}_ppm max_diff={frame_diff.max()} "
+                    f"mean_diff={frame_diff.mean():.6f}"
+                )
+            print(
+                f"vae_decode_frame{frame_idx}_ppm: ok "
+                f"max_abs={frame_diff.max()} mean_abs={frame_diff.mean():.6g}"
+            )
 
 
 if __name__ == "__main__":

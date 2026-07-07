@@ -850,6 +850,32 @@ static int taehv_write_ppm(const char *path, const unsigned char *rgb, int width
     return 0;
 }
 
+static int taehv_make_frame_path(char *out, size_t out_size, const char *path, int frame_idx) {
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    const char *dot = strrchr(name, '.');
+    int stem_len = dot ? (int)(dot - path) : (int)strlen(path);
+    const char *ext = dot ? dot : "";
+    int n = snprintf(out, out_size, "%.*s.%d%s", stem_len, path, frame_idx, ext);
+    return n < 0 || (size_t)n >= out_size;
+}
+
+static int taehv_write_ppm_frames(const char *path, const unsigned char *rgb, int frame_count, int width, int height) {
+    size_t frame_bytes = (size_t)width * height * 3;
+    if (taehv_write_ppm(path, rgb, width, height)) return 1;
+    fprintf(stderr, "wrote RGB image: %s\n", path);
+    for (int i = 0; i < frame_count; ++i) {
+        char frame_path[4096];
+        if (taehv_make_frame_path(frame_path, sizeof(frame_path), path, i)) {
+            fprintf(stderr, "output frame path too long for %s frame %d\n", path, i);
+            return 1;
+        }
+        if (taehv_write_ppm(frame_path, rgb + (size_t)i * frame_bytes, width, height)) return 1;
+        fprintf(stderr, "wrote RGB frame %d: %s\n", i, frame_path);
+    }
+    return 0;
+}
+
 static int world_cuda_decode_vae_to_ppm(
         const WorldConfig *cfg,
         const WorldVaeDecoderWeights *host_vae,
@@ -965,8 +991,7 @@ static int world_cuda_decode_vae_to_ppm(
     CUDA_OK(cudaGetLastError());
     CUDA_OK(cudaMemcpy(h_rgb, d_rgb, rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
-    if (taehv_write_ppm(out_path, h_rgb, out_w, out_h)) goto cleanup;
-    fprintf(stderr, "wrote RGB image: %s\n", out_path);
+    if (taehv_write_ppm_frames(out_path, h_rgb, 4, out_w, out_h)) goto cleanup;
     rc = 0;
 
 cleanup:
