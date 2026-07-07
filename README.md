@@ -94,7 +94,7 @@ higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
 --headless-smoke`
 stabilizes around 80 ms per decoded 4-frame RGB chunk, about 50 RGB fps. With
 `--steps 4 --cache-window 8 --warmup 9 --headless-smoke`, the current CUDA path
-stabilizes around 300 ms per decoded chunk, about 13 RGB fps. D=64 cache
+stabilizes around 290 ms per decoded chunk, about 13.8 RGB fps. D=64 cache
 attention uses the cuBLAS path by default when every cache has
 `pinned_dilation=1` and at most 8192 visible tokens; set
 `WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback.

@@ -340,6 +340,19 @@ def test_patchify_matches_torch_conv2d_layout(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
 
 
+def test_patchify_cublas_matches_torch_conv2d_layout(wm_cuda):
+    torch.manual_seed(17)
+    b, c, h, w = 2, 4, 8, 12
+    d, ph, pw = 7, 2, 3
+    x = torch.randn(b, c, h, w, device="cuda", dtype=torch.float32)
+    weight = torch.randn(d, c, ph, pw, device="cuda", dtype=torch.float32)
+
+    y = wm_cuda.patchify_cublas(x, weight)
+    ref = F.conv2d(x, weight, bias=None, stride=(ph, pw))
+    ref = ref.permute(0, 2, 3, 1).reshape(b, (h // ph) * (w // pw), d).contiguous()
+    torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
 def test_unpatchify_matches_torch_linear_layout(wm_cuda):
     torch.manual_seed(10)
     b, c, h, w = 2, 4, 6, 8
@@ -411,6 +424,7 @@ if __name__ == "__main__":
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_cache_frame_indices_matches_mask_nonzero_reference,
         test_patchify_matches_torch_conv2d_layout,
+        test_patchify_cublas_matches_torch_conv2d_layout,
         test_unpatchify_matches_torch_linear_layout,
         test_taehv_conv2d_matches_torch_same_padding,
         test_taehv_concat_past_matches_reference,

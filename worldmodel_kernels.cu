@@ -826,6 +826,37 @@ __global__ void patchify_f32_kernel(
     }
 }
 
+__global__ void patchify_im2row_f32_kernel(
+        const float *x,
+        float *rows,
+        int B,
+        int C,
+        int H,
+        int W,
+        int ph,
+        int pw,
+        int Hp,
+        int Wp) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int patch_elems = C * ph * pw;
+    int64_t total = (int64_t)B * Hp * Wp * patch_elems;
+    if (i >= total) return;
+    int p = (int)(i % patch_elems);
+    int64_t qtoken = i / patch_elems;
+    int token = (int)(qtoken % (Hp * Wp));
+    int b = (int)(qtoken / (Hp * Wp));
+    int ox = token % Wp;
+    int oy = token / Wp;
+    int q = p;
+    int dx = q % pw;
+    q /= pw;
+    int dy = q % ph;
+    int c = q / ph;
+    int iy = oy * ph + dy;
+    int ix = ox * pw + dx;
+    rows[i] = x[((int64_t)b * C + c) * H * W + iy * W + ix];
+}
+
 __global__ void unpatchify_f32_kernel(
         const float *tokens,
         const float *weight,
@@ -1601,6 +1632,67 @@ torch::Tensor patchify_cuda(torch::Tensor x, torch::Tensor weight) {
     return tokens;
 }
 
+torch::Tensor patchify_cublas_cuda(torch::Tensor x, torch::Tensor weight) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(weight);
+    TORCH_CHECK(x.dim() == 4, "x must be [B,C,H,W]");
+    TORCH_CHECK(weight.dim() == 4, "weight must be [D,C,ph,pw]");
+    TORCH_CHECK(x.size(1) == weight.size(1), "channel mismatch");
+
+    int B = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int D = (int)weight.size(0);
+    int ph = (int)weight.size(2);
+    int pw = (int)weight.size(3);
+    TORCH_CHECK(H % ph == 0 && W % pw == 0, "H/W must be divisible by patch");
+    int Hp = H / ph;
+    int Wp = W / pw;
+    int T = Hp * Wp;
+    int patch_elems = C * ph * pw;
+
+    auto rows = torch::empty({B * T, patch_elems}, x.options());
+    auto tokens = torch::empty({B, T, D}, x.options());
+    int64_t row_elems = (int64_t)B * T * patch_elems;
+    patchify_im2row_f32_kernel<<<div_up_i64(row_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        rows.data_ptr<float>(),
+        B,
+        C,
+        H,
+        W,
+        ph,
+        pw,
+        Hp,
+        Wp);
+    check_last_cuda_error("patchify_im2row_f32");
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    TORCH_CHECK(cublasSgemm(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        D,
+        B * T,
+        patch_elems,
+        &alpha,
+        weight.data_ptr<float>(),
+        patch_elems,
+        rows.data_ptr<float>(),
+        patch_elems,
+        &beta,
+        tokens.data_ptr<float>(),
+        D) == CUBLAS_STATUS_SUCCESS, "patchify_cublas cublasSgemm failed");
+    return tokens;
+}
+
 torch::Tensor unpatchify_cuda(
         torch::Tensor tokens,
         torch::Tensor weight,
@@ -1759,6 +1851,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
+    m.def("patchify_cublas", &patchify_cublas_cuda, "WorldModel patchify im2row + cuBLAS (CUDA, f32)");
     m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
     m.def("taehv_conv2d", &taehv_conv2d_cuda, "TAEHV direct same-padding Conv2d (CUDA, f32)");
     m.def("taehv_concat_past", &taehv_concat_past_cuda, "TAEHV MemBlock current+past concat (CUDA, f32)");

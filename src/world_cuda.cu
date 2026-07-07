@@ -773,6 +773,34 @@ __global__ static void patchify_f32_kernel(
     if (tid == 0) tokens[token * D + d] = red[0];
 }
 
+__global__ static void patchify_im2row_f32_kernel(
+        const float *x,
+        float *rows,
+        int C,
+        int H,
+        int W,
+        int ph,
+        int pw,
+        int Hp,
+        int Wp) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int patch_elems = C * ph * pw;
+    int64_t total = (int64_t)Hp * Wp * patch_elems;
+    if (i >= total) return;
+    int p = (int)(i % patch_elems);
+    int token = (int)(i / patch_elems);
+    int ox = token % Wp;
+    int oy = token / Wp;
+    int q = p;
+    int dx = q % pw;
+    q /= pw;
+    int dy = q % ph;
+    int c = q / ph;
+    int iy = oy * ph + dy;
+    int ix = ox * pw + dx;
+    rows[i] = x[(c * H + iy) * W + ix];
+}
+
 __global__ static void unpatchify_orig_f32_kernel(
         const float *tokens,
         const float *weight,
@@ -1966,6 +1994,7 @@ struct WorldCudaRuntime {
     int64_t *h_t_pos;
     float *d_latent;
     float *d_patch;
+    float *d_patch_rows;
     float *d_noise;
     float *d_noise_hidden;
     float *d_cond;
@@ -2118,6 +2147,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     free_device_world_caches(rt->d_caches, rt->layers_to_run);
     cudaFree(rt->d_latent);
     cudaFree(rt->d_patch);
+    cudaFree(rt->d_patch_rows);
     cudaFree(rt->d_noise);
     cudaFree(rt->d_noise_hidden);
     cudaFree(rt->d_cond);
@@ -2235,6 +2265,7 @@ extern "C" int world_cuda_runtime_create(
     }
     size_t qkv_token_elems = rt->token_elems + 2 * ((size_t)rt->T * rt->kv_dim);
     size_t patch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
+    size_t patch_row_elems = (size_t)rt->T * rt->C * rt->ph * rt->pw;
     size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     const char *cublas_attn_env = NULL;
@@ -2270,6 +2301,7 @@ extern "C" int world_cuda_runtime_create(
     fill_rope_tables(rt->h_xy, rt->h_inv_t, rt->d_head, cfg->height, cfg->width);
 
     RT_CUDA(cudaMalloc((void **)&rt->d_latent, rt->latent_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_patch_rows, patch_row_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_noise, 512 * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_noise_hidden, (size_t)rt->mlp_hidden * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_cond, (size_t)rt->D * sizeof(float)));
@@ -2445,8 +2477,11 @@ extern "C" int world_cuda_runtime_step_rgb(
         STEP_CUDA(cudaGetLastError());
         STEP_LINEAR(rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D);
 
-        patchify_f32_kernel<<<rt->T * rt->D, 256>>>(rt->d_latent, rt->d_patch, rt->d_tokens, rt->C, rt->H, rt->W, rt->D, rt->ph, rt->pw, cfg->height, cfg->width);
+        int patch_elems = rt->C * rt->ph * rt->pw;
+        patchify_im2row_f32_kernel<<<div_up_i64((int64_t)rt->T * patch_elems, 256), 256>>>(
+            rt->d_latent, rt->d_patch_rows, rt->C, rt->H, rt->W, rt->ph, rt->pw, cfg->height, cfg->width);
         STEP_CUDA(cudaGetLastError());
+        STEP_LINEAR(rt->d_patch_rows, rt->d_patch, rt->d_tokens, rt->T, patch_elems, rt->D);
         float *d_tokens_cur = rt->d_tokens;
         float *d_tokens_next = rt->d_tokens_after_mlp;
 
