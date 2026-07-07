@@ -12,6 +12,9 @@
 #define WM_CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define WM_CHECK_F32(x) TORCH_CHECK((x).scalar_type() == at::ScalarType::Float, #x " must be float32")
 
+#define WM_ATTN_D64_Q_BLOCK 4
+#define WM_ATTN_D64_K_BLOCK 64
+
 static int div_up_i64(int64_t a, int b) {
     return (int)((a + b - 1) / b);
 }
@@ -508,6 +511,162 @@ __global__ void indexed_attention_d64_warp_f32_kernel(
     } else {
         orow[lane] = 0.0f;
         orow[lane + 32] = 0.0f;
+    }
+}
+
+__global__ void indexed_attention_d64_q4_shared_f32_kernel(
+        const float *__restrict__ q,
+        const float *__restrict__ k,
+        const float *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        float scale) {
+    extern __shared__ float smem[];
+    float *sh_k = smem;
+    float *sh_v = sh_k + WM_ATTN_D64_K_BLOCK * 64;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int q_blocks = (Tq + WM_ATTN_D64_Q_BLOCK - 1) / WM_ATTN_D64_Q_BLOCK;
+    int bh = blockIdx.x / q_blocks;
+    int tq_base = (blockIdx.x - bh * q_blocks) * WM_ATTN_D64_Q_BLOCK;
+    int tq = tq_base + warp;
+    int hq = bh % Hq;
+    int b = bh / Hq;
+    if (b >= B) return;
+
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const float *kbase = k + ((int64_t)b * Hkv + hk) * Tk * 64;
+    const float *vbase = v + ((int64_t)b * Hkv + hk) * Tk * 64;
+    bool valid_q = tq < Tq;
+    const float *qrow = q + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+    float *orow = out + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+
+    float q0 = valid_q ? qrow[lane] : 0.0f;
+    float q1 = valid_q ? qrow[lane + 32] : 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n0 = 0; n0 < Nkv; n0 += WM_ATTN_D64_K_BLOCK) {
+        int active = Nkv - n0;
+        if (active > WM_ATTN_D64_K_BLOCK) active = WM_ATTN_D64_K_BLOCK;
+        int tile_elems = active * 64;
+        for (int i = tid; i < tile_elems; i += blockDim.x) {
+            int n = i >> 6;
+            int d = i & 63;
+            int tk = (int)indices[n0 + n];
+            sh_k[i] = kbase[(int64_t)tk * 64 + d];
+            sh_v[i] = vbase[(int64_t)tk * 64 + d];
+        }
+        __syncthreads();
+
+        if (valid_q) {
+            for (int n = 0; n < active; ++n) {
+                const float *krow = sh_k + n * 64;
+                float dot = wm_warp_sum(q0 * krow[lane] + q1 * krow[lane + 32]);
+                dot = __shfl_sync(0xffffffffu, dot, 0);
+                float score = dot * scale;
+                float new_m = fmaxf(m, score);
+                float alpha = expf(m - new_m);
+                float beta = expf(score - new_m);
+                const float *vrow = sh_v + n * 64;
+                acc0 = acc0 * alpha + beta * vrow[lane];
+                acc1 = acc1 * alpha + beta * vrow[lane + 32];
+                l = l * alpha + beta;
+                m = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_q) {
+        if (Nkv > 0) {
+            float inv_l = 1.0f / l;
+            orow[lane] = acc0 * inv_l;
+            orow[lane + 32] = acc1 * inv_l;
+        } else {
+            orow[lane] = 0.0f;
+            orow[lane + 32] = 0.0f;
+        }
+    }
+}
+
+__global__ void gather_indexed_kv_d64_f32_kernel(
+        const float *__restrict__ k,
+        const float *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ k_compact,
+        float *__restrict__ v_compact,
+        int B,
+        int Hq,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Hq * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hq = (int)((q / Nkv) % Hq);
+    int b = (int)(q / ((int64_t)Nkv * Hq));
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = (((int64_t)b * Hkv + hk) * Tk + tk) * 64 + d;
+    k_compact[i] = k[src];
+    v_compact[i] = v[src];
+}
+
+__global__ void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+    float *row_x = x + (int64_t)row * cols;
+
+    float mx = -INFINITY;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        mx = fmaxf(mx, row_x[c]);
+    }
+    red[tid] = mx;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    mx = red[0];
+
+    float sum = 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        float v = expf(row_x[c] - mx);
+        row_x[c] = v;
+        sum += v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        row_x[c] *= inv;
     }
 }
 
@@ -1147,7 +1306,9 @@ torch::Tensor indexed_attention_cuda(
 
     auto out = torch::empty_like(q);
     if (D == 64) {
-        indexed_attention_d64_warp_f32_kernel<<<div_up_i64((int64_t)B * Hq * Tq, 4), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        int q_blocks = div_up_i64(Tq, WM_ATTN_D64_Q_BLOCK);
+        size_t smem = (size_t)2 * WM_ATTN_D64_K_BLOCK * 64 * sizeof(float);
+        indexed_attention_d64_q4_shared_f32_kernel<<<B * Hq * q_blocks, 128, smem, at::cuda::getCurrentCUDAStream()>>>(
             q.data_ptr<float>(),
             k.data_ptr<float>(),
             v.data_ptr<float>(),
@@ -1160,7 +1321,7 @@ torch::Tensor indexed_attention_cuda(
             Nkv,
             Tk,
             (float)scale);
-        check_last_cuda_error("indexed_attention_d64_warp_f32");
+        check_last_cuda_error("indexed_attention_d64_q4_shared_f32");
     } else {
         indexed_attention_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
             q.data_ptr<float>(),
@@ -1177,6 +1338,111 @@ torch::Tensor indexed_attention_cuda(
             D,
             (float)scale);
         check_last_cuda_error("indexed_attention_f32");
+    }
+    return out;
+}
+
+torch::Tensor indexed_attention_cublas_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F32(k);
+    WM_CHECK_F32(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "indexed_attention_cublas currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(Nkv > 0, "indices must be non-empty");
+
+    auto out = torch::empty_like(q);
+    auto k_compact = torch::empty({B, Hq, Nkv, 64}, q.options());
+    auto v_compact = torch::empty({B, Hq, Nkv, 64}, q.options());
+    auto scores = torch::empty({B, Hq, Tq, Nkv}, q.options());
+
+    int64_t compact_elems = (int64_t)B * Hq * Nkv * 64;
+    gather_indexed_kv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        k_compact.data_ptr<float>(),
+        v_compact.data_ptr<float>(),
+        B,
+        Hq,
+        Hkv,
+        Nkv,
+        Tk);
+    check_last_cuda_error("gather_indexed_kv_d64_f32");
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    const float alpha_qk = (float)scale;
+    const float alpha_av = 1.0f;
+    const float beta = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        TORCH_CHECK(cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            Nkv,
+            Tq,
+            64,
+            &alpha_qk,
+            k_compact.data_ptr<float>() + (int64_t)b * Hq * Nkv * 64,
+            64,
+            (long long)Nkv * 64,
+            q.data_ptr<float>() + (int64_t)b * Hq * Tq * 64,
+            64,
+            (long long)Tq * 64,
+            &beta,
+            scores.data_ptr<float>() + (int64_t)b * Hq * Tq * Nkv,
+            Nkv,
+            (long long)Tq * Nkv,
+            Hq) == CUBLAS_STATUS_SUCCESS, "cublas QK failed");
+    }
+
+    softmax_rows_inplace_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scores.data_ptr<float>(), B * Hq * Tq, Nkv);
+    check_last_cuda_error("softmax_rows_inplace_f32");
+
+    for (int b = 0; b < B; ++b) {
+        TORCH_CHECK(cublasSgemmStridedBatched(
+            handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            64,
+            Tq,
+            Nkv,
+            &alpha_av,
+            v_compact.data_ptr<float>() + (int64_t)b * Hq * Nkv * 64,
+            64,
+            (long long)Nkv * 64,
+            scores.data_ptr<float>() + (int64_t)b * Hq * Tq * Nkv,
+            Nkv,
+            (long long)Tq * Nkv,
+            &beta,
+            out.data_ptr<float>() + (int64_t)b * Hq * Tq * 64,
+            64,
+            (long long)Tq * 64,
+            Hq) == CUBLAS_STATUS_SUCCESS, "cublas AV failed");
     }
     return out;
 }
@@ -1489,6 +1755,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qkv_rms_rope", &qkv_rms_rope_cuda, "WorldModel fused QKV split + RMSNorm + OrthoRoPE (CUDA, f32)", py::arg("qkv"), py::arg("x_pos"), py::arg("y_pos"), py::arg("t_pos"), py::arg("xy"), py::arg("inv_t"), py::arg("n_heads"), py::arg("n_kv_heads"), py::arg("width"), py::arg("height"), py::arg("eps") = 1.0e-6);
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
     m.def("indexed_attention", &indexed_attention_cuda, "WorldModel indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("indexed_attention_cublas", &indexed_attention_cublas_cuda, "WorldModel indexed GQA attention (cuBLAS prototype, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");

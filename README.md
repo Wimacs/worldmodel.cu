@@ -92,9 +92,12 @@ ring slot is masked during attention, so no previous-frame history is visible
 and rollout looks like a fresh sample every frame. Use `--cache-window 2` or
 higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
 --headless-smoke`
-stabilizes around 100-111 ms per decoded 4-frame RGB chunk, about 36-40 RGB fps.
-The full `--steps 4` path keeps the quality-oriented schedule and longer cache,
-but FPS drops as cache history grows.
+stabilizes around 80 ms per decoded 4-frame RGB chunk, about 50 RGB fps. With
+`--steps 4 --cache-window 8 --warmup 9 --headless-smoke`, the current CUDA path
+stabilizes around 300 ms per decoded chunk, about 13 RGB fps. D=64 cache
+attention uses the cuBLAS path by default when every cache has
+`pinned_dilation=1` and at most 8192 visible tokens; set
+`WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback.
 
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the PyTorch controller layout
@@ -193,8 +196,8 @@ python generate_smoke.py --model-dir ../Waypoint-1.5-1B --steps 1 --cache-pass
 Notes:
 
 - Kernels currently target float32 parity first, with resident realtime fast
-  paths for FP16-weight GEMM, warp-level D=64 indexed attention, and optional
-  cuDNN VAE convolutions.
+  paths for FP16-weight GEMM, cuBLAS-backed D=64 indexed cache attention, and
+  optional cuDNN VAE convolutions.
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,

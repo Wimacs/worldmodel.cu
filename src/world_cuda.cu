@@ -635,6 +635,70 @@ __global__ static void indexed_attention_cache_d64_warp_f32_kernel(
     }
 }
 
+__global__ static void gather_indexed_kv_d64_f32_kernel(
+        const float *__restrict__ cache_k,
+        const float *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ k_compact,
+        float *__restrict__ v_compact,
+        int Hq,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Hq * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hq = (int)(q / Nkv);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
+    k_compact[i] = cache_k[src];
+    v_compact[i] = cache_v[src];
+}
+
+__global__ static void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+    float *row_x = x + (int64_t)row * cols;
+
+    float mx = -INFINITY;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        mx = fmaxf(mx, row_x[c]);
+    }
+    red[tid] = mx;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    mx = red[0];
+
+    float sum = 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        float v = expf(row_x[c] - mx);
+        row_x[c] = v;
+        sum += v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        row_x[c] *= inv;
+    }
+}
+
 __global__ static void gated_residual_add_f32_kernel(
         const float *residual,
         const float *update,
@@ -1929,6 +1993,9 @@ struct WorldCudaRuntime {
     float *d_v;
     float *d_v_first;
     float *d_attn;
+    float *d_attn_scores;
+    float *d_attn_k_compact;
+    float *d_attn_v_compact;
     float *d_attn_out;
     float *d_tokens_after_attn;
     float *d_ctrl_norm;
@@ -1946,6 +2013,8 @@ struct WorldCudaRuntime {
     int64_t *d_y_pos;
     int64_t *d_t_pos;
     __half *d_linear_half;
+    int attn_cublas_enabled;
+    int attn_cublas_max_tokens;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
     cublasHandle_t handle;
@@ -1955,6 +2024,81 @@ struct WorldCudaRuntime {
     cudaEvent_t ev_after_vae;
     DeviceVaeDecoder d_vae;
 };
+
+static int visible_cache_tokens_pinned1_host(const DeviceWorldLayerCache *cache, int T, int frame_idx) {
+    int ring_slots = cache->ring_length / T;
+    int slots = frame_idx + 1;
+    if (slots < 1) slots = 1;
+    if (slots > ring_slots) slots = ring_slots;
+    return slots * T;
+}
+
+static int indexed_attention_cache_d64_cublas(
+        WorldCudaRuntime *rt,
+        const DeviceWorldLayerCache *cache,
+        int Nkv,
+        float scale) {
+    if (!rt || !cache || Nkv <= 0 || Nkv > rt->attn_cublas_max_tokens) return 1;
+    int Hq = rt->cfg.n_heads;
+    int Hkv = rt->cfg.n_kv_heads;
+    int Tq = rt->T;
+    int group = Hq / Hkv;
+    if (group <= 0 || Hq % Hkv != 0) return 1;
+
+    int64_t compact_elems = (int64_t)Hq * Nkv * 64;
+    gather_indexed_kv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256>>>(
+        cache->k, cache->v, cache->indices,
+        rt->d_attn_k_compact, rt->d_attn_v_compact,
+        Hq, Hkv, Nkv, cache->capacity);
+    CUDA_OK(cudaGetLastError());
+
+    const float alpha_qk = scale;
+    const float alpha_av = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_OK(cublasSgemmStridedBatched(
+        rt->handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        Nkv,
+        Tq,
+        64,
+        &alpha_qk,
+        rt->d_attn_k_compact,
+        64,
+        (long long)Nkv * 64,
+        rt->d_q,
+        64,
+        (long long)Tq * 64,
+        &beta,
+        rt->d_attn_scores,
+        Nkv,
+        (long long)Tq * Nkv,
+        Hq));
+
+    softmax_rows_inplace_f32_kernel<<<Hq * Tq, 256>>>(rt->d_attn_scores, Hq * Tq, Nkv);
+    CUDA_OK(cudaGetLastError());
+
+    CUBLAS_OK(cublasSgemmStridedBatched(
+        rt->handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        64,
+        Tq,
+        Nkv,
+        &alpha_av,
+        rt->d_attn_v_compact,
+        64,
+        (long long)Nkv * 64,
+        rt->d_attn_scores,
+        Nkv,
+        (long long)Tq * Nkv,
+        &beta,
+        rt->d_attn,
+        Hq * 64,
+        64,
+        Hq));
+    return 0;
+}
 
 static double monotonic_seconds(void) {
     struct timespec ts;
@@ -2001,6 +2145,9 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_v);
     cudaFree(rt->d_v_first);
     cudaFree(rt->d_attn);
+    cudaFree(rt->d_attn_scores);
+    cudaFree(rt->d_attn_k_compact);
+    cudaFree(rt->d_attn_v_compact);
     cudaFree(rt->d_attn_out);
     cudaFree(rt->d_tokens_after_attn);
     cudaFree(rt->d_ctrl_norm);
@@ -2090,6 +2237,9 @@ extern "C" int world_cuda_runtime_create(
     size_t patch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
+    const char *cublas_attn_env = NULL;
+    int cublas_attn_max_tokens = 0;
+    int cublas_attn_supported = 1;
 
 #define RT_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -2168,6 +2318,29 @@ extern "C" int world_cuda_runtime_create(
     if (copy_f32_to_device(&rt->d_unpatch_b, weights->unpatchify_bias, (size_t)rt->C)) goto fail;
     if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
     if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head)) goto fail;
+    cublas_attn_env = getenv("WORLD_CUBLAS_ATTN");
+    if ((!cublas_attn_env || cublas_attn_env[0] != '0') && rt->d_head == 64 && cfg->n_heads % cfg->n_kv_heads == 0) {
+        cublas_attn_max_tokens = 0;
+        cublas_attn_supported = 1;
+        for (int i = 0; i < layers_to_run; ++i) {
+            DeviceWorldLayerCache *cache = &rt->d_caches[i];
+            if (cache->pinned_dilation != 1) cublas_attn_supported = 0;
+            if (cache->ring_length > cublas_attn_max_tokens) cublas_attn_max_tokens = cache->ring_length;
+        }
+        if (cublas_attn_supported && cublas_attn_max_tokens > 0 && cublas_attn_max_tokens <= 8192) {
+            rt->attn_cublas_enabled = 1;
+            rt->attn_cublas_max_tokens = cublas_attn_max_tokens;
+            RT_CUDA(cudaMalloc((void **)&rt->d_attn_scores, (size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)));
+            RT_CUDA(cudaMalloc((void **)&rt->d_attn_k_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
+            RT_CUDA(cudaMalloc((void **)&rt->d_attn_v_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
+            fprintf(stderr, "cuBLAS attention enabled: max_tokens=%d score_scratch=%.2f MiB\n",
+                    cublas_attn_max_tokens,
+                    (double)((size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)) / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "cuBLAS attention disabled: pinned1=%d max_tokens=%d\n",
+                    cublas_attn_supported, cublas_attn_max_tokens);
+        }
+    }
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUBLAS(cublasCreate(&rt->handle));
@@ -2324,10 +2497,20 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
             if (rt->d_head == 64) {
-                indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
-                    rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
-                    cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
-                    1.0f / 8.0f);
+                int cublas_attn_ok = 0;
+                if (rt->attn_cublas_enabled && cache->pinned_dilation == 1) {
+                    int n_tokens = visible_cache_tokens_pinned1_host(cache, rt->T, current_frame_idx);
+                    if (n_tokens > 0 && n_tokens <= rt->attn_cublas_max_tokens) {
+                        if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        cublas_attn_ok = 1;
+                    }
+                }
+                if (!cublas_attn_ok) {
+                    indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
+                        rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                        cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                        1.0f / 8.0f);
+                }
             } else {
                 indexed_attention_cache_f32_kernel<<<cfg->n_heads * rt->T, 256>>>(
                     rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
