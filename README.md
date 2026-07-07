@@ -151,6 +151,9 @@ Notes:
 - The standalone layer conditioning heads also keep the six attention/MLP
   scale-bias-gate projection matrices as one resident GPU matrix, reducing the
   per-layer conditioning projection from six cuBLAS GEMMs to one.
+- Controller conditioning vectors are projected once per generated frame for
+  each control-conditioned layer, then reused across all scheduler and cache
+  passes for that frame.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across

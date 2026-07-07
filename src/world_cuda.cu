@@ -2229,7 +2229,7 @@ extern "C" int world_cuda_transformer_probe(
     float *d_attn_out = NULL;
     float *d_tokens_after_attn = NULL;
     float *d_ctrl_norm = NULL;
-    float *d_ctrl_cond = NULL;
+    float *d_ctrl_cond_by_layer = NULL;
     float *d_ctrl_hidden = NULL;
     float *d_ctrl_out = NULL;
     float *d_tokens_after_ctrl = NULL;
@@ -2291,7 +2291,7 @@ extern "C" int world_cuda_transformer_probe(
     TRY_CUDA2(cudaMalloc((void **)&d_attn_out, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_tokens_after_attn, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_ctrl_norm, token_elems * sizeof(float)));
-    TRY_CUDA2(cudaMalloc((void **)&d_ctrl_cond, (size_t)D * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_ctrl_cond_by_layer, (size_t)layers_to_run * D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_ctrl_hidden, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_ctrl_out, token_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_tokens_after_ctrl, token_elems * sizeof(float)));
@@ -2338,6 +2338,14 @@ extern "C" int world_cuda_transformer_probe(
         TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
         rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
         TRY_CUDA2(cudaGetLastError());
+        for (int layer_idx = 0; layer_idx < layers_to_run; ++layer_idx) {
+            const DeviceWorldLayerWeights *lw = &d_layers[layer_idx];
+            if (lw->has_ctrl) {
+                TRY_LINEAR2(d_ctrl_emb_norm, lw->ctrl_fc1_c_weight,
+                            d_ctrl_cond_by_layer + (size_t)layer_idx * D,
+                            1, D, D);
+            }
+        }
         if (weights->initial_latents) {
             memcpy(h_latent,
                    weights->initial_latents + (size_t)frame_ordinal * latent_elems,
@@ -2450,9 +2458,9 @@ extern "C" int world_cuda_transformer_probe(
             if (lw->has_ctrl) {
                 rms_norm_rows_f32_kernel<<<T, 256>>>(d_tokens_after_attn, d_ctrl_norm, T, D, 1.0e-6f);
                 TRY_CUDA2(cudaGetLastError());
-                TRY_LINEAR2(d_ctrl_emb_norm, lw->ctrl_fc1_c_weight, d_ctrl_cond, 1, D, D);
                 TRY_LINEAR2(d_ctrl_norm, lw->ctrl_fc1_x_weight, d_ctrl_hidden, T, D, D);
-                add_channel_silu_inplace_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(d_ctrl_hidden, d_ctrl_cond, T, D);
+                add_channel_silu_inplace_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
+                    d_ctrl_hidden, d_ctrl_cond_by_layer + (size_t)layer_idx * D, T, D);
                 TRY_CUDA2(cudaGetLastError());
                 TRY_LINEAR2(d_ctrl_hidden, lw->ctrl_fc2_weight, d_ctrl_out, T, D, D);
                 add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
@@ -2557,7 +2565,7 @@ cleanup_device:
     cudaFree(d_attn_out);
     cudaFree(d_tokens_after_attn);
     cudaFree(d_ctrl_norm);
-    cudaFree(d_ctrl_cond);
+    cudaFree(d_ctrl_cond_by_layer);
     cudaFree(d_ctrl_hidden);
     cudaFree(d_ctrl_out);
     cudaFree(d_tokens_after_ctrl);
