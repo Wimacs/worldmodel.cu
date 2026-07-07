@@ -1866,6 +1866,7 @@ struct WorldCudaRuntime {
     size_t kv_rope_elems;
     size_t q_rope_elems;
     size_t linear_half_elems;
+    const float *h_latent_override;
     float *h_latent;
     float *h_noise;
     float *h_xy;
@@ -2217,7 +2218,11 @@ extern "C" int world_cuda_runtime_step_rgb(
         }
     }
 
-    fill_latent(rt->h_latent, (int)rt->latent_elems, rt->seed + (unsigned int)rt->frame_ordinal, rt->noise_mode);
+    if (rt->h_latent_override) {
+        memcpy(rt->h_latent, rt->h_latent_override, rt->latent_elems * sizeof(float));
+    } else {
+        fill_latent(rt->h_latent, (int)rt->latent_elems, rt->seed + (unsigned int)rt->frame_ordinal, rt->noise_mode);
+    }
     fill_positions(rt->h_x_pos, rt->h_y_pos, rt->h_t_pos, rt->T, cfg->width, frame_timestamp);
     STEP_CUDA(cudaMemcpy(rt->d_latent, rt->h_latent, rt->latent_elems * sizeof(float), cudaMemcpyHostToDevice));
     STEP_CUDA(cudaMemcpy(rt->d_x_pos, rt->h_x_pos, (size_t)rt->T * sizeof(int64_t), cudaMemcpyHostToDevice));
@@ -2385,6 +2390,32 @@ extern "C" int world_cuda_runtime_step_rgb(
 #undef STEP_LINEAR
 #undef STEP_LINEAR_FAST
     return 0;
+}
+
+extern "C" int world_cuda_runtime_seed_latent_rgb(
+        WorldCudaRuntime *rt,
+        const float *latent,
+        const float *control_input,
+        const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out) {
+    if (!rt || !latent || !control_input) return 1;
+    int old_steps_to_run = rt->steps_to_run;
+    int old_total_passes = rt->total_passes;
+    const float *old_override = rt->h_latent_override;
+
+    rt->h_latent_override = latent;
+    rt->steps_to_run = 0;
+    rt->total_passes = 1;
+    int rc = world_cuda_runtime_step_rgb(
+        rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
+
+    rt->h_latent_override = old_override;
+    rt->steps_to_run = old_steps_to_run;
+    rt->total_passes = old_total_passes;
+    return rc;
 }
 
 extern "C" int world_cuda_generation_probe(

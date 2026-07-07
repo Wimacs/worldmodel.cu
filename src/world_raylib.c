@@ -51,7 +51,7 @@ enum {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
             "then renders decoded RGB frames to a raylib texture without writing images.\n",
@@ -250,6 +250,7 @@ int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
     const char *vae_weights = NULL;
+    const char *seed_latent_path = NULL;
     int steps_to_run = -1;
     int layers_to_run = -1;
     int frame_idx = 0;
@@ -269,6 +270,8 @@ int main(int argc, char **argv) {
             weights = argv[++i];
         } else if (strcmp(argv[i], "--vae-weights") == 0 && i + 1 < argc) {
             vae_weights = argv[++i];
+        } else if (strcmp(argv[i], "--seed-latent") == 0 && i + 1 < argc) {
+            seed_latent_path = argv[++i];
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             steps_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
@@ -344,12 +347,20 @@ int main(int argc, char **argv) {
     LoadedWorldModel model;
     WorldVaeDecoderWeights vae;
     WorldCudaRuntime *rt = NULL;
+    float *seed_latent = NULL;
+    memset(&st, 0, sizeof(st));
     memset(&model, 0, sizeof(model));
     memset(&vae, 0, sizeof(vae));
     int rc = 1;
 
+    size_t seed_latent_elems = (size_t)cfg.channels * (size_t)(cfg.height * cfg.patch_h) * (size_t)(cfg.width * cfg.patch_w);
+    if (seed_latent_path) {
+        if (read_f32_file_exact(seed_latent_path, seed_latent_elems, &seed_latent)) goto cleanup_before_window;
+        fprintf(stderr, "loaded seed latent: %s elems=%zu\n", seed_latent_path, seed_latent_elems);
+    }
+
     fprintf(stderr, "loading transformer safetensors: %s\n", weights);
-    if (safetensors_open(&st, weights)) return 1;
+    if (safetensors_open(&st, weights)) goto cleanup_before_window;
     if (load_live_model_weights(&st, &cfg, layers_to_run, &model)) goto cleanup_before_window;
     safetensors_close(&st);
     memset(&st, 0, sizeof(st));
@@ -370,6 +381,13 @@ int main(int argc, char **argv) {
     int rgb_h = 0;
     int rgb_frames = 0;
     float warm_seconds = 0.0f;
+    if (seed_latent) {
+        fprintf(stderr, "seeding runtime KV cache from latent\n");
+        if (world_cuda_runtime_seed_latent_rgb(rt, seed_latent, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            free(zero_control);
+            goto cleanup_before_window;
+        }
+    }
     for (int i = 0; i < warmup_chunks; ++i) {
         fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
         if (world_cuda_runtime_step_rgb(rt, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
@@ -390,6 +408,7 @@ int main(int argc, char **argv) {
                 "headless smoke: resident runtime produced %d RGB frame(s) %dx%d in %.3fs, no image files written\n",
                 rgb_frames, rgb_w, rgb_h, warm_seconds);
         free(display_rgb);
+        free(seed_latent);
         world_cuda_runtime_destroy(rt);
         return 0;
     }
@@ -489,6 +508,7 @@ int main(int argc, char **argv) {
     rc = final_failed ? 1 : 0;
 
 cleanup_runtime_only:
+    free(seed_latent);
     world_cuda_runtime_destroy(rt);
     return rc;
 
@@ -496,6 +516,7 @@ cleanup_before_window:
     safetensors_close(&st);
     free_loaded_model(&model);
     free_vae_decoder_weights(&vae);
+    free(seed_latent);
     world_cuda_runtime_destroy(rt);
     return rc;
 }

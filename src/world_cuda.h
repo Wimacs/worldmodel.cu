@@ -176,6 +176,16 @@ int world_cuda_runtime_step_rgb(
         int *frames_out,
         float *seconds_out);
 
+int world_cuda_runtime_seed_latent_rgb(
+        WorldCudaRuntime *rt,
+        const float *latent,
+        const float *control_input,
+        const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out);
+
 void world_cuda_runtime_destroy(WorldCudaRuntime *rt);
 
 #ifdef __cplusplus

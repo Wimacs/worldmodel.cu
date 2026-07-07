@@ -46,13 +46,32 @@ runtime, runs a warmup chunk, then opens a window and streams decoded RGB frames
 directly into a raylib texture without writing image files:
 
 ```sh
-./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --steps 4
+python export_seed_latent.py \
+  --model-dir ../Waypoint-1.5-1B \
+  --out /tmp/world_seed_latent.f32
+
+./build/worldmodel_raylib \
+  --model-dir ../Waypoint-1.5-1B \
+  --steps 4 \
+  --cache-window 1 \
+  --seed-latent /tmp/world_seed_latent.f32
 ```
+
+The seed latent mirrors the Python runtime's `append_frame()` startup path: it
+encodes a starter image with the checkpoint VAE, runs one cache-only pass to
+anchor visual history, and then generates subsequent frames from live controls.
+Running without `--seed-latent` starts from random latent noise and is useful for
+parity/debugging, but it is not a controllable world rollout.
 
 For terminal-only validation of the same resident runtime path:
 
 ```sh
-./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --steps 4 --headless-smoke
+./build/worldmodel_raylib \
+  --model-dir ../Waypoint-1.5-1B \
+  --steps 4 \
+  --cache-window 1 \
+  --seed-latent /tmp/world_seed_latent.f32 \
+  --headless-smoke
 ```
 
 For a lower-latency interactive mode, use the fast realtime preset. It uses one
@@ -69,9 +88,11 @@ The full `--steps 4` path keeps the quality-oriented schedule and longer cache,
 but FPS drops as cache history grows.
 
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
-delta, and mouse wheel into the controller vector. CUDA generation runs on a
-worker thread while the raylib main thread keeps polling input and presenting
-the latest decoded 4-frame RGB chunk.
+delta, and mouse wheel into the PyTorch controller layout
+`[mouse_x, mouse_y, buttons..., scroll]`, using Owl-Control/Windows virtual key
+codes for the button indices. CUDA generation runs on a worker thread while the
+raylib main thread keeps polling input and presenting the latest decoded frame
+from each generated chunk.
 
 Run the current standalone image probe:
 
