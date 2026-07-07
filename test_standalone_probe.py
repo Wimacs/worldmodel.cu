@@ -55,6 +55,26 @@ def _lcg_latent(shape, seed):
     return out.reshape(shape)
 
 
+def _lcg_normal_latent(shape, seed):
+    state = seed or 1
+    out = np.empty(int(np.prod(shape)), dtype=np.float32)
+    i = 0
+    while i < out.size:
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        u1 = np.float32(((state >> 8) & 0x00FFFFFF) / 16777216.0)
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        u2 = np.float32(((state >> 8) & 0x00FFFFFF) / 16777216.0)
+        if u1 < np.float32(1.0e-7):
+            u1 = np.float32(1.0e-7)
+        mag = np.float32(math.sqrt(float(np.float32(-2.0) * np.float32(math.log(float(u1))))))
+        phase = np.float32(np.float32(2.0 * math.pi) * u2)
+        out[i] = np.float32(mag * np.float32(math.cos(float(phase))))
+        if i + 1 < out.size:
+            out[i + 1] = np.float32(mag * np.float32(math.sin(float(phase))))
+        i += 2
+    return out.reshape(shape)
+
+
 def _control_vector(cfg):
     n = int(cfg["n_buttons"]) + 3
     idx = np.arange(n, dtype=np.float32)
@@ -143,6 +163,46 @@ def _assert_close(name, actual_cpu, expected, rtol=3.0e-4, atol=3.0e-4):
     print(f"{name}: ok max_abs={diff:.6g}")
 
 
+def test_standalone_normal_noise_dump_matches_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not WEIGHTS_PATH.exists():
+        pytest.skip(f"missing Waypoint weights: {WEIGHTS_PATH}")
+
+    cfg = _load_config()
+    exe = _build_executable()
+    seed = 2468
+    device = torch.device("cuda")
+
+    with tempfile.TemporaryDirectory(prefix="world_normal_noise_probe_") as td:
+        prefix = str(Path(td) / "dump")
+        subprocess.run(
+            [
+                str(exe),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--seed",
+                str(seed),
+                "--noise",
+                "normal",
+                "--sigma",
+                "1.0",
+                "--layers",
+                "1",
+                "--dump-prefix",
+                prefix,
+            ],
+            check=True,
+            cwd=str(ROOT),
+        )
+
+        c = cfg["channels"]
+        ph, pw = int(cfg["patch"][0]), int(cfg["patch"][1])
+        h, w = cfg["height"] * ph, cfg["width"] * pw
+        expected = torch.from_numpy(_lcg_normal_latent((1, c, h, w), seed)).to(device)
+        _assert_close("normal_noise_latent", _read_dump(prefix, "latent", (1, c, h, w)), expected, rtol=0, atol=2.0e-6)
+
+
 def test_standalone_layer0_probe_matches_pytorch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -167,6 +227,8 @@ def test_standalone_layer0_probe_matches_pytorch():
                 str(MODEL_DIR),
                 "--seed",
                 str(seed),
+                "--noise",
+                "uniform",
                 "--sigma",
                 str(sigma),
                 "--layers",
@@ -354,6 +416,8 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 str(MODEL_DIR),
                 "--seed",
                 str(seed),
+                "--noise",
+                "uniform",
                 "--sigma",
                 str(sigma),
                 "--layers",
@@ -639,6 +703,8 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 str(MODEL_DIR),
                 "--seed",
                 str(seed),
+                "--noise",
+                "uniform",
                 "--sigma",
                 str(sigma),
                 "--layers",
@@ -878,6 +944,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
 
 
 if __name__ == "__main__":
+    test_standalone_normal_noise_dump_matches_reference()
     test_standalone_layer0_probe_matches_pytorch()
     test_standalone_two_layer_transformer_matches_pytorch()
     test_standalone_two_frame_cache_rollout_matches_pytorch()

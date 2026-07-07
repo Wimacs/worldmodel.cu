@@ -7,6 +7,9 @@
 extern "C" {
 #endif
 
+#define WORLD_NOISE_UNIFORM 0
+#define WORLD_NOISE_NORMAL 1
+
 #define WORLD_VAE_DECODER_CONV_COUNT 35
 
 enum {
@@ -131,6 +134,7 @@ int world_cuda_layer0_probe(
         const WorldLayer0ProbeWeights *weights,
         float sigma,
         unsigned int seed,
+        int noise_mode,
         const char *dump_prefix);
 
 int world_cuda_transformer_probe(
@@ -143,6 +147,7 @@ int world_cuda_transformer_probe(
         int cache_pass,
         float sigma,
         unsigned int seed,
+        int noise_mode,
         const char *dump_prefix,
         const WorldVaeDecoderWeights *vae,
         const char *out_path);

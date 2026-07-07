@@ -764,12 +764,36 @@ static uint32_t lcg_next(uint32_t *state) {
     return *state;
 }
 
-static void fill_latent(float *x, int n, unsigned int seed) {
-    uint32_t s = seed ? seed : 1u;
+static float lcg_uniform01(uint32_t *state) {
+    uint32_t r = lcg_next(state);
+    return (float)((r >> 8) & 0x00FFFFFFu) / 16777216.0f;
+}
+
+static void fill_latent_uniform(float *x, int n, uint32_t *state) {
     for (int i = 0; i < n; ++i) {
-        uint32_t r = lcg_next(&s);
-        float u = (float)((r >> 8) & 0x00FFFFFFu) / 16777216.0f;
+        float u = lcg_uniform01(state);
         x[i] = 2.0f * u - 1.0f;
+    }
+}
+
+static void fill_latent_normal(float *x, int n, uint32_t *state) {
+    for (int i = 0; i < n; i += 2) {
+        float u1 = lcg_uniform01(state);
+        float u2 = lcg_uniform01(state);
+        if (u1 < 1.0e-7f) u1 = 1.0e-7f;
+        float mag = sqrtf(-2.0f * logf(u1));
+        float phase = 2.0f * (float)M_PI * u2;
+        x[i] = mag * cosf(phase);
+        if (i + 1 < n) x[i + 1] = mag * sinf(phase);
+    }
+}
+
+static void fill_latent(float *x, int n, unsigned int seed, int noise_mode) {
+    uint32_t s = seed ? seed : 1u;
+    if (noise_mode == WORLD_NOISE_NORMAL) {
+        fill_latent_normal(x, n, &s);
+    } else {
+        fill_latent_uniform(x, n, &s);
     }
 }
 
@@ -1434,7 +1458,7 @@ extern "C" int world_cuda_generation_probe(
         free(h_q);
         return 1;
     }
-    fill_latent(h_latent, (int)latent_elems, seed);
+    fill_latent(h_latent, (int)latent_elems, seed, WORLD_NOISE_UNIFORM);
 
     float *d_latent = NULL;
     float *d_patch = NULL;
@@ -1485,6 +1509,7 @@ extern "C" int world_cuda_layer0_probe(
         const WorldLayer0ProbeWeights *weights,
         float sigma,
         unsigned int seed,
+        int noise_mode,
         const char *dump_prefix) {
     int rc = 1;
     int C = cfg->channels;
@@ -1578,7 +1603,7 @@ extern "C" int world_cuda_layer0_probe(
         free(h_t_pos);
         return 1;
     }
-    fill_latent(h_latent, (int)latent_elems, seed);
+    fill_latent(h_latent, (int)latent_elems, seed, noise_mode);
     fill_noise_embedding(h_noise, sigma);
     fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, 0);
     fill_rope_tables(h_xy, h_inv_t, d_head, cfg->height, cfg->width);
@@ -2001,6 +2026,7 @@ extern "C" int world_cuda_transformer_probe(
         int cache_pass,
         float sigma,
         unsigned int seed,
+        int noise_mode,
         const char *dump_prefix,
         const WorldVaeDecoderWeights *vae,
         const char *out_path) {
@@ -2230,7 +2256,7 @@ extern "C" int world_cuda_transformer_probe(
         TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
         rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
         TRY_CUDA2(cudaGetLastError());
-        fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal);
+        fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal, noise_mode);
         fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
         TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
         TRY_CUDA2(cudaMemcpy(d_x_pos, h_x_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));

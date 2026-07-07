@@ -45,6 +45,9 @@ Run the current standalone image probe:
 ./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frames 2 --frame-idx 3 --cache-pass --control-seq controls_seq.f32 --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
+Initial latent noise defaults to `--noise normal`, using the standalone C
+LCG plus Box-Muller transform to produce standard normal samples. Pass
+`--noise uniform` to reproduce the earlier uniform `[-1, 1]` parity fixtures.
 Pass `--control controls.f32` to provide one little-endian float32 controller
 vector of length `n_buttons + 3`; it is broadcast to every generated frame. Pass
 `--control-seq controls_seq.f32` to provide `frames * (n_buttons + 3)` float32
@@ -120,18 +123,20 @@ Notes:
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,
-  controller input loading, controller embedding, per-layer local/global KV
-  ring-cache allocation, frozen tail upsert, indexed GQA attention, 24-layer
-  transformer token forward, value residual, optional ctrl fusion with
+  normal or uniform seeded latent noise, controller input loading, controller
+  embedding, per-layer local/global KV ring-cache allocation, frozen tail
+  upsert, indexed GQA attention, 24-layer transformer token forward, value
+  residual, optional ctrl fusion with
   `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
   conversion, resident VAE decoder weights/scratch buffers, TAEHV direct
   conv/MemBlock/TGrow/upsample decode, pixel shuffle, and 4-frame PPM output.
   Multi-frame standalone rollout recomputes the controller embedding from the
   current frame's control vector before each denoise/cache pass pair.
-  `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
-  two-layer transformer + latent output + one-step scheduler update + VAE PPM
-  decode path against PyTorch reference math for all 4 decoded frames.
+  `test_standalone_probe.py` checks the standalone normal-noise fixture, the
+  fully dumped layer-0 path, and a two-layer transformer + latent output +
+  one-step scheduler update + VAE PPM decode path against PyTorch reference
+  math for all 4 decoded frames.
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.

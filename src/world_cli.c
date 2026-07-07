@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--seed N] [--noise normal|uniform] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -252,6 +252,7 @@ int main(int argc, char **argv) {
     const char *dump_prefix = NULL;
     const char *out_path = NULL;
     unsigned int seed = 1234;
+    int noise_mode = WORLD_NOISE_NORMAL;
     float sigma = 1.0f;
     int layers_to_run = -1;
     int steps_to_run = 1;
@@ -272,6 +273,16 @@ int main(int argc, char **argv) {
             control_seq_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "normal") == 0) {
+                noise_mode = WORLD_NOISE_NORMAL;
+            } else if (strcmp(mode, "uniform") == 0) {
+                noise_mode = WORLD_NOISE_UNIFORM;
+            } else {
+                fprintf(stderr, "invalid --noise %s, expected normal or uniform\n", mode);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
             sigma = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
@@ -349,6 +360,7 @@ int main(int argc, char **argv) {
         cache_pass = 1;
     }
     world_config_print(&cfg);
+    fprintf(stderr, "noise: %s seed=%u\n", noise_mode == WORLD_NOISE_NORMAL ? "normal" : "uniform", seed);
 
     SafeTensors st;
     fprintf(stderr, "loading safetensors index: %s\n", weights);
@@ -493,7 +505,7 @@ int main(int argc, char **argv) {
             unpatchify_weight,
             unpatchify_bias,
         };
-        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, frames_to_run, frame_idx, cache_pass, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, frames_to_run, frame_idx, cache_pass, sigma, seed, noise_mode, dump_prefix, out_path ? &vae : NULL, out_path);
         goto cleanup;
     }
 
@@ -570,7 +582,7 @@ int main(int argc, char **argv) {
         layer0_dit_mlp_fc1_weight,
         layer0_dit_mlp_fc2_weight,
     };
-    rc = world_cuda_layer0_probe(&cfg, &layer0, sigma, seed, dump_prefix);
+    rc = world_cuda_layer0_probe(&cfg, &layer0, sigma, seed, noise_mode, dump_prefix);
 
 cleanup:
     free(patchify_weight);
