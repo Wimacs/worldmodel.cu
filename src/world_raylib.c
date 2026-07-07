@@ -73,6 +73,37 @@ static void free_loaded_model(LoadedWorldModel *m) {
     memset(m, 0, sizeof(*m));
 }
 
+static int ray_load_layer_as_f32(
+        const SafeTensors *st,
+        int layer,
+        const char *suffix,
+        const int64_t *shape,
+        int ndim,
+        float **out) {
+    char name[256];
+    int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) return 1;
+    return load_required_as_f32(st, name, shape, ndim, out);
+}
+
+static int ray_load_optional_layer_as_f32(
+        const SafeTensors *st,
+        int layer,
+        const char *suffix,
+        const int64_t *shape,
+        int ndim,
+        float **out) {
+    char name[256];
+    int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) return 1;
+    const SafeTensorEntry *e = safetensors_find(st, name);
+    if (!e) {
+        *out = NULL;
+        return 0;
+    }
+    return load_required_as_f32(st, name, shape, ndim, out);
+}
+
 static int load_live_model_weights(
         const SafeTensors *st,
         const WorldConfig *cfg,
@@ -95,37 +126,37 @@ static int load_live_model_weights(
     int64_t kv_proj_shape[2] = {kv_dim, cfg->d_model};
     int64_t unpatch_bias_shape[1] = {cfg->channels};
 
-    if (load_required_f32(st, "patchify.weight", patch_shape, 4, &m->patchify_weight)) return 1;
-    if (load_required_f32(st, "denoise_step_emb.mlp.fc1.weight", denoise_fc1_shape, 2, &m->denoise_fc1_weight)) return 1;
-    if (load_required_f32(st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &m->denoise_fc2_weight)) return 1;
-    if (load_required_f32(st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &m->ctrl_emb_fc1_weight)) return 1;
-    if (load_required_f32(st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &m->ctrl_emb_fc2_weight)) return 1;
-    if (load_required_f32(st, "out_norm.fc.weight", out_norm_shape, 2, &m->out_norm_fc_weight)) return 1;
-    if (load_required_f32(st, "unpatchify.weight", patch_shape, 4, &m->unpatchify_weight)) return 1;
-    if (load_required_f32(st, "unpatchify.bias", unpatch_bias_shape, 1, &m->unpatchify_bias)) return 1;
+    if (load_required_as_f32(st, "patchify.weight", patch_shape, 4, &m->patchify_weight)) return 1;
+    if (load_required_as_f32(st, "denoise_step_emb.mlp.fc1.weight", denoise_fc1_shape, 2, &m->denoise_fc1_weight)) return 1;
+    if (load_required_as_f32(st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &m->denoise_fc2_weight)) return 1;
+    if (load_required_as_f32(st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &m->ctrl_emb_fc1_weight)) return 1;
+    if (load_required_as_f32(st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &m->ctrl_emb_fc2_weight)) return 1;
+    if (load_required_as_f32(st, "out_norm.fc.weight", out_norm_shape, 2, &m->out_norm_fc_weight)) return 1;
+    if (load_required_as_f32(st, "unpatchify.weight", patch_shape, 4, &m->unpatchify_weight)) return 1;
+    if (load_required_as_f32(st, "unpatchify.bias", unpatch_bias_shape, 1, &m->unpatchify_bias)) return 1;
 
     m->layers = (WorldLayerWeights *)calloc((size_t)layers_to_run, sizeof(*m->layers));
     if (!m->layers) return 1;
     for (int layer = 0; layer < layers_to_run; ++layer) {
         WorldLayerWeights *lw = &m->layers[layer];
-        if (load_layer_f32(st, layer, "mlp_cond_head.bias_in", d_shape, 1, (float **)&lw->cond_bias)) return 1;
-        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->attn_cond_s_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->attn_cond_b_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->attn_cond_g_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn.q_proj.weight", dxd_shape, 2, (float **)&lw->q_proj_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn.k_proj.weight", kv_proj_shape, 2, (float **)&lw->k_proj_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn.v_proj.weight", kv_proj_shape, 2, (float **)&lw->v_proj_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn.out_proj.weight", dxd_shape, 2, (float **)&lw->out_proj_weight)) return 1;
-        if (load_layer_f32(st, layer, "attn.v_lamb", NULL, 0, (float **)&lw->v_lamb)) return 1;
-        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->mlp_cond_s_weight)) return 1;
-        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->mlp_cond_b_weight)) return 1;
-        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->mlp_cond_g_weight)) return 1;
-        if (load_optional_layer_f32(st, layer, "ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_x_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "mlp_cond_head.bias_in", d_shape, 1, (float **)&lw->cond_bias)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->attn_cond_s_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->attn_cond_b_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->attn_cond_g_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn.q_proj.weight", dxd_shape, 2, (float **)&lw->q_proj_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn.k_proj.weight", kv_proj_shape, 2, (float **)&lw->k_proj_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn.v_proj.weight", kv_proj_shape, 2, (float **)&lw->v_proj_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn.out_proj.weight", dxd_shape, 2, (float **)&lw->out_proj_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "attn.v_lamb", NULL, 0, (float **)&lw->v_lamb)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "mlp_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->mlp_cond_s_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "mlp_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->mlp_cond_b_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->mlp_cond_g_weight)) return 1;
+        if (ray_load_optional_layer_as_f32(st, layer, "ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_x_weight)) return 1;
         lw->has_ctrl = lw->ctrl_fc1_x_weight != NULL;
-        if (lw->has_ctrl && load_layer_f32(st, layer, "ctrl_mlpfusion.fc1_c.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_c_weight)) return 1;
-        if (lw->has_ctrl && load_layer_f32(st, layer, "ctrl_mlpfusion.fc2.weight", dxd_shape, 2, (float **)&lw->ctrl_fc2_weight)) return 1;
-        if (load_layer_f32(st, layer, "dit_mlp.fc1.weight", hidden_d_shape, 2, (float **)&lw->dit_mlp_fc1_weight)) return 1;
-        if (load_layer_f32(st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) return 1;
+        if (lw->has_ctrl && ray_load_layer_as_f32(st, layer, "ctrl_mlpfusion.fc1_c.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_c_weight)) return 1;
+        if (lw->has_ctrl && ray_load_layer_as_f32(st, layer, "ctrl_mlpfusion.fc2.weight", dxd_shape, 2, (float **)&lw->ctrl_fc2_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "dit_mlp.fc1.weight", hidden_d_shape, 2, (float **)&lw->dit_mlp_fc1_weight)) return 1;
+        if (ray_load_layer_as_f32(st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) return 1;
     }
 
     m->probe.patchify_weight = m->patchify_weight;
@@ -368,7 +399,7 @@ int main(int argc, char **argv) {
     char default_vae_weights[PATH_BUF];
     if (join_path(config_path, sizeof(config_path), model_dir, "config.yaml")) return 1;
     if (!weights) {
-        if (join_path(default_weights, sizeof(default_weights), model_dir, "transformer/diffusion_pytorch_model.safetensors")) return 1;
+        if (join_path(default_weights, sizeof(default_weights), model_dir, "model.safetensors")) return 1;
         weights = default_weights;
     }
     if (!vae_weights) {
@@ -384,10 +415,15 @@ int main(int argc, char **argv) {
     }
     if (cache_window_override > 0) {
         cfg.local_window = cache_window_override;
-        cfg.global_window = cache_window_override;
-        cfg.global_pinned_dilation = 1;
-        fprintf(stderr, "realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
-                cfg.local_window, cfg.global_window);
+        if (fast_realtime) {
+            cfg.global_window = cache_window_override;
+            cfg.global_pinned_dilation = 1;
+            fprintf(stderr, "fast realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
+                    cfg.local_window, cfg.global_window);
+        } else {
+            fprintf(stderr, "local cache override: local_window=%d, keeping global_window=%d global_pinned_dilation=%d\n",
+                    cfg.local_window, cfg.global_window, cfg.global_pinned_dilation);
+        }
         if (cache_window_override == 1) {
             fprintf(stderr,
                     "warning: --cache-window 1 masks the current ring slot and leaves no previous-frame history; use --cache-window 2 or higher for controllable rollout\n");

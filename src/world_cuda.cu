@@ -2729,7 +2729,10 @@ struct WorldCudaRuntime {
     int ctrl_dim;
     int d_xy;
     int d_t;
+    float rms_eps;
     int total_passes;
+    int precomputed_total_passes;
+    int forced_pass_table_idx;
     int frame_stride;
     size_t latent_elems;
     size_t token_elems;
@@ -2760,7 +2763,7 @@ struct WorldCudaRuntime {
     float *d_ctrl_emb;
     float *d_ctrl_emb_norm;
     float *d_out_norm_w;
-    float *d_out_mod;
+    float *d_out_mod_table;
     float *d_final_tokens;
     float *d_unpatch_w;
     float *d_unpatch_b;
@@ -2984,7 +2987,7 @@ static int indexed_attention_cache_d64_cublas_gqa(
 }
 
 static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
-    if (!rt || !rt->d_layer_mod_table) return 1;
+    if (!rt || !rt->d_layer_mod_table || !rt->d_out_mod_table) return 1;
     const WorldConfig *cfg = &rt->cfg;
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
@@ -2996,6 +2999,16 @@ static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
         silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_noise_hidden, rt->d_noise_hidden, rt->mlp_hidden);
         CUDA_OK(cudaGetLastError());
         if (row_major_linear(rt->handle, rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D)) return 1;
+        silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, rt->d_cond_act, rt->D);
+        CUDA_OK(cudaGetLastError());
+        if (row_major_linear(
+                    rt->handle,
+                    rt->d_cond_act,
+                    rt->d_out_norm_w,
+                    rt->d_out_mod_table + (int64_t)pass_idx * 2 * rt->D,
+                    1,
+                    rt->D,
+                    2 * rt->D)) return 1;
 
         for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
             const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
@@ -3041,7 +3054,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_ctrl_emb);
     cudaFree(rt->d_ctrl_emb_norm);
     cudaFree(rt->d_out_norm_w);
-    cudaFree(rt->d_out_mod);
+    cudaFree(rt->d_out_mod_table);
     cudaFree(rt->d_final_tokens);
     cudaFree(rt->d_unpatch_w);
     cudaFree(rt->d_unpatch_b);
@@ -3143,7 +3156,18 @@ extern "C" int world_cuda_runtime_create(
     rt->ctrl_dim = cfg->n_buttons + 3;
     rt->d_xy = rt->d_head / 8;
     rt->d_t = rt->d_head / 4;
+    rt->rms_eps = 1.0e-6f;
+    {
+        const char *rms_eps_env = getenv("WORLD_RMS_EPS");
+        if (rms_eps_env && rms_eps_env[0]) {
+            float v = (float)atof(rms_eps_env);
+            if (v > 0.0f) rt->rms_eps = v;
+        }
+        fprintf(stderr, "runtime RMSNorm eps: %.8g\n", rt->rms_eps);
+    }
     rt->total_passes = steps_to_run + 1;
+    rt->precomputed_total_passes = rt->total_passes;
+    rt->forced_pass_table_idx = -1;
     int fps_div = cfg->temporal_compression > 0 ? cfg->inference_fps / cfg->temporal_compression : 0;
     rt->frame_stride = fps_div > 0 ? cfg->base_fps / fps_div : 1;
     if (rt->frame_stride <= 0) rt->frame_stride = 1;
@@ -3161,6 +3185,7 @@ extern "C" int world_cuda_runtime_create(
     size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     size_t layer_mod_table_elems = (size_t)rt->total_passes * layers_to_run * 6 * rt->D;
+    size_t out_mod_table_elems = (size_t)rt->total_passes * 2 * rt->D;
     const char *cublas_attn_env = NULL;
     const char *cublas_attn_gqa_env = NULL;
     const char *flash_attn_env = NULL;
@@ -3205,7 +3230,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb_hidden, (size_t)rt->mlp_hidden * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb, (size_t)rt->D * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb_norm, (size_t)rt->D * sizeof(float)));
-    RT_CUDA(cudaMalloc((void **)&rt->d_out_mod, (size_t)2 * rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_out_mod_table, out_mod_table_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_final_tokens, rt->token_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_latent_out, rt->latent_elems * sizeof(float)));
     RT_CUDA(cudaMalloc((void **)&rt->d_layer_mod_table, layer_mod_table_elems * sizeof(float)));
@@ -3335,6 +3360,8 @@ extern "C" int world_cuda_runtime_step_rgb(
     float transformer_ms = 0.0f;
     float vae_ms = 0.0f;
     float total_ms = 0.0f;
+    const char *fp16_gemm_env = getenv("WORLD_FP16_GEMM");
+    int use_fp16_gemm = fp16_gemm_env ? fp16_gemm_env[0] != '0' : 1;
 
 #define STEP_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -3347,7 +3374,7 @@ extern "C" int world_cuda_runtime_step_rgb(
     if (row_major_linear(rt->handle, (x), (w), (y), (m), (k), (n))) return 1; \
 } while (0)
 #define STEP_LINEAR_FAST(x, w, wh, y, m, k, n) do { \
-    if ((wh) && (m) > 1) { \
+    if (use_fp16_gemm && (wh) && (m) > 1) { \
         if (row_major_linear_fp16_weight(rt->handle, (x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
     } else { \
         STEP_LINEAR((x), (w), (y), (m), (k), (n)); \
@@ -3362,7 +3389,7 @@ extern "C" int world_cuda_runtime_step_rgb(
     silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_ctrl_emb_hidden, rt->d_ctrl_emb_hidden, rt->mlp_hidden);
     STEP_CUDA(cudaGetLastError());
     STEP_LINEAR(rt->d_ctrl_emb_hidden, rt->d_ctrl_emb_fc2_w, rt->d_ctrl_emb, 1, rt->mlp_hidden, rt->D);
-    rms_norm_rows_f32_kernel<<<1, 256>>>(rt->d_ctrl_emb, rt->d_ctrl_emb_norm, 1, rt->D, 1.0e-6f);
+    rms_norm_rows_f32_kernel<<<1, 256>>>(rt->d_ctrl_emb, rt->d_ctrl_emb_norm, 1, rt->D, rt->rms_eps);
     STEP_CUDA(cudaGetLastError());
     for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
         const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
@@ -3389,10 +3416,17 @@ extern "C" int world_cuda_runtime_step_rgb(
 
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
+        int table_pass_idx = rt->forced_pass_table_idx >= 0 ? rt->forced_pass_table_idx : pass_idx;
         int frozen_pass = !is_cache_pass;
         float sigma_step = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx];
         float next_sigma = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx + 1];
         float dsigma = next_sigma - sigma_step;
+        if (table_pass_idx < 0 || table_pass_idx >= rt->precomputed_total_passes) {
+            fprintf(stderr,
+                    "invalid runtime pass table index %d for precomputed_total_passes=%d\n",
+                    table_pass_idx, rt->precomputed_total_passes);
+            return 1;
+        }
 
         int patch_elems = rt->C * rt->ph * rt->pw;
         patchify_im2row_f32_kernel<<<div_up_i64((int64_t)rt->T * patch_elems, 256), 256>>>(
@@ -3406,7 +3440,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
             DeviceWorldLayerCache *cache = &rt->d_caches[layer_idx];
 
-            float *d_layer_mod = rt->d_layer_mod_table + ((int64_t)pass_idx * rt->layers_to_run + layer_idx) * (6 * rt->D);
+            float *d_layer_mod = rt->d_layer_mod_table + ((int64_t)table_pass_idx * rt->layers_to_run + layer_idx) * (6 * rt->D);
             float *d_s0 = d_layer_mod;
             float *d_b0 = d_layer_mod + rt->D;
             float *d_g0 = d_layer_mod + 2 * rt->D;
@@ -3414,7 +3448,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             float *d_b1 = d_layer_mod + 4 * rt->D;
             float *d_g1 = d_layer_mod + 5 * rt->D;
 
-            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, 1.0e-6f);
+            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, rt->rms_eps);
             STEP_CUDA(cudaGetLastError());
             STEP_LINEAR_FAST(rt->d_norm, lw->qkv_proj_weight, lw->qkv_proj_weight_h,
                              rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
@@ -3425,7 +3459,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                 qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
                     rt->d_qkv_raw, rt->d_q, rt->d_k, d_v_cur,
                     rt->d_x_pos, rt->d_y_pos, rt->d_t_pos, rt->d_xy_table, rt->d_inv_t,
-                    rt->T, cfg->n_heads, cfg->n_kv_heads, rt->d_head, cfg->width, cfg->height, 1.0e-6f);
+                    rt->T, cfg->n_heads, cfg->n_kv_heads, rt->d_head, cfg->width, cfg->height, rt->rms_eps);
             }
             STEP_CUDA(cudaGetLastError());
             if (cfg->value_residual && layer_idx != 0) {
@@ -3491,7 +3525,7 @@ extern "C" int world_cuda_runtime_step_rgb(
 
             float *d_tokens_ctrl = rt->d_tokens_after_attn;
             if (lw->has_ctrl) {
-                rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, 1.0e-6f);
+                rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, rt->rms_eps);
                 STEP_CUDA(cudaGetLastError());
                 STEP_LINEAR_FAST(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, lw->ctrl_fc1_x_weight_h,
                                  rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
@@ -3506,7 +3540,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                 d_tokens_ctrl = rt->d_tokens_after_ctrl;
             }
 
-            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, 1.0e-6f);
+            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, rt->rms_eps);
             STEP_CUDA(cudaGetLastError());
             STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
                              rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
@@ -3526,10 +3560,8 @@ extern "C" int world_cuda_runtime_step_rgb(
 
         if (is_cache_pass) continue;
 
-        silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, rt->d_cond_act, rt->D);
-        STEP_CUDA(cudaGetLastError());
-        STEP_LINEAR(rt->d_cond_act, rt->d_out_norm_w, rt->d_out_mod, 1, rt->D, 2 * rt->D);
-        out_norm_silu_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, rt->d_out_mod, rt->d_final_tokens, rt->T, rt->D, 1.0e-6f);
+        float *d_out_mod = rt->d_out_mod_table + (int64_t)table_pass_idx * 2 * rt->D;
+        out_norm_silu_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_out_mod, rt->d_final_tokens, rt->T, rt->D, rt->rms_eps);
         STEP_CUDA(cudaGetLastError());
         unpatchify_orig_f32_kernel<<<rt->T * (rt->C * rt->ph * rt->pw), 256>>>(
             rt->d_final_tokens, rt->d_unpatch_w, rt->d_unpatch_b, rt->d_latent_out,
@@ -3541,6 +3573,22 @@ extern "C" int world_cuda_runtime_step_rgb(
     }
 
     STEP_CUDA(cudaEventRecord(rt->ev_after_transformer, 0));
+    {
+        const char *dump_latent_path = getenv("WORLD_DUMP_RUNTIME_LATENT");
+        if (dump_latent_path && dump_latent_path[0]) {
+            float *h_dump_latent = (float *)malloc(rt->latent_elems * sizeof(float));
+            if (!h_dump_latent) return 1;
+            STEP_CUDA(cudaMemcpy(h_dump_latent, rt->d_latent, rt->latent_elems * sizeof(float), cudaMemcpyDeviceToHost));
+            FILE *f = fopen(dump_latent_path, rt->frame_ordinal == 0 ? "wb" : "ab");
+            if (!f) {
+                free(h_dump_latent);
+                return 1;
+            }
+            fwrite(h_dump_latent, sizeof(float), rt->latent_elems, f);
+            fclose(f);
+            free(h_dump_latent);
+        }
+    }
     if (world_cuda_decode_vae_to_rgb(cfg, &rt->d_vae, rt->d_latent, rgb_out, frames_out, width_out, height_out)) return 1;
     STEP_CUDA(cudaEventRecord(rt->ev_after_vae, 0));
     STEP_CUDA(cudaEventSynchronize(rt->ev_after_vae));
@@ -3584,17 +3632,20 @@ extern "C" int world_cuda_runtime_seed_latent_rgb(
     if (!rt || !latent || !control_input) return 1;
     int old_steps_to_run = rt->steps_to_run;
     int old_total_passes = rt->total_passes;
+    int old_forced_pass_table_idx = rt->forced_pass_table_idx;
     const float *old_override = rt->h_latent_override;
 
     rt->h_latent_override = latent;
     rt->steps_to_run = 0;
     rt->total_passes = 1;
+    rt->forced_pass_table_idx = old_steps_to_run;
     int rc = world_cuda_runtime_step_rgb(
         rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
 
     rt->h_latent_override = old_override;
     rt->steps_to_run = old_steps_to_run;
     rt->total_passes = old_total_passes;
+    rt->forced_pass_table_idx = old_forced_pass_table_idx;
     return rc;
 }
 
