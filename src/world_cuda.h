@@ -125,6 +125,8 @@ typedef struct {
     const float *unpatchify_bias;
 } WorldModelProbeWeights;
 
+typedef struct WorldCudaRuntime WorldCudaRuntime;
+
 int world_cuda_generation_probe(
         const WorldConfig *cfg,
         const float *patchify_weight,
@@ -153,6 +155,28 @@ int world_cuda_transformer_probe(
         const char *dump_prefix,
         const WorldVaeDecoderWeights *vae,
         const char *out_path);
+
+int world_cuda_runtime_create(
+        WorldCudaRuntime **out,
+        const WorldConfig *cfg,
+        const WorldModelProbeWeights *weights,
+        int layers_to_run,
+        int steps_to_run,
+        int frame_idx,
+        unsigned int seed,
+        int noise_mode,
+        const WorldVaeDecoderWeights *vae);
+
+int world_cuda_runtime_step_rgb(
+        WorldCudaRuntime *rt,
+        const float *control_input,
+        const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out);
+
+void world_cuda_runtime_destroy(WorldCudaRuntime *rt);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,450 @@
+#define WORLD_CLI_NO_MAIN
+#include "world_cli.c"
+
+#include "raylib.h"
+
+#include <pthread.h>
+#include <math.h>
+
+typedef struct {
+    WorldModelProbeWeights probe;
+    WorldLayerWeights *layers;
+    float *patchify_weight;
+    float *denoise_fc1_weight;
+    float *denoise_fc2_weight;
+    float *ctrl_emb_fc1_weight;
+    float *ctrl_emb_fc2_weight;
+    float *out_norm_fc_weight;
+    float *unpatchify_weight;
+    float *unpatchify_bias;
+} LoadedWorldModel;
+
+typedef struct {
+    pthread_mutex_t mutex;
+    WorldCudaRuntime *rt;
+    float *control;
+    int ctrl_dim;
+    unsigned char *rgb;
+    size_t rgb_bytes;
+    int width;
+    int height;
+    int frames;
+    int ready;
+    int stop;
+    int failed;
+    int produced_chunks;
+    float generation_seconds;
+} LiveShared;
+
+static void ray_usage(const char *argv0) {
+    fprintf(stderr,
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--steps N] [--layers N] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
+            "\n"
+            "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
+            "then renders decoded RGB frames to a raylib texture without writing images.\n",
+            argv0);
+}
+
+static void free_loaded_model(LoadedWorldModel *m) {
+    if (!m) return;
+    free(m->patchify_weight);
+    free(m->denoise_fc1_weight);
+    free(m->denoise_fc2_weight);
+    free(m->ctrl_emb_fc1_weight);
+    free(m->ctrl_emb_fc2_weight);
+    free(m->out_norm_fc_weight);
+    free(m->unpatchify_weight);
+    free(m->unpatchify_bias);
+    free_layer_weights(m->layers, m->probe.n_layers);
+    memset(m, 0, sizeof(*m));
+}
+
+static int load_live_model_weights(
+        const SafeTensors *st,
+        const WorldConfig *cfg,
+        int layers_to_run,
+        LoadedWorldModel *m) {
+    memset(m, 0, sizeof(*m));
+    int hidden = cfg->d_model * cfg->mlp_ratio;
+    int d_head = cfg->d_model / cfg->n_heads;
+    int kv_dim = cfg->n_kv_heads * d_head;
+    int ctrl_dim = cfg->n_buttons + 3;
+    int64_t patch_shape[4] = {cfg->d_model, cfg->channels, cfg->patch_h, cfg->patch_w};
+    int64_t denoise_fc1_shape[2] = {hidden, 512};
+    int64_t denoise_fc2_shape[2] = {cfg->d_model, hidden};
+    int64_t ctrl_emb_fc1_shape[2] = {hidden, ctrl_dim};
+    int64_t ctrl_emb_fc2_shape[2] = {cfg->d_model, hidden};
+    int64_t hidden_d_shape[2] = {hidden, cfg->d_model};
+    int64_t d_shape[1] = {cfg->d_model};
+    int64_t dxd_shape[2] = {cfg->d_model, cfg->d_model};
+    int64_t out_norm_shape[2] = {cfg->d_model * 2, cfg->d_model};
+    int64_t kv_proj_shape[2] = {kv_dim, cfg->d_model};
+    int64_t unpatch_bias_shape[1] = {cfg->channels};
+
+    if (load_required_f32(st, "patchify.weight", patch_shape, 4, &m->patchify_weight)) return 1;
+    if (load_required_f32(st, "denoise_step_emb.mlp.fc1.weight", denoise_fc1_shape, 2, &m->denoise_fc1_weight)) return 1;
+    if (load_required_f32(st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &m->denoise_fc2_weight)) return 1;
+    if (load_required_f32(st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &m->ctrl_emb_fc1_weight)) return 1;
+    if (load_required_f32(st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &m->ctrl_emb_fc2_weight)) return 1;
+    if (load_required_f32(st, "out_norm.fc.weight", out_norm_shape, 2, &m->out_norm_fc_weight)) return 1;
+    if (load_required_f32(st, "unpatchify.weight", patch_shape, 4, &m->unpatchify_weight)) return 1;
+    if (load_required_f32(st, "unpatchify.bias", unpatch_bias_shape, 1, &m->unpatchify_bias)) return 1;
+
+    m->layers = (WorldLayerWeights *)calloc((size_t)layers_to_run, sizeof(*m->layers));
+    if (!m->layers) return 1;
+    for (int layer = 0; layer < layers_to_run; ++layer) {
+        WorldLayerWeights *lw = &m->layers[layer];
+        if (load_layer_f32(st, layer, "mlp_cond_head.bias_in", d_shape, 1, (float **)&lw->cond_bias)) return 1;
+        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->attn_cond_s_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->attn_cond_b_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->attn_cond_g_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn.q_proj.weight", dxd_shape, 2, (float **)&lw->q_proj_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn.k_proj.weight", kv_proj_shape, 2, (float **)&lw->k_proj_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn.v_proj.weight", kv_proj_shape, 2, (float **)&lw->v_proj_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn.out_proj.weight", dxd_shape, 2, (float **)&lw->out_proj_weight)) return 1;
+        if (load_layer_f32(st, layer, "attn.v_lamb", NULL, 0, (float **)&lw->v_lamb)) return 1;
+        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.0.weight", dxd_shape, 2, (float **)&lw->mlp_cond_s_weight)) return 1;
+        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.1.weight", dxd_shape, 2, (float **)&lw->mlp_cond_b_weight)) return 1;
+        if (load_layer_f32(st, layer, "mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->mlp_cond_g_weight)) return 1;
+        if (load_optional_layer_f32(st, layer, "ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_x_weight)) return 1;
+        lw->has_ctrl = lw->ctrl_fc1_x_weight != NULL;
+        if (lw->has_ctrl && load_layer_f32(st, layer, "ctrl_mlpfusion.fc1_c.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_c_weight)) return 1;
+        if (lw->has_ctrl && load_layer_f32(st, layer, "ctrl_mlpfusion.fc2.weight", dxd_shape, 2, (float **)&lw->ctrl_fc2_weight)) return 1;
+        if (load_layer_f32(st, layer, "dit_mlp.fc1.weight", hidden_d_shape, 2, (float **)&lw->dit_mlp_fc1_weight)) return 1;
+        if (load_layer_f32(st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) return 1;
+    }
+
+    m->probe.patchify_weight = m->patchify_weight;
+    m->probe.denoise_fc1_weight = m->denoise_fc1_weight;
+    m->probe.denoise_fc2_weight = m->denoise_fc2_weight;
+    m->probe.ctrl_emb_fc1_weight = m->ctrl_emb_fc1_weight;
+    m->probe.ctrl_emb_fc2_weight = m->ctrl_emb_fc2_weight;
+    m->probe.layers = m->layers;
+    m->probe.n_layers = layers_to_run;
+    m->probe.out_norm_fc_weight = m->out_norm_fc_weight;
+    m->probe.unpatchify_weight = m->unpatchify_weight;
+    m->probe.unpatchify_bias = m->unpatchify_bias;
+    return 0;
+}
+
+static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons) {
+    memset(control, 0, (size_t)ctrl_dim * sizeof(float));
+    if (n_buttons > 0) control[0] = IsKeyDown(KEY_W) ? 1.0f : 0.0f;
+    if (n_buttons > 1) control[1] = IsKeyDown(KEY_S) ? 1.0f : 0.0f;
+    if (n_buttons > 2) control[2] = IsKeyDown(KEY_A) ? 1.0f : 0.0f;
+    if (n_buttons > 3) control[3] = IsKeyDown(KEY_D) ? 1.0f : 0.0f;
+    if (n_buttons > 4) control[4] = IsKeyDown(KEY_SPACE) ? 1.0f : 0.0f;
+    if (n_buttons > 5) control[5] = IsKeyDown(KEY_LEFT_SHIFT) ? 1.0f : 0.0f;
+    if (n_buttons > 6) control[6] = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1.0f : 0.0f;
+    if (n_buttons > 7) control[7] = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 1.0f : 0.0f;
+    Vector2 delta = GetMouseDelta();
+    if (ctrl_dim >= n_buttons + 3) {
+        control[n_buttons + 0] = delta.x * 0.01f;
+        control[n_buttons + 1] = delta.y * 0.01f;
+        control[n_buttons + 2] = GetMouseWheelMove() * 0.05f;
+    }
+}
+
+static void *generation_worker(void *arg) {
+    LiveShared *s = (LiveShared *)arg;
+    float *control = (float *)malloc((size_t)s->ctrl_dim * sizeof(float));
+    if (!control) {
+        pthread_mutex_lock(&s->mutex);
+        s->failed = 1;
+        pthread_mutex_unlock(&s->mutex);
+        return NULL;
+    }
+
+    for (;;) {
+        pthread_mutex_lock(&s->mutex);
+        int stop = s->stop;
+        memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
+        pthread_mutex_unlock(&s->mutex);
+        if (stop) break;
+
+        const unsigned char *rgb = NULL;
+        int width = 0;
+        int height = 0;
+        int frames = 0;
+        float seconds = 0.0f;
+        if (world_cuda_runtime_step_rgb(s->rt, control, &rgb, &width, &height, &frames, &seconds)) {
+            pthread_mutex_lock(&s->mutex);
+            s->failed = 1;
+            s->stop = 1;
+            pthread_mutex_unlock(&s->mutex);
+            break;
+        }
+
+        size_t bytes = (size_t)width * height * 3 * frames;
+        pthread_mutex_lock(&s->mutex);
+        if (bytes == s->rgb_bytes) {
+            memcpy(s->rgb, rgb, bytes);
+            s->width = width;
+            s->height = height;
+            s->frames = frames;
+            s->generation_seconds = seconds;
+            s->produced_chunks += 1;
+            s->ready = 1;
+        } else {
+            s->failed = 1;
+            s->stop = 1;
+        }
+        pthread_mutex_unlock(&s->mutex);
+    }
+
+    free(control);
+    return NULL;
+}
+
+static Rectangle fit_rect(int dst_w, int dst_h, int src_w, int src_h) {
+    float sx = (float)dst_w / (float)src_w;
+    float sy = (float)dst_h / (float)src_h;
+    float scale = sx < sy ? sx : sy;
+    float w = (float)src_w * scale;
+    float h = (float)src_h * scale;
+    Rectangle r = {(float)(dst_w - w) * 0.5f, (float)(dst_h - h) * 0.5f, w, h};
+    return r;
+}
+
+int main(int argc, char **argv) {
+    const char *model_dir = "../Waypoint-1.5-1B";
+    const char *weights = NULL;
+    const char *vae_weights = NULL;
+    int steps_to_run = -1;
+    int layers_to_run = -1;
+    int frame_idx = 0;
+    int window_width = 1280;
+    int window_height = 720;
+    int warmup_chunks = 1;
+    int headless_smoke = 0;
+    unsigned int seed = 1234;
+    int noise_mode = WORLD_NOISE_NORMAL;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
+        } else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) {
+            weights = argv[++i];
+        } else if (strcmp(argv[i], "--vae-weights") == 0 && i + 1 < argc) {
+            vae_weights = argv[++i];
+        } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
+            steps_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
+            layers_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--frame-idx") == 0 && i + 1 < argc) {
+            frame_idx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = (unsigned int)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "normal") == 0) noise_mode = WORLD_NOISE_NORMAL;
+            else if (strcmp(mode, "uniform") == 0) noise_mode = WORLD_NOISE_UNIFORM;
+            else {
+                fprintf(stderr, "invalid --noise %s\n", mode);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--window-width") == 0 && i + 1 < argc) {
+            window_width = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--window-height") == 0 && i + 1 < argc) {
+            window_height = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
+            warmup_chunks = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--headless-smoke") == 0) {
+            headless_smoke = 1;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            ray_usage(argv[0]);
+            return 0;
+        } else {
+            ray_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    char config_path[PATH_BUF];
+    char default_weights[PATH_BUF];
+    char default_vae_weights[PATH_BUF];
+    if (join_path(config_path, sizeof(config_path), model_dir, "config.yaml")) return 1;
+    if (!weights) {
+        if (join_path(default_weights, sizeof(default_weights), model_dir, "transformer/diffusion_pytorch_model.safetensors")) return 1;
+        weights = default_weights;
+    }
+    if (!vae_weights) {
+        if (join_path(default_vae_weights, sizeof(default_vae_weights), model_dir, "vae/diffusion_pytorch_model.safetensors")) return 1;
+        vae_weights = default_vae_weights;
+    }
+
+    WorldConfig cfg;
+    if (world_config_load(&cfg, config_path)) return 1;
+    if (layers_to_run < 0) layers_to_run = cfg.n_layers;
+    if (steps_to_run < 0) steps_to_run = cfg.scheduler_sigmas_count - 1;
+    if (layers_to_run <= 0 || layers_to_run > cfg.n_layers || steps_to_run <= 0 || steps_to_run >= cfg.scheduler_sigmas_count) {
+        fprintf(stderr, "invalid --layers/--steps for config\n");
+        return 1;
+    }
+    world_config_print(&cfg);
+
+    SafeTensors st;
+    LoadedWorldModel model;
+    WorldVaeDecoderWeights vae;
+    WorldCudaRuntime *rt = NULL;
+    memset(&model, 0, sizeof(model));
+    memset(&vae, 0, sizeof(vae));
+    int rc = 1;
+
+    fprintf(stderr, "loading transformer safetensors: %s\n", weights);
+    if (safetensors_open(&st, weights)) return 1;
+    if (load_live_model_weights(&st, &cfg, layers_to_run, &model)) goto cleanup_before_window;
+    safetensors_close(&st);
+    memset(&st, 0, sizeof(st));
+    if (load_vae_decoder_weights(vae_weights, &vae)) goto cleanup_before_window;
+
+    fprintf(stderr, "creating resident CUDA runtime\n");
+    if (world_cuda_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+        goto cleanup_before_window;
+    }
+    free_loaded_model(&model);
+    free_vae_decoder_weights(&vae);
+
+    int ctrl_dim = cfg.n_buttons + 3;
+    float *zero_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
+    if (!zero_control) goto cleanup_before_window;
+    const unsigned char *warm_rgb = NULL;
+    int rgb_w = 0;
+    int rgb_h = 0;
+    int rgb_frames = 0;
+    float warm_seconds = 0.0f;
+    for (int i = 0; i < warmup_chunks; ++i) {
+        fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
+        if (world_cuda_runtime_step_rgb(rt, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            free(zero_control);
+            goto cleanup_before_window;
+        }
+    }
+    free(zero_control);
+    if (!warm_rgb || rgb_w <= 0 || rgb_h <= 0 || rgb_frames <= 0) goto cleanup_before_window;
+
+    size_t frame_bytes = (size_t)rgb_w * rgb_h * 3;
+    size_t rgb_bytes = frame_bytes * (size_t)rgb_frames;
+    unsigned char *display_rgb = (unsigned char *)malloc(rgb_bytes);
+    if (!display_rgb) goto cleanup_before_window;
+    memcpy(display_rgb, warm_rgb, rgb_bytes);
+    if (headless_smoke) {
+        fprintf(stderr,
+                "headless smoke: resident runtime produced %d RGB frame(s) %dx%d in %.3fs, no image files written\n",
+                rgb_frames, rgb_w, rgb_h, warm_seconds);
+        free(display_rgb);
+        world_cuda_runtime_destroy(rt);
+        return 0;
+    }
+
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    InitWindow(window_width, window_height, "worldmodel.cu");
+    SetExitKey(KEY_ESCAPE);
+    DisableCursor();
+    SetTargetFPS(60);
+
+    Image image = {display_rgb, rgb_w, rgb_h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8};
+    Texture2D texture = LoadTextureFromImage(image);
+    int texture_frame = 0;
+    UpdateTexture(texture, display_rgb);
+
+    LiveShared shared;
+    memset(&shared, 0, sizeof(shared));
+    pthread_mutex_init(&shared.mutex, NULL);
+    shared.rt = rt;
+    shared.ctrl_dim = ctrl_dim;
+    shared.rgb_bytes = rgb_bytes;
+    shared.width = rgb_w;
+    shared.height = rgb_h;
+    shared.frames = rgb_frames;
+    shared.control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
+    shared.rgb = (unsigned char *)malloc(rgb_bytes);
+    if (!shared.control || !shared.rgb) {
+        pthread_mutex_destroy(&shared.mutex);
+        UnloadTexture(texture);
+        CloseWindow();
+        free(display_rgb);
+        goto cleanup_runtime_only;
+    }
+
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, generation_worker, &shared) != 0) {
+        pthread_mutex_destroy(&shared.mutex);
+        UnloadTexture(texture);
+        CloseWindow();
+        free(shared.control);
+        free(shared.rgb);
+        free(display_rgb);
+        goto cleanup_runtime_only;
+    }
+
+    double chunk_start = GetTime();
+    float last_generation_seconds = warm_seconds;
+    int chunk_id = 0;
+    float *frame_control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
+    if (!frame_control) {
+        pthread_mutex_lock(&shared.mutex);
+        shared.failed = 1;
+        shared.stop = 1;
+        pthread_mutex_unlock(&shared.mutex);
+    }
+    while (!WindowShouldClose()) {
+        if (!frame_control) break;
+        fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons);
+        pthread_mutex_lock(&shared.mutex);
+        memcpy(shared.control, frame_control, (size_t)ctrl_dim * sizeof(float));
+        int failed = shared.failed;
+        if (shared.ready) {
+            memcpy(display_rgb, shared.rgb, rgb_bytes);
+            last_generation_seconds = shared.generation_seconds;
+            chunk_id = shared.produced_chunks;
+            shared.ready = 0;
+            chunk_start = GetTime();
+        }
+        pthread_mutex_unlock(&shared.mutex);
+        if (failed) break;
+
+        double elapsed = GetTime() - chunk_start;
+        int next_texture_frame = (int)(elapsed * (double)cfg.base_fps) % rgb_frames;
+        if (next_texture_frame != texture_frame) {
+            texture_frame = next_texture_frame;
+            UpdateTexture(texture, display_rgb + (size_t)texture_frame * frame_bytes);
+        }
+        char title[256];
+        snprintf(title, sizeof(title), "worldmodel.cu | chunk %d | gen %.2fs | %.2f rgb fps", chunk_id, last_generation_seconds, rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
+        SetWindowTitle(title);
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        Rectangle src = {0.0f, 0.0f, (float)rgb_w, (float)rgb_h};
+        Rectangle dst = fit_rect(GetScreenWidth(), GetScreenHeight(), rgb_w, rgb_h);
+        Vector2 origin = {0.0f, 0.0f};
+        DrawTexturePro(texture, src, dst, origin, 0.0f, WHITE);
+        EndDrawing();
+    }
+
+    pthread_mutex_lock(&shared.mutex);
+    shared.stop = 1;
+    int final_failed = shared.failed;
+    pthread_mutex_unlock(&shared.mutex);
+    pthread_join(worker, NULL);
+    pthread_mutex_destroy(&shared.mutex);
+    free(frame_control);
+    free(shared.control);
+    free(shared.rgb);
+    UnloadTexture(texture);
+    CloseWindow();
+    free(display_rgb);
+    rc = final_failed ? 1 : 0;
+
+cleanup_runtime_only:
+    world_cuda_runtime_destroy(rt);
+    return rc;
+
+cleanup_before_window:
+    safetensors_close(&st);
+    free_loaded_model(&model);
+    free_vae_decoder_weights(&vae);
+    world_cuda_runtime_destroy(rt);
+    return rc;
+}

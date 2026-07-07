@@ -40,6 +40,26 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+If `3rd/raylib` is present, the build also produces `worldmodel_raylib`, a
+raylib frontend that loads the transformer/VAE weights into a resident CUDA
+runtime, runs a warmup chunk, then opens a window and streams decoded RGB frames
+directly into a raylib texture without writing image files:
+
+```sh
+./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --steps 4
+```
+
+For terminal-only validation of the same resident runtime path:
+
+```sh
+./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --steps 4 --headless-smoke
+```
+
+The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
+delta, and mouse wheel into the controller vector. CUDA generation runs on a
+worker thread while the raylib main thread keeps polling input and presenting
+the latest decoded 4-frame RGB chunk.
+
 Run the current standalone image probe:
 
 ```sh

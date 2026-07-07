@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1423,13 +1424,15 @@ static int taehv_write_ppm_frames(const char *path, const unsigned char *rgb, in
     return 0;
 }
 
-static int world_cuda_decode_vae_to_ppm(
+static int world_cuda_decode_vae_to_rgb(
         const WorldConfig *cfg,
         DeviceVaeDecoder *dec,
         const float *d_latent,
-        const char *out_path,
-        int frame_offset) {
-    if (!dec || !dec->buf0 || !out_path || !out_path[0]) return 0;
+        const unsigned char **rgb_out,
+        int *frame_count_out,
+        int *width_out,
+        int *height_out) {
+    if (!dec || !dec->buf0) return 1;
 
     int C_latent = cfg->channels;
     int H0 = cfg->height * cfg->patch_h;
@@ -1447,7 +1450,7 @@ static int world_cuda_decode_vae_to_ppm(
     float *tmp = NULL;
     float *aux = NULL;
 
-    fprintf(stderr, "VAE decode: latent [%d,%d,%d] -> RGB %dx%d PPM\n", C_latent, H0, W0, dec->out_w, dec->out_h);
+    fprintf(stderr, "VAE decode: latent [%d,%d,%d] -> RGB %dx%d\n", C_latent, H0, W0, dec->out_w, dec->out_h);
 
     taehv_repeat_latent4_kernel<<<div_up_i64((int64_t)4 * C * H * W, 256), 256>>>(d_latent, cur, C, H, W);
     CUDA_OK(cudaGetLastError());
@@ -1517,7 +1520,10 @@ static int world_cuda_decode_vae_to_ppm(
     CUDA_OK(cudaGetLastError());
     CUDA_OK(cudaMemcpy(dec->h_rgb, dec->d_rgb, dec->rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
-    if (taehv_write_ppm_frames(out_path, dec->h_rgb, 4, dec->out_w, dec->out_h, frame_offset)) goto cleanup;
+    if (rgb_out) *rgb_out = dec->h_rgb;
+    if (frame_count_out) *frame_count_out = 4;
+    if (width_out) *width_out = dec->out_w;
+    if (height_out) *height_out = dec->out_h;
     rc = 0;
 
 cleanup:
@@ -1527,6 +1533,507 @@ cleanup:
 #undef VAE_UPSAMPLE2
 #undef VAE_TGROW
     return rc;
+}
+
+static int world_cuda_decode_vae_to_ppm(
+        const WorldConfig *cfg,
+        DeviceVaeDecoder *dec,
+        const float *d_latent,
+        const char *out_path,
+        int frame_offset) {
+    if (!dec || !dec->buf0 || !out_path || !out_path[0]) return 0;
+    const unsigned char *rgb = NULL;
+    int frames = 0;
+    int width = 0;
+    int height = 0;
+    if (world_cuda_decode_vae_to_rgb(cfg, dec, d_latent, &rgb, &frames, &width, &height)) return 1;
+    if (taehv_write_ppm_frames(out_path, rgb, frames, width, height, frame_offset)) return 1;
+    return 0;
+}
+
+struct WorldCudaRuntime {
+    WorldConfig cfg;
+    int layers_to_run;
+    int steps_to_run;
+    int next_frame_idx;
+    unsigned int seed;
+    int noise_mode;
+    int frame_ordinal;
+    int C;
+    int H;
+    int W;
+    int D;
+    int ph;
+    int pw;
+    int T;
+    int d_head;
+    int kv_dim;
+    int mlp_hidden;
+    int ctrl_dim;
+    int d_xy;
+    int d_t;
+    int total_passes;
+    int frame_stride;
+    size_t latent_elems;
+    size_t token_elems;
+    size_t kv_rope_elems;
+    size_t q_rope_elems;
+    float *h_latent;
+    float *h_noise;
+    float *h_xy;
+    float *h_inv_t;
+    int64_t *h_x_pos;
+    int64_t *h_y_pos;
+    int64_t *h_t_pos;
+    float *d_latent;
+    float *d_patch;
+    float *d_noise;
+    float *d_noise_hidden;
+    float *d_cond;
+    float *d_cond_act;
+    float *d_denoise_fc1;
+    float *d_denoise_fc2;
+    float *d_control_input;
+    float *d_ctrl_emb_fc1_w;
+    float *d_ctrl_emb_fc2_w;
+    float *d_ctrl_emb_hidden;
+    float *d_ctrl_emb;
+    float *d_ctrl_emb_norm;
+    float *d_out_norm_w;
+    float *d_out_mod;
+    float *d_final_tokens;
+    float *d_unpatch_w;
+    float *d_unpatch_b;
+    float *d_latent_out;
+    float *d_layer_mod;
+    float *d_tokens;
+    float *d_norm;
+    float *d_qkv_raw;
+    float *d_q;
+    float *d_k;
+    float *d_v;
+    float *d_v_first;
+    float *d_attn;
+    float *d_attn_out;
+    float *d_tokens_after_attn;
+    float *d_ctrl_norm;
+    float *d_ctrl_cond_by_layer;
+    float *d_ctrl_hidden;
+    float *d_ctrl_out;
+    float *d_tokens_after_ctrl;
+    float *d_mlp_in;
+    float *d_mlp_hidden;
+    float *d_mlp_out;
+    float *d_tokens_after_mlp;
+    float *d_xy_table;
+    float *d_inv_t;
+    int64_t *d_x_pos;
+    int64_t *d_y_pos;
+    int64_t *d_t_pos;
+    DeviceWorldLayerWeights *d_layers;
+    DeviceWorldLayerCache *d_caches;
+    cublasHandle_t handle;
+    DeviceVaeDecoder d_vae;
+};
+
+static double monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+}
+
+extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
+    if (!rt) return;
+    taehv_decoder_free(&rt->d_vae);
+    if (rt->handle) cublasDestroy(rt->handle);
+    free_device_world_layers(rt->d_layers, rt->layers_to_run);
+    free_device_world_caches(rt->d_caches, rt->layers_to_run);
+    cudaFree(rt->d_latent);
+    cudaFree(rt->d_patch);
+    cudaFree(rt->d_noise);
+    cudaFree(rt->d_noise_hidden);
+    cudaFree(rt->d_cond);
+    cudaFree(rt->d_cond_act);
+    cudaFree(rt->d_denoise_fc1);
+    cudaFree(rt->d_denoise_fc2);
+    cudaFree(rt->d_control_input);
+    cudaFree(rt->d_ctrl_emb_fc1_w);
+    cudaFree(rt->d_ctrl_emb_fc2_w);
+    cudaFree(rt->d_ctrl_emb_hidden);
+    cudaFree(rt->d_ctrl_emb);
+    cudaFree(rt->d_ctrl_emb_norm);
+    cudaFree(rt->d_out_norm_w);
+    cudaFree(rt->d_out_mod);
+    cudaFree(rt->d_final_tokens);
+    cudaFree(rt->d_unpatch_w);
+    cudaFree(rt->d_unpatch_b);
+    cudaFree(rt->d_latent_out);
+    cudaFree(rt->d_layer_mod);
+    cudaFree(rt->d_tokens);
+    cudaFree(rt->d_norm);
+    cudaFree(rt->d_qkv_raw);
+    cudaFree(rt->d_q);
+    cudaFree(rt->d_k);
+    cudaFree(rt->d_v);
+    cudaFree(rt->d_v_first);
+    cudaFree(rt->d_attn);
+    cudaFree(rt->d_attn_out);
+    cudaFree(rt->d_tokens_after_attn);
+    cudaFree(rt->d_ctrl_norm);
+    cudaFree(rt->d_ctrl_cond_by_layer);
+    cudaFree(rt->d_ctrl_hidden);
+    cudaFree(rt->d_ctrl_out);
+    cudaFree(rt->d_tokens_after_ctrl);
+    cudaFree(rt->d_mlp_in);
+    cudaFree(rt->d_mlp_hidden);
+    cudaFree(rt->d_mlp_out);
+    cudaFree(rt->d_tokens_after_mlp);
+    cudaFree(rt->d_xy_table);
+    cudaFree(rt->d_inv_t);
+    cudaFree(rt->d_x_pos);
+    cudaFree(rt->d_y_pos);
+    cudaFree(rt->d_t_pos);
+    free(rt->h_latent);
+    free(rt->h_noise);
+    free(rt->h_xy);
+    free(rt->h_inv_t);
+    free(rt->h_x_pos);
+    free(rt->h_y_pos);
+    free(rt->h_t_pos);
+    free(rt);
+}
+
+extern "C" int world_cuda_runtime_create(
+        WorldCudaRuntime **out,
+        const WorldConfig *cfg,
+        const WorldModelProbeWeights *weights,
+        int layers_to_run,
+        int steps_to_run,
+        int frame_idx,
+        unsigned int seed,
+        int noise_mode,
+        const WorldVaeDecoderWeights *vae) {
+    if (!out || !cfg || !weights || !weights->layers || !vae) return 1;
+    *out = NULL;
+    if (layers_to_run <= 0 || layers_to_run > weights->n_layers) {
+        fprintf(stderr, "invalid runtime layers_to_run=%d n_layers=%d\n", layers_to_run, weights->n_layers);
+        return 1;
+    }
+    if (steps_to_run <= 0 || steps_to_run >= cfg->scheduler_sigmas_count) {
+        fprintf(stderr, "invalid runtime steps_to_run=%d scheduler_count=%d\n", steps_to_run, cfg->scheduler_sigmas_count);
+        return 1;
+    }
+    if (frame_idx < 0) {
+        fprintf(stderr, "invalid runtime frame_idx=%d\n", frame_idx);
+        return 1;
+    }
+
+    WorldCudaRuntime *rt = (WorldCudaRuntime *)calloc(1, sizeof(*rt));
+    if (!rt) return 1;
+    rt->cfg = *cfg;
+    rt->layers_to_run = layers_to_run;
+    rt->steps_to_run = steps_to_run;
+    rt->next_frame_idx = frame_idx;
+    rt->seed = seed;
+    rt->noise_mode = noise_mode;
+    rt->C = cfg->channels;
+    rt->H = cfg->height * cfg->patch_h;
+    rt->W = cfg->width * cfg->patch_w;
+    rt->D = cfg->d_model;
+    rt->ph = cfg->patch_h;
+    rt->pw = cfg->patch_w;
+    rt->T = cfg->height * cfg->width;
+    rt->d_head = rt->D / cfg->n_heads;
+    rt->kv_dim = cfg->n_kv_heads * rt->d_head;
+    rt->mlp_hidden = rt->D * cfg->mlp_ratio;
+    rt->ctrl_dim = cfg->n_buttons + 3;
+    rt->d_xy = rt->d_head / 8;
+    rt->d_t = rt->d_head / 4;
+    rt->total_passes = steps_to_run + 1;
+    int fps_div = cfg->temporal_compression > 0 ? cfg->inference_fps / cfg->temporal_compression : 0;
+    rt->frame_stride = fps_div > 0 ? cfg->base_fps / fps_div : 1;
+    if (rt->frame_stride <= 0) rt->frame_stride = 1;
+    rt->latent_elems = (size_t)rt->C * rt->H * rt->W;
+    rt->token_elems = (size_t)rt->T * rt->D;
+    rt->q_rope_elems = (size_t)cfg->n_heads * rt->T * rt->d_head;
+    rt->kv_rope_elems = (size_t)cfg->n_kv_heads * rt->T * rt->d_head;
+    size_t qkv_token_elems = rt->token_elems + 2 * ((size_t)rt->T * rt->kv_dim);
+    size_t patch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
+    size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
+    size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
+
+#define RT_CUDA(expr) do { \
+    cudaError_t _e = (expr); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
+        goto fail; \
+    } \
+} while (0)
+#define RT_CUBLAS(expr) do { \
+    cublasStatus_t _s = (expr); \
+    if (_s != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)_s); \
+        goto fail; \
+    } \
+} while (0)
+
+    rt->h_latent = (float *)malloc(rt->latent_elems * sizeof(float));
+    rt->h_noise = (float *)malloc(512 * sizeof(float));
+    rt->h_xy = (float *)malloc((size_t)rt->d_xy * sizeof(float));
+    rt->h_inv_t = (float *)malloc((size_t)rt->d_t * sizeof(float));
+    rt->h_x_pos = (int64_t *)malloc((size_t)rt->T * sizeof(int64_t));
+    rt->h_y_pos = (int64_t *)malloc((size_t)rt->T * sizeof(int64_t));
+    rt->h_t_pos = (int64_t *)malloc((size_t)rt->T * sizeof(int64_t));
+    if (!rt->h_latent || !rt->h_noise || !rt->h_xy || !rt->h_inv_t || !rt->h_x_pos || !rt->h_y_pos || !rt->h_t_pos) {
+        fprintf(stderr, "runtime host allocation failed\n");
+        goto fail;
+    }
+    fill_rope_tables(rt->h_xy, rt->h_inv_t, rt->d_head, cfg->height, cfg->width);
+
+    RT_CUDA(cudaMalloc((void **)&rt->d_latent, rt->latent_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_noise, 512 * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_noise_hidden, (size_t)rt->mlp_hidden * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_cond, (size_t)rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_cond_act, (size_t)rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_control_input, (size_t)rt->ctrl_dim * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb_hidden, (size_t)rt->mlp_hidden * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb, (size_t)rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_emb_norm, (size_t)rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_out_mod, (size_t)2 * rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_final_tokens, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_latent_out, rt->latent_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_layer_mod, (size_t)6 * rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_tokens, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_norm, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_qkv_raw, qkv_token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_q, rt->q_rope_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_k, rt->kv_rope_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_v, rt->kv_rope_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_v_first, rt->kv_rope_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_attn, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_attn_out, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_tokens_after_attn, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_norm, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_cond_by_layer, (size_t)layers_to_run * rt->D * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_hidden, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_ctrl_out, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_tokens_after_ctrl, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_mlp_in, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_mlp_hidden, (size_t)rt->T * rt->mlp_hidden * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_mlp_out, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_tokens_after_mlp, rt->token_elems * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_xy_table, (size_t)rt->d_xy * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_inv_t, (size_t)rt->d_t * sizeof(float)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_x_pos, (size_t)rt->T * sizeof(int64_t)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_y_pos, (size_t)rt->T * sizeof(int64_t)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_t_pos, (size_t)rt->T * sizeof(int64_t)));
+
+    if (copy_f32_to_device(&rt->d_patch, weights->patchify_weight, patch_weight_elems)) goto fail;
+    if (copy_f32_to_device(&rt->d_denoise_fc1, weights->denoise_fc1_weight, (size_t)rt->mlp_hidden * 512)) goto fail;
+    if (copy_f32_to_device(&rt->d_denoise_fc2, weights->denoise_fc2_weight, (size_t)rt->D * rt->mlp_hidden)) goto fail;
+    if (copy_f32_to_device(&rt->d_ctrl_emb_fc1_w, weights->ctrl_emb_fc1_weight, (size_t)rt->mlp_hidden * rt->ctrl_dim)) goto fail;
+    if (copy_f32_to_device(&rt->d_ctrl_emb_fc2_w, weights->ctrl_emb_fc2_weight, (size_t)rt->D * rt->mlp_hidden)) goto fail;
+    if (copy_f32_to_device(&rt->d_out_norm_w, weights->out_norm_fc_weight, out_norm_weight_elems)) goto fail;
+    if (copy_f32_to_device(&rt->d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto fail;
+    if (copy_f32_to_device(&rt->d_unpatch_b, weights->unpatchify_bias, (size_t)rt->C)) goto fail;
+    if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
+    if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head)) goto fail;
+    RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
+    RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
+    RT_CUBLAS(cublasCreate(&rt->handle));
+    if (taehv_decoder_init(&rt->d_vae, cfg, vae)) goto fail;
+    RT_CUDA(cudaDeviceSynchronize());
+
+    *out = rt;
+#undef RT_CUDA
+#undef RT_CUBLAS
+    return 0;
+
+fail:
+#undef RT_CUDA
+#undef RT_CUBLAS
+    world_cuda_runtime_destroy(rt);
+    return 1;
+}
+
+extern "C" int world_cuda_runtime_step_rgb(
+        WorldCudaRuntime *rt,
+        const float *control_input,
+        const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out) {
+    if (!rt || !control_input) return 1;
+    const WorldConfig *cfg = &rt->cfg;
+    double t0 = monotonic_seconds();
+
+#define STEP_CUDA(expr) do { \
+    cudaError_t _e = (expr); \
+    if (_e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
+        return 1; \
+    } \
+} while (0)
+#define STEP_LINEAR(x, w, y, m, k, n) do { \
+    if (row_major_linear(rt->handle, (x), (w), (y), (m), (k), (n))) return 1; \
+} while (0)
+
+    int current_frame_idx = rt->next_frame_idx;
+    int frame_timestamp = current_frame_idx * rt->frame_stride;
+    STEP_CUDA(cudaMemcpy(rt->d_control_input, control_input, (size_t)rt->ctrl_dim * sizeof(float), cudaMemcpyHostToDevice));
+    STEP_LINEAR(rt->d_control_input, rt->d_ctrl_emb_fc1_w, rt->d_ctrl_emb_hidden, 1, rt->ctrl_dim, rt->mlp_hidden);
+    silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_ctrl_emb_hidden, rt->d_ctrl_emb_hidden, rt->mlp_hidden);
+    STEP_CUDA(cudaGetLastError());
+    STEP_LINEAR(rt->d_ctrl_emb_hidden, rt->d_ctrl_emb_fc2_w, rt->d_ctrl_emb, 1, rt->mlp_hidden, rt->D);
+    rms_norm_rows_f32_kernel<<<1, 256>>>(rt->d_ctrl_emb, rt->d_ctrl_emb_norm, 1, rt->D, 1.0e-6f);
+    STEP_CUDA(cudaGetLastError());
+    for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+        const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
+        if (lw->has_ctrl) {
+            STEP_LINEAR(rt->d_ctrl_emb_norm, lw->ctrl_fc1_c_weight,
+                        rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D,
+                        1, rt->D, rt->D);
+        }
+    }
+
+    fill_latent(rt->h_latent, (int)rt->latent_elems, rt->seed + (unsigned int)rt->frame_ordinal, rt->noise_mode);
+    fill_positions(rt->h_x_pos, rt->h_y_pos, rt->h_t_pos, rt->T, cfg->width, frame_timestamp);
+    STEP_CUDA(cudaMemcpy(rt->d_latent, rt->h_latent, rt->latent_elems * sizeof(float), cudaMemcpyHostToDevice));
+    STEP_CUDA(cudaMemcpy(rt->d_x_pos, rt->h_x_pos, (size_t)rt->T * sizeof(int64_t), cudaMemcpyHostToDevice));
+    STEP_CUDA(cudaMemcpy(rt->d_y_pos, rt->h_y_pos, (size_t)rt->T * sizeof(int64_t), cudaMemcpyHostToDevice));
+    STEP_CUDA(cudaMemcpy(rt->d_t_pos, rt->h_t_pos, (size_t)rt->T * sizeof(int64_t), cudaMemcpyHostToDevice));
+    fprintf(stderr, "live frame %d: frame_idx=%d frame_timestamp=%d\n",
+            rt->frame_ordinal, current_frame_idx, frame_timestamp);
+
+    for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+        int is_cache_pass = pass_idx >= rt->steps_to_run;
+        int frozen_pass = !is_cache_pass;
+        float sigma_step = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx];
+        float next_sigma = is_cache_pass ? 0.0f : cfg->scheduler_sigmas[pass_idx + 1];
+        float dsigma = next_sigma - sigma_step;
+
+        fill_noise_embedding(rt->h_noise, sigma_step);
+        STEP_CUDA(cudaMemcpy(rt->d_noise, rt->h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
+        STEP_LINEAR(rt->d_noise, rt->d_denoise_fc1, rt->d_noise_hidden, 1, 512, rt->mlp_hidden);
+        silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_noise_hidden, rt->d_noise_hidden, rt->mlp_hidden);
+        STEP_CUDA(cudaGetLastError());
+        STEP_LINEAR(rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D);
+
+        patchify_f32_kernel<<<rt->T * rt->D, 256>>>(rt->d_latent, rt->d_patch, rt->d_tokens, rt->C, rt->H, rt->W, rt->D, rt->ph, rt->pw, cfg->height, cfg->width);
+        STEP_CUDA(cudaGetLastError());
+        float *d_tokens_cur = rt->d_tokens;
+        float *d_tokens_next = rt->d_tokens_after_mlp;
+
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            const DeviceWorldLayerWeights *lw = &rt->d_layers[layer_idx];
+            DeviceWorldLayerCache *cache = &rt->d_caches[layer_idx];
+
+            add_bias_silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, lw->cond_bias, rt->d_cond_act, rt->D);
+            STEP_CUDA(cudaGetLastError());
+            STEP_LINEAR(rt->d_cond_act, lw->cond_proj_weight, rt->d_layer_mod, 1, rt->D, 6 * rt->D);
+            float *d_s0 = rt->d_layer_mod;
+            float *d_b0 = rt->d_layer_mod + rt->D;
+            float *d_g0 = rt->d_layer_mod + 2 * rt->D;
+            float *d_s1 = rt->d_layer_mod + 3 * rt->D;
+            float *d_b1 = rt->d_layer_mod + 4 * rt->D;
+            float *d_g1 = rt->d_layer_mod + 5 * rt->D;
+
+            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, 1.0e-6f);
+            STEP_CUDA(cudaGetLastError());
+            STEP_LINEAR(rt->d_norm, lw->qkv_proj_weight, rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
+            float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? rt->d_v_first : rt->d_v;
+            {
+                dim3 grid(rt->T, cfg->n_heads + 2 * cfg->n_kv_heads);
+                size_t smem = (size_t)(rt->d_head + 256) * sizeof(float);
+                qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
+                    rt->d_qkv_raw, rt->d_q, rt->d_k, d_v_cur,
+                    rt->d_x_pos, rt->d_y_pos, rt->d_t_pos, rt->d_xy_table, rt->d_inv_t,
+                    rt->T, cfg->n_heads, cfg->n_kv_heads, rt->d_head, cfg->width, cfg->height, 1.0e-6f);
+            }
+            STEP_CUDA(cudaGetLastError());
+            if (cfg->value_residual && layer_idx != 0) {
+                lerp_inplace_f32_kernel<<<div_up_i64((int64_t)rt->kv_rope_elems, 256), 256>>>(
+                    rt->d_v, rt->d_v_first, lw->v_lamb, (int64_t)rt->kv_rope_elems);
+                STEP_CUDA(cudaGetLastError());
+            }
+
+            int bucket = (current_frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
+            int num_buckets = (cache->ring_length / rt->T) / cache->pinned_dilation;
+            int base = (bucket % num_buckets) * rt->T;
+            bool write_step = (current_frame_idx % cache->pinned_dilation) == 0;
+            kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * rt->T * rt->d_head, 256), 256>>>(
+                cache->k, cache->v, rt->d_k, d_v_cur, cache->written,
+                cfg->n_kv_heads, rt->T, rt->d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
+            STEP_CUDA(cudaGetLastError());
+            collect_cache_frame_indices_kernel<<<cache->capacity / rt->T, 256>>>(
+                cache->written, cache->indices, cache->index_count,
+                cache->capacity, rt->T, base, write_step);
+            STEP_CUDA(cudaGetLastError());
+            indexed_attention_cache_f32_kernel<<<cfg->n_heads * rt->T, 256>>>(
+                rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity, rt->d_head,
+                1.0f / sqrtf((float)rt->d_head));
+            STEP_CUDA(cudaGetLastError());
+            STEP_LINEAR(rt->d_attn, lw->out_proj_weight, rt->d_attn_out, rt->T, rt->D, rt->D);
+            gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                d_tokens_cur, rt->d_attn_out, d_g0, rt->d_tokens_after_attn, rt->T, rt->D);
+            STEP_CUDA(cudaGetLastError());
+
+            float *d_tokens_ctrl = rt->d_tokens_after_attn;
+            if (lw->has_ctrl) {
+                rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, 1.0e-6f);
+                STEP_CUDA(cudaGetLastError());
+                STEP_LINEAR(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
+                add_channel_silu_inplace_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    rt->d_ctrl_hidden, rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D, rt->T, rt->D);
+                STEP_CUDA(cudaGetLastError());
+                STEP_LINEAR(rt->d_ctrl_hidden, lw->ctrl_fc2_weight, rt->d_ctrl_out, rt->T, rt->D, rt->D);
+                add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    rt->d_tokens_after_attn, rt->d_ctrl_out, rt->d_tokens_after_ctrl, rt->token_elems);
+                STEP_CUDA(cudaGetLastError());
+                d_tokens_ctrl = rt->d_tokens_after_ctrl;
+            }
+
+            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, 1.0e-6f);
+            STEP_CUDA(cudaGetLastError());
+            STEP_LINEAR(rt->d_mlp_in, lw->dit_mlp_fc1_weight, rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
+            silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
+                rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
+            STEP_CUDA(cudaGetLastError());
+            STEP_LINEAR(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);
+            gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                d_tokens_ctrl, rt->d_mlp_out, d_g1, d_tokens_next, rt->T, rt->D);
+            STEP_CUDA(cudaGetLastError());
+
+            float *d_swap = d_tokens_cur;
+            d_tokens_cur = d_tokens_next;
+            d_tokens_next = d_swap;
+        }
+
+        if (is_cache_pass) continue;
+
+        silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, rt->d_cond_act, rt->D);
+        STEP_CUDA(cudaGetLastError());
+        STEP_LINEAR(rt->d_cond_act, rt->d_out_norm_w, rt->d_out_mod, 1, rt->D, 2 * rt->D);
+        out_norm_silu_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, rt->d_out_mod, rt->d_final_tokens, rt->T, rt->D, 1.0e-6f);
+        STEP_CUDA(cudaGetLastError());
+        unpatchify_orig_f32_kernel<<<rt->T * (rt->C * rt->ph * rt->pw), 256>>>(
+            rt->d_final_tokens, rt->d_unpatch_w, rt->d_unpatch_b, rt->d_latent_out,
+            rt->T, rt->D, rt->C, rt->H, rt->W, rt->ph, rt->pw, cfg->width, rt->C * rt->ph * rt->pw);
+        STEP_CUDA(cudaGetLastError());
+        latent_update_f32_kernel<<<div_up_i64((int64_t)rt->latent_elems, 256), 256>>>(
+            rt->d_latent, rt->d_latent_out, dsigma, (int64_t)rt->latent_elems);
+        STEP_CUDA(cudaGetLastError());
+    }
+
+    if (world_cuda_decode_vae_to_rgb(cfg, &rt->d_vae, rt->d_latent, rgb_out, frames_out, width_out, height_out)) return 1;
+    rt->frame_ordinal += 1;
+    rt->next_frame_idx += 1;
+    if (seconds_out) *seconds_out = (float)(monotonic_seconds() - t0);
+#undef STEP_CUDA
+#undef STEP_LINEAR
+    return 0;
 }
 
 extern "C" int world_cuda_generation_probe(

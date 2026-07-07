@@ -243,6 +243,7 @@ static void free_vae_decoder_weights(WorldVaeDecoderWeights *vae) {
     memset(vae, 0, sizeof(*vae));
 }
 
+#ifndef WORLD_CLI_NO_MAIN
 int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
@@ -630,3 +631,4 @@ cleanup:
     safetensors_close(&st);
     return rc;
 }
+#endif
