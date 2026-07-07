@@ -1,7 +1,11 @@
 #include "world_cuda.h"
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#ifdef WORLD_USE_CUDNN
+#include <cudnn.h>
+#endif
 
 #include <math.h>
 #include <errno.h>
@@ -31,12 +35,31 @@
     } \
 } while (0)
 
+#ifdef WORLD_USE_CUDNN
+#define CUDNN_OK(expr) do { \
+    cudnnStatus_t _s = (expr); \
+    if (_s != CUDNN_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
+        return 1; \
+    } \
+} while (0)
+#endif
+
 static int div_up_i64(int64_t a, int b) {
     return (int)((a + b - 1) / b);
 }
 
 __device__ __forceinline__ float wm_silu(float x) {
     return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float wm_warp_sum(float x) {
+    x += __shfl_down_sync(0xffffffffu, x, 16);
+    x += __shfl_down_sync(0xffffffffu, x, 8);
+    x += __shfl_down_sync(0xffffffffu, x, 4);
+    x += __shfl_down_sync(0xffffffffu, x, 2);
+    x += __shfl_down_sync(0xffffffffu, x, 1);
+    return x;
 }
 
 __device__ __forceinline__ float wm_rope_phase(
@@ -63,6 +86,11 @@ __device__ __forceinline__ float wm_rope_phase(
 __global__ static void silu_f32_kernel(const float *x, float *y, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = wm_silu(x[i]);
+}
+
+__global__ static void f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(x[i]);
 }
 
 __global__ static void add_bias_silu_f32_kernel(const float *x, const float *bias, float *y, int64_t n) {
@@ -544,6 +572,69 @@ __global__ static void indexed_attention_cache_f32_kernel(
     }
 }
 
+__global__ static void indexed_attention_cache_d64_warp_f32_kernel(
+        const float *q,
+        const float *cache_k,
+        const float *cache_v,
+        const int64_t *indices,
+        const int *index_count,
+        float *out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+    int warp_row = ((int)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int total_rows = Hq * Tq;
+    if (warp_row >= total_rows) return;
+
+    int tq = warp_row % Tq;
+    int hq = warp_row / Tq;
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int Nkv = *index_count;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const float *qrow = q + (((int64_t)hq * Tq + tq) * 64);
+    const float *kbase = cache_k + (int64_t)hk * Tk * 64;
+    const float *vbase = cache_v + (int64_t)hk * Tk * 64;
+    float *orow = out_tokens + (int64_t)tq * (Hq * 64) + hq * 64;
+
+    float q0 = qrow[lane];
+    float q1 = qrow[lane + 32];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        const float *krow = kbase + (int64_t)tk * 64;
+        float dot = wm_warp_sum(q0 * krow[lane] + q1 * krow[lane + 32]);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        float score = dot * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        const float *vrow = vbase + (int64_t)tk * 64;
+        acc0 = acc0 * alpha + beta * vrow[lane];
+        acc1 = acc1 * alpha + beta * vrow[lane + 32];
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (Nkv > 0) {
+        float inv_l = 1.0f / l;
+        orow[lane] = acc0 * inv_l;
+        orow[lane + 32] = acc1 * inv_l;
+    } else {
+        orow[lane] = 0.0f;
+        orow[lane + 32] = 0.0f;
+    }
+}
+
 __global__ static void gated_residual_add_f32_kernel(
         const float *residual,
         const float *update,
@@ -935,6 +1026,44 @@ static int row_major_linear(
     return 0;
 }
 
+static int row_major_linear_fp16_weight(
+        cublasHandle_t handle,
+        const float *x_rm,
+        __half *x_half_tmp,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n) {
+    int64_t x_elems = (int64_t)m * k;
+    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
+    CUDA_OK(cudaGetLastError());
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_OK(cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        m,
+        k,
+        &alpha,
+        w_rm_h,
+        CUDA_R_16F,
+        k,
+        x_half_tmp,
+        CUDA_R_16F,
+        k,
+        &beta,
+        y_rm,
+        CUDA_R_32F,
+        n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    return 0;
+}
+
 static int copy_f32_to_device(float **dst, const float *src, size_t n) {
     *dst = NULL;
     CUDA_OK(cudaMalloc((void **)dst, n * sizeof(float)));
@@ -942,17 +1071,49 @@ static int copy_f32_to_device(float **dst, const float *src, size_t n) {
     return 0;
 }
 
+static int copy_f32_to_half_device(__half **dst, const float *src, size_t n) {
+    *dst = NULL;
+    __half *host = (__half *)malloc(n * sizeof(__half));
+    if (!host) {
+        fprintf(stderr, "failed to allocate half conversion buffer\n");
+        return 1;
+    }
+    for (size_t i = 0; i < n; ++i) host[i] = __float2half(src[i]);
+    cudaError_t err = cudaMalloc((void **)dst, n * sizeof(__half));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));
+        free(host);
+        return 1;
+    }
+    err = cudaMemcpy(*dst, host, n * sizeof(__half), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));
+        cudaFree(*dst);
+        *dst = NULL;
+        free(host);
+        return 1;
+    }
+    free(host);
+    return 0;
+}
+
 typedef struct {
     float *cond_bias;
     float *cond_proj_weight;
     float *qkv_proj_weight;
+    __half *qkv_proj_weight_h;
     float *out_proj_weight;
+    __half *out_proj_weight_h;
     float v_lamb;
     float *ctrl_fc1_x_weight;
+    __half *ctrl_fc1_x_weight_h;
     float *ctrl_fc1_c_weight;
     float *ctrl_fc2_weight;
+    __half *ctrl_fc2_weight_h;
     float *dit_mlp_fc1_weight;
+    __half *dit_mlp_fc1_weight_h;
     float *dit_mlp_fc2_weight;
+    __half *dit_mlp_fc2_weight_h;
     int has_ctrl;
 } DeviceWorldLayerWeights;
 
@@ -979,12 +1140,18 @@ static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_laye
         cudaFree(layers[i].cond_bias);
         cudaFree(layers[i].cond_proj_weight);
         cudaFree(layers[i].qkv_proj_weight);
+        cudaFree(layers[i].qkv_proj_weight_h);
         cudaFree(layers[i].out_proj_weight);
+        cudaFree(layers[i].out_proj_weight_h);
         cudaFree(layers[i].ctrl_fc1_x_weight);
+        cudaFree(layers[i].ctrl_fc1_x_weight_h);
         cudaFree(layers[i].ctrl_fc1_c_weight);
         cudaFree(layers[i].ctrl_fc2_weight);
+        cudaFree(layers[i].ctrl_fc2_weight_h);
         cudaFree(layers[i].dit_mlp_fc1_weight);
+        cudaFree(layers[i].dit_mlp_fc1_weight_h);
         cudaFree(layers[i].dit_mlp_fc2_weight);
+        cudaFree(layers[i].dit_mlp_fc2_weight_h);
     }
     free(layers);
 }
@@ -1082,6 +1249,24 @@ static int copy_qkv_proj_to_device(float **dst, const WorldLayerWeights *src, in
     return rc;
 }
 
+static int copy_qkv_proj_to_half_device(__half **dst, const WorldLayerWeights *src, int D, int kv_dim) {
+    *dst = NULL;
+    size_t q_elems = (size_t)D * D;
+    size_t kv_elems = (size_t)kv_dim * D;
+    size_t total = q_elems + 2 * kv_elems;
+    float *host = (float *)malloc(total * sizeof(float));
+    if (!host) {
+        fprintf(stderr, "failed to allocate fused QKV host weight\n");
+        return 1;
+    }
+    memcpy(host, src->q_proj_weight, q_elems * sizeof(float));
+    memcpy(host + q_elems, src->k_proj_weight, kv_elems * sizeof(float));
+    memcpy(host + q_elems + kv_elems, src->v_proj_weight, kv_elems * sizeof(float));
+    int rc = copy_f32_to_half_device(dst, host, total);
+    free(host);
+    return rc;
+}
+
 static int copy_world_layers_to_device(
         DeviceWorldLayerWeights **dst_layers,
         const WorldLayerWeights *src_layers,
@@ -1101,14 +1286,20 @@ static int copy_world_layers_to_device(
         if (copy_f32_to_device(&dl->cond_bias, src->cond_bias, (size_t)D)) goto fail;
         if (copy_cond_proj_to_device(&dl->cond_proj_weight, src, D)) goto fail;
         if (copy_qkv_proj_to_device(&dl->qkv_proj_weight, src, D, kv_dim)) goto fail;
+        if (copy_qkv_proj_to_half_device(&dl->qkv_proj_weight_h, src, D, kv_dim)) goto fail;
         if (copy_f32_to_device(&dl->out_proj_weight, src->out_proj_weight, (size_t)D * D)) goto fail;
+        if (copy_f32_to_half_device(&dl->out_proj_weight_h, src->out_proj_weight, (size_t)D * D)) goto fail;
         if (src->has_ctrl) {
             if (copy_f32_to_device(&dl->ctrl_fc1_x_weight, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
+            if (copy_f32_to_half_device(&dl->ctrl_fc1_x_weight_h, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
             if (copy_f32_to_device(&dl->ctrl_fc1_c_weight, src->ctrl_fc1_c_weight, (size_t)D * D)) goto fail;
             if (copy_f32_to_device(&dl->ctrl_fc2_weight, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
+            if (copy_f32_to_half_device(&dl->ctrl_fc2_weight_h, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
         }
         if (copy_f32_to_device(&dl->dit_mlp_fc1_weight, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
+        if (copy_f32_to_half_device(&dl->dit_mlp_fc1_weight_h, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
         if (copy_f32_to_device(&dl->dit_mlp_fc2_weight, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
+        if (copy_f32_to_half_device(&dl->dit_mlp_fc2_weight_h, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
     }
 
     *dst_layers = dst;
@@ -1234,6 +1425,11 @@ typedef struct {
     unsigned char *h_rgb;
     size_t max_elems;
     size_t rgb_elems;
+#ifdef WORLD_USE_CUDNN
+    cudnnHandle_t cudnn;
+    void *cudnn_workspace;
+    size_t cudnn_workspace_bytes;
+#endif
     int out_w;
     int out_h;
     int H_pre_shuffle;
@@ -1281,6 +1477,10 @@ static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_CO
 
 static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     if (!dec) return;
+#ifdef WORLD_USE_CUDNN
+    cudaFree(dec->cudnn_workspace);
+    if (dec->cudnn) cudnnDestroy(dec->cudnn);
+#endif
     taehv_free_weights(dec->convs);
     cudaFree(dec->buf0);
     cudaFree(dec->buf1);
@@ -1316,14 +1516,28 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf1, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
+#ifdef WORLD_USE_CUDNN
+    if (cudnnCreate(&dec->cudnn) != CUDNN_STATUS_SUCCESS) {
+        fprintf(stderr, "failed to create cuDNN handle\n");
+        goto fail;
+    }
+    dec->cudnn_workspace_bytes = 128ull * 1024ull * 1024ull;
+    VAE_INIT_CUDA(cudaMalloc((void **)&dec->cudnn_workspace, dec->cudnn_workspace_bytes));
+#endif
     dec->h_rgb = (unsigned char *)malloc(dec->rgb_elems);
     if (!dec->h_rgb) {
         fprintf(stderr, "failed to allocate VAE RGB host buffer\n");
         goto fail;
     }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3\n",
-            dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0));
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3%s\n",
+            dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
+#ifdef WORLD_USE_CUDNN
+            ", cuDNN conv enabled"
+#else
+            ""
+#endif
+    );
 #undef VAE_INIT_CUDA
     return 0;
 
@@ -1333,7 +1547,79 @@ fail:
     return 1;
 }
 
-static int taehv_run_conv(const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
+static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
+#ifdef WORLD_USE_CUDNN
+    if (dec && dec->cudnn) {
+        cudnnTensorDescriptor_t in_desc = NULL;
+        cudnnTensorDescriptor_t out_desc = NULL;
+        cudnnTensorDescriptor_t bias_desc = NULL;
+        cudnnFilterDescriptor_t filter_desc = NULL;
+        cudnnConvolutionDescriptor_t conv_desc = NULL;
+        cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+        size_t workspace_bytes = 0;
+        int rc = 1;
+
+#define CUDNN_CONV_OK(expr) do { \
+    cudnnStatus_t _s = (expr); \
+    if (_s != CUDNN_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
+        goto cleanup; \
+    } \
+} while (0)
+
+        CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&in_desc));
+        CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&out_desc));
+        CUDNN_CONV_OK(cudnnCreateFilterDescriptor(&filter_desc));
+        CUDNN_CONV_OK(cudnnCreateConvolutionDescriptor(&conv_desc));
+        CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->in_c, H, W));
+        CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->out_c, H, W));
+        CUDNN_CONV_OK(cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, conv->out_c, conv->in_c, conv->kernel, conv->kernel));
+        CUDNN_CONV_OK(cudnnSetConvolution2dDescriptor(
+            conv_desc, conv->kernel / 2, conv->kernel / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+        CUDNN_CONV_OK(cudnnSetConvolutionMathType(conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
+        if (cudnnGetConvolutionForwardWorkspaceSize(
+                    dec->cudnn, in_desc, filter_desc, conv_desc, out_desc, algo, &workspace_bytes) != CUDNN_STATUS_SUCCESS ||
+                workspace_bytes > dec->cudnn_workspace_bytes) {
+            algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+            workspace_bytes = 0;
+        }
+
+        {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            CUDNN_CONV_OK(cudnnConvolutionForward(
+                dec->cudnn,
+                &alpha,
+                in_desc,
+                in,
+                filter_desc,
+                conv->weight,
+                conv_desc,
+                algo,
+                dec->cudnn_workspace,
+                workspace_bytes,
+                &beta,
+                out_desc,
+                out));
+            if (conv->has_bias) {
+                CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&bias_desc));
+                CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(
+                    bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, conv->out_c, 1, 1));
+                CUDNN_CONV_OK(cudnnAddTensor(dec->cudnn, &alpha, bias_desc, conv->bias, &alpha, out_desc, out));
+            }
+        }
+        rc = 0;
+
+cleanup:
+        if (bias_desc) cudnnDestroyTensorDescriptor(bias_desc);
+        if (conv_desc) cudnnDestroyConvolutionDescriptor(conv_desc);
+        if (filter_desc) cudnnDestroyFilterDescriptor(filter_desc);
+        if (out_desc) cudnnDestroyTensorDescriptor(out_desc);
+        if (in_desc) cudnnDestroyTensorDescriptor(in_desc);
+#undef CUDNN_CONV_OK
+        return rc;
+    }
+#endif
     int64_t total = (int64_t)N * conv->out_c * H * W;
     taehv_conv2d_nchw_kernel<<<div_up_i64(total, 256), 256>>>(
         in, conv->weight, conv->bias, out, N, conv->in_c, conv->out_c, H, W, conv->kernel, conv->has_bias);
@@ -1348,6 +1634,7 @@ static int taehv_run_relu(float *x, int64_t n) {
 }
 
 static int taehv_run_memblock(
+        DeviceVaeDecoder *dec,
         float **cur_io,
         float *buf0,
         float *buf1,
@@ -1367,11 +1654,11 @@ static int taehv_run_memblock(
     int64_t elems = (int64_t)N * C * H * W;
     taehv_concat_past_nchw_kernel<<<div_up_i64(elems * 2, 256), 256>>>(cur, aux, N, C, H, W);
     CUDA_OK(cudaGetLastError());
-    if (taehv_run_conv(aux, tmp, conv0, N, H, W)) return 1;
+    if (taehv_run_conv(dec, aux, tmp, conv0, N, H, W)) return 1;
     if (taehv_run_relu(tmp, elems)) return 1;
-    if (taehv_run_conv(tmp, aux, conv2, N, H, W)) return 1;
+    if (taehv_run_conv(dec, tmp, aux, conv2, N, H, W)) return 1;
     if (taehv_run_relu(aux, elems)) return 1;
-    if (taehv_run_conv(aux, tmp, conv4, N, H, W)) return 1;
+    if (taehv_run_conv(dec, aux, tmp, conv4, N, H, W)) return 1;
     taehv_add_relu_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
     CUDA_OK(cudaGetLastError());
     *cur_io = aux;
@@ -1459,7 +1746,7 @@ static int world_cuda_decode_vae_to_rgb(
 
 #define VAE_CONV_TO(idx, out_c) do { \
     taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv(cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
+    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
     cur = tmp; \
     C = (out_c); \
 } while (0)
@@ -1467,7 +1754,7 @@ static int world_cuda_decode_vae_to_rgb(
     if (taehv_run_relu(cur, (int64_t)N * C * H * W)) goto cleanup; \
 } while (0)
 #define VAE_MEMBLOCK(a, b, c) do { \
-    if (taehv_run_memblock(&cur, buf0, buf1, buf2, &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], N, C, H, W)) goto cleanup; \
+    if (taehv_run_memblock(dec, &cur, buf0, buf1, buf2, &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], N, C, H, W)) goto cleanup; \
 } while (0)
 #define VAE_UPSAMPLE2() do { \
     taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
@@ -1480,7 +1767,7 @@ static int world_cuda_decode_vae_to_rgb(
 #define VAE_TGROW(idx, stride_value) do { \
     int _stride = (stride_value); \
     taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv(cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
+    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
     if (_stride == 1) { \
         cur = tmp; \
     } else { \
@@ -1578,6 +1865,7 @@ struct WorldCudaRuntime {
     size_t token_elems;
     size_t kv_rope_elems;
     size_t q_rope_elems;
+    size_t linear_half_elems;
     float *h_latent;
     float *h_noise;
     float *h_xy;
@@ -1630,9 +1918,14 @@ struct WorldCudaRuntime {
     int64_t *d_x_pos;
     int64_t *d_y_pos;
     int64_t *d_t_pos;
+    __half *d_linear_half;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
     cublasHandle_t handle;
+    cudaEvent_t ev_step_start;
+    cudaEvent_t ev_after_setup;
+    cudaEvent_t ev_after_transformer;
+    cudaEvent_t ev_after_vae;
     DeviceVaeDecoder d_vae;
 };
 
@@ -1645,6 +1938,10 @@ static double monotonic_seconds(void) {
 extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     if (!rt) return;
     taehv_decoder_free(&rt->d_vae);
+    if (rt->ev_after_vae) cudaEventDestroy(rt->ev_after_vae);
+    if (rt->ev_after_transformer) cudaEventDestroy(rt->ev_after_transformer);
+    if (rt->ev_after_setup) cudaEventDestroy(rt->ev_after_setup);
+    if (rt->ev_step_start) cudaEventDestroy(rt->ev_step_start);
     if (rt->handle) cublasDestroy(rt->handle);
     free_device_world_layers(rt->d_layers, rt->layers_to_run);
     free_device_world_caches(rt->d_caches, rt->layers_to_run);
@@ -1693,6 +1990,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_x_pos);
     cudaFree(rt->d_y_pos);
     cudaFree(rt->d_t_pos);
+    cudaFree(rt->d_linear_half);
     free(rt->h_latent);
     free(rt->h_noise);
     free(rt->h_xy);
@@ -1757,6 +2055,10 @@ extern "C" int world_cuda_runtime_create(
     rt->token_elems = (size_t)rt->T * rt->D;
     rt->q_rope_elems = (size_t)cfg->n_heads * rt->T * rt->d_head;
     rt->kv_rope_elems = (size_t)cfg->n_kv_heads * rt->T * rt->d_head;
+    rt->linear_half_elems = rt->token_elems;
+    if ((size_t)rt->T * rt->mlp_hidden > rt->linear_half_elems) {
+        rt->linear_half_elems = (size_t)rt->T * rt->mlp_hidden;
+    }
     size_t qkv_token_elems = rt->token_elems + 2 * ((size_t)rt->T * rt->kv_dim);
     size_t patch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     size_t out_norm_weight_elems = (size_t)2 * rt->D * rt->D;
@@ -1827,6 +2129,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_x_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_y_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_t_pos, (size_t)rt->T * sizeof(int64_t)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_linear_half, rt->linear_half_elems * sizeof(__half)));
 
     if (copy_f32_to_device(&rt->d_patch, weights->patchify_weight, patch_weight_elems)) goto fail;
     if (copy_f32_to_device(&rt->d_denoise_fc1, weights->denoise_fc1_weight, (size_t)rt->mlp_hidden * 512)) goto fail;
@@ -1841,6 +2144,11 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUBLAS(cublasCreate(&rt->handle));
+    RT_CUBLAS(cublasSetMathMode(rt->handle, CUBLAS_TF32_TENSOR_OP_MATH));
+    RT_CUDA(cudaEventCreate(&rt->ev_step_start));
+    RT_CUDA(cudaEventCreate(&rt->ev_after_setup));
+    RT_CUDA(cudaEventCreate(&rt->ev_after_transformer));
+    RT_CUDA(cudaEventCreate(&rt->ev_after_vae));
     if (taehv_decoder_init(&rt->d_vae, cfg, vae)) goto fail;
     RT_CUDA(cudaDeviceSynchronize());
 
@@ -1867,6 +2175,10 @@ extern "C" int world_cuda_runtime_step_rgb(
     if (!rt || !control_input) return 1;
     const WorldConfig *cfg = &rt->cfg;
     double t0 = monotonic_seconds();
+    float setup_ms = 0.0f;
+    float transformer_ms = 0.0f;
+    float vae_ms = 0.0f;
+    float total_ms = 0.0f;
 
 #define STEP_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -1878,7 +2190,15 @@ extern "C" int world_cuda_runtime_step_rgb(
 #define STEP_LINEAR(x, w, y, m, k, n) do { \
     if (row_major_linear(rt->handle, (x), (w), (y), (m), (k), (n))) return 1; \
 } while (0)
+#define STEP_LINEAR_FAST(x, w, wh, y, m, k, n) do { \
+    if ((wh) && (m) > 1) { \
+        if (row_major_linear_fp16_weight(rt->handle, (x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+    } else { \
+        STEP_LINEAR((x), (w), (y), (m), (k), (n)); \
+    } \
+} while (0)
 
+    STEP_CUDA(cudaEventRecord(rt->ev_step_start, 0));
     int current_frame_idx = rt->next_frame_idx;
     int frame_timestamp = current_frame_idx * rt->frame_stride;
     STEP_CUDA(cudaMemcpy(rt->d_control_input, control_input, (size_t)rt->ctrl_dim * sizeof(float), cudaMemcpyHostToDevice));
@@ -1905,6 +2225,7 @@ extern "C" int world_cuda_runtime_step_rgb(
     STEP_CUDA(cudaMemcpy(rt->d_t_pos, rt->h_t_pos, (size_t)rt->T * sizeof(int64_t), cudaMemcpyHostToDevice));
     fprintf(stderr, "live frame %d: frame_idx=%d frame_timestamp=%d\n",
             rt->frame_ordinal, current_frame_idx, frame_timestamp);
+    STEP_CUDA(cudaEventRecord(rt->ev_after_setup, 0));
 
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
@@ -1941,7 +2262,8 @@ extern "C" int world_cuda_runtime_step_rgb(
 
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, 1.0e-6f);
             STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR(rt->d_norm, lw->qkv_proj_weight, rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
+            STEP_LINEAR_FAST(rt->d_norm, lw->qkv_proj_weight, lw->qkv_proj_weight_h,
+                             rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
             float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? rt->d_v_first : rt->d_v;
             {
                 dim3 grid(rt->T, cfg->n_heads + 2 * cfg->n_kv_heads);
@@ -1970,12 +2292,20 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache->written, cache->indices, cache->index_count,
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
-            indexed_attention_cache_f32_kernel<<<cfg->n_heads * rt->T, 256>>>(
-                rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
-                cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity, rt->d_head,
-                1.0f / sqrtf((float)rt->d_head));
+            if (rt->d_head == 64) {
+                indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
+                    rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                    cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                    1.0f / 8.0f);
+            } else {
+                indexed_attention_cache_f32_kernel<<<cfg->n_heads * rt->T, 256>>>(
+                    rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                    cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity, rt->d_head,
+                    1.0f / sqrtf((float)rt->d_head));
+            }
             STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR(rt->d_attn, lw->out_proj_weight, rt->d_attn_out, rt->T, rt->D, rt->D);
+            STEP_LINEAR_FAST(rt->d_attn, lw->out_proj_weight, lw->out_proj_weight_h,
+                             rt->d_attn_out, rt->T, rt->D, rt->D);
             gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                 d_tokens_cur, rt->d_attn_out, d_g0, rt->d_tokens_after_attn, rt->T, rt->D);
             STEP_CUDA(cudaGetLastError());
@@ -1984,11 +2314,13 @@ extern "C" int world_cuda_runtime_step_rgb(
             if (lw->has_ctrl) {
                 rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, 1.0e-6f);
                 STEP_CUDA(cudaGetLastError());
-                STEP_LINEAR(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
+                STEP_LINEAR_FAST(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, lw->ctrl_fc1_x_weight_h,
+                                 rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
                 add_channel_silu_inplace_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                     rt->d_ctrl_hidden, rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D, rt->T, rt->D);
                 STEP_CUDA(cudaGetLastError());
-                STEP_LINEAR(rt->d_ctrl_hidden, lw->ctrl_fc2_weight, rt->d_ctrl_out, rt->T, rt->D, rt->D);
+                STEP_LINEAR_FAST(rt->d_ctrl_hidden, lw->ctrl_fc2_weight, lw->ctrl_fc2_weight_h,
+                                 rt->d_ctrl_out, rt->T, rt->D, rt->D);
                 add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                     rt->d_tokens_after_attn, rt->d_ctrl_out, rt->d_tokens_after_ctrl, rt->token_elems);
                 STEP_CUDA(cudaGetLastError());
@@ -1997,11 +2329,13 @@ extern "C" int world_cuda_runtime_step_rgb(
 
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, 1.0e-6f);
             STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR(rt->d_mlp_in, lw->dit_mlp_fc1_weight, rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
+            STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
+                             rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
             silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
                 rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
             STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);
+            STEP_LINEAR_FAST(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, lw->dit_mlp_fc2_weight_h,
+                             rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);
             gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                 d_tokens_ctrl, rt->d_mlp_out, d_g1, d_tokens_next, rt->T, rt->D);
             STEP_CUDA(cudaGetLastError());
@@ -2027,12 +2361,29 @@ extern "C" int world_cuda_runtime_step_rgb(
         STEP_CUDA(cudaGetLastError());
     }
 
+    STEP_CUDA(cudaEventRecord(rt->ev_after_transformer, 0));
     if (world_cuda_decode_vae_to_rgb(cfg, &rt->d_vae, rt->d_latent, rgb_out, frames_out, width_out, height_out)) return 1;
+    STEP_CUDA(cudaEventRecord(rt->ev_after_vae, 0));
+    STEP_CUDA(cudaEventSynchronize(rt->ev_after_vae));
+    STEP_CUDA(cudaEventElapsedTime(&setup_ms, rt->ev_step_start, rt->ev_after_setup));
+    STEP_CUDA(cudaEventElapsedTime(&transformer_ms, rt->ev_after_setup, rt->ev_after_transformer));
+    STEP_CUDA(cudaEventElapsedTime(&vae_ms, rt->ev_after_transformer, rt->ev_after_vae));
+    STEP_CUDA(cudaEventElapsedTime(&total_ms, rt->ev_step_start, rt->ev_after_vae));
     rt->frame_ordinal += 1;
     rt->next_frame_idx += 1;
     if (seconds_out) *seconds_out = (float)(monotonic_seconds() - t0);
+    {
+        int frames = frames_out ? *frames_out : 4;
+        float total_s = total_ms * 1.0e-3f;
+        fprintf(stderr,
+                "live timing: setup=%.3fms transformer=%.3fms vae=%.3fms total=%.3fms chunk_fps=%.3f rgb_fps=%.3f\n",
+                setup_ms, transformer_ms, vae_ms, total_ms,
+                total_s > 0.0f ? 1.0f / total_s : 0.0f,
+                total_s > 0.0f ? (float)frames / total_s : 0.0f);
+    }
 #undef STEP_CUDA
 #undef STEP_LINEAR
+#undef STEP_LINEAR_FAST
     return 0;
 }
 

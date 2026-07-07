@@ -38,7 +38,7 @@ typedef struct {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--steps N] [--layers N] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
             "then renders decoded RGB frames to a raylib texture without writing images.\n",
@@ -217,6 +217,8 @@ int main(int argc, char **argv) {
     int window_height = 720;
     int warmup_chunks = 1;
     int headless_smoke = 0;
+    int fast_realtime = 0;
+    int cache_window_override = -1;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
 
@@ -231,6 +233,10 @@ int main(int argc, char **argv) {
             steps_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
             layers_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cache-window") == 0 && i + 1 < argc) {
+            cache_window_override = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--fast-realtime") == 0) {
+            fast_realtime = 1;
         } else if (strcmp(argv[i], "--frame-idx") == 0 && i + 1 < argc) {
             frame_idx = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
@@ -275,6 +281,17 @@ int main(int argc, char **argv) {
 
     WorldConfig cfg;
     if (world_config_load(&cfg, config_path)) return 1;
+    if (fast_realtime) {
+        if (steps_to_run < 0) steps_to_run = 1;
+        if (cache_window_override < 0) cache_window_override = 1;
+    }
+    if (cache_window_override > 0) {
+        cfg.local_window = cache_window_override;
+        cfg.global_window = cache_window_override;
+        cfg.global_pinned_dilation = 1;
+        fprintf(stderr, "realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
+                cfg.local_window, cfg.global_window);
+    }
     if (layers_to_run < 0) layers_to_run = cfg.n_layers;
     if (steps_to_run < 0) steps_to_run = cfg.scheduler_sigmas_count - 1;
     if (layers_to_run <= 0 || layers_to_run > cfg.n_layers || steps_to_run <= 0 || steps_to_run >= cfg.scheduler_sigmas_count) {

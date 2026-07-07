@@ -84,6 +84,22 @@ def test_silu_matches_torch(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=1e-6, atol=1e-6)
 
 
+def test_row_major_linear_fp16_matches_half_rounded_reference(wm_cuda):
+    torch.manual_seed(11)
+    x = torch.randn(32, 256, device="cuda", dtype=torch.float32) * 0.5
+    w = torch.randn(384, 256, device="cuda", dtype=torch.float32) * 0.5
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        y = wm_cuda.row_major_linear_fp16(x.contiguous(), w.contiguous())
+        ref = x.half().float().matmul(w.half().float().t())
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+    torch.testing.assert_close(y, ref, rtol=2e-3, atol=2e-3)
+
+
 def test_rms_norm_matches_torch(wm_cuda):
     torch.manual_seed(2)
     x = torch.randn(5, 17, 128, device="cuda", dtype=torch.float32)
@@ -362,6 +378,7 @@ if __name__ == "__main__":
     ext = load_wm_cuda()
     for test in (
         test_silu_matches_torch,
+        test_row_major_linear_fp16_matches_half_rounded_reference,
         test_rms_norm_matches_torch,
         test_ada_rms_norm_matches_world_formula,
         test_ortho_rope_matches_world_formula,

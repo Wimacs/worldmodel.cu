@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -22,6 +23,15 @@ static void check_last_cuda_error(const char *name) {
 
 __device__ __forceinline__ float wm_silu(float x) {
     return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float wm_warp_sum(float x) {
+    x += __shfl_down_sync(0xffffffffu, x, 16);
+    x += __shfl_down_sync(0xffffffffu, x, 8);
+    x += __shfl_down_sync(0xffffffffu, x, 4);
+    x += __shfl_down_sync(0xffffffffu, x, 2);
+    x += __shfl_down_sync(0xffffffffu, x, 1);
+    return x;
 }
 
 __device__ __forceinline__ float wm_rope_phase(
@@ -384,6 +394,123 @@ __global__ void indexed_attention_f32_kernel(
     }
 }
 
+__global__ void indexed_attention_d64_f32_kernel(
+        const float *q,
+        const float *k,
+        const float *v,
+        const int64_t *indices,
+        float *out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        float scale) {
+    __shared__ float warp_partials[2];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int tq = row % Tq;
+    int hq = (row / Tq) % Hq;
+    int b = row / (Tq * Hq);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+
+    const float *qrow = q + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+    const float *kbase = k + ((int64_t)b * Hkv + hk) * Tk * 64;
+    const float *vbase = v + ((int64_t)b * Hkv + hk) * Tk * 64;
+    float *orow = out + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+
+    float qv = qrow[tid];
+    float acc = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        const float *krow = kbase + (int64_t)tk * 64;
+        float partial = wm_warp_sum(qv * krow[tid]);
+        if (lane == 0) warp_partials[warp] = partial;
+        __syncthreads();
+
+        float score = (warp_partials[0] + warp_partials[1]) * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        acc = acc * alpha + beta * vbase[(int64_t)tk * 64 + tid];
+        l = l * alpha + beta;
+        m = new_m;
+        __syncthreads();
+    }
+
+    orow[tid] = Nkv > 0 ? acc / l : 0.0f;
+}
+
+__global__ void indexed_attention_d64_warp_f32_kernel(
+        const float *q,
+        const float *k,
+        const float *v,
+        const int64_t *indices,
+        float *out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        float scale) {
+    int warp_row = ((int)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int total_rows = B * Hq * Tq;
+    if (warp_row >= total_rows) return;
+
+    int tq = warp_row % Tq;
+    int hq = (warp_row / Tq) % Hq;
+    int b = warp_row / (Tq * Hq);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+
+    const float *qrow = q + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+    const float *kbase = k + ((int64_t)b * Hkv + hk) * Tk * 64;
+    const float *vbase = v + ((int64_t)b * Hkv + hk) * Tk * 64;
+    float *orow = out + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+
+    float q0 = qrow[lane];
+    float q1 = qrow[lane + 32];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        const float *krow = kbase + (int64_t)tk * 64;
+        float dot = wm_warp_sum(q0 * krow[lane] + q1 * krow[lane + 32]);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        float score = dot * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        const float *vrow = vbase + (int64_t)tk * 64;
+        acc0 = acc0 * alpha + beta * vrow[lane];
+        acc1 = acc1 * alpha + beta * vrow[lane + 32];
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (Nkv > 0) {
+        float inv_l = 1.0f / l;
+        orow[lane] = acc0 * inv_l;
+        orow[lane + 32] = acc1 * inv_l;
+    } else {
+        orow[lane] = 0.0f;
+        orow[lane + 32] = 0.0f;
+    }
+}
+
 __global__ void kv_cache_upsert_copy_f32_kernel(
         float *cache_k,
         float *cache_v,
@@ -700,6 +827,51 @@ torch::Tensor silu_cuda(torch::Tensor x) {
     return y;
 }
 
+torch::Tensor row_major_linear_fp16_cuda(torch::Tensor x, torch::Tensor w) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    auto x_h = x.to(torch::kFloat16);
+    auto w_h = w.to(torch::kFloat16);
+    auto y = torch::empty({m, n}, x.options());
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        m,
+        k,
+        &alpha,
+        w_h.data_ptr<at::Half>(),
+        CUDA_R_16F,
+        k,
+        x_h.data_ptr<at::Half>(),
+        CUDA_R_16F,
+        k,
+        &beta,
+        y.data_ptr<float>(),
+        CUDA_R_32F,
+        n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "row_major_linear_fp16 cublasGemmEx failed: ", (int)status);
+    return y;
+}
+
 torch::Tensor rms_norm_cuda(torch::Tensor x, double eps) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CONTIGUOUS(x);
@@ -974,21 +1146,38 @@ torch::Tensor indexed_attention_cuda(
     TORCH_CHECK(D > 0 && D <= 256, "indexed_attention currently supports 1 <= D <= 256");
 
     auto out = torch::empty_like(q);
-    indexed_attention_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        q.data_ptr<float>(),
-        k.data_ptr<float>(),
-        v.data_ptr<float>(),
-        indices.data_ptr<int64_t>(),
-        out.data_ptr<float>(),
-        B,
-        Hq,
-        Hkv,
-        Tq,
-        Nkv,
-        Tk,
-        D,
-        (float)scale);
-    check_last_cuda_error("indexed_attention_f32");
+    if (D == 64) {
+        indexed_attention_d64_warp_f32_kernel<<<div_up_i64((int64_t)B * Hq * Tq, 4), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+            q.data_ptr<float>(),
+            k.data_ptr<float>(),
+            v.data_ptr<float>(),
+            indices.data_ptr<int64_t>(),
+            out.data_ptr<float>(),
+            B,
+            Hq,
+            Hkv,
+            Tq,
+            Nkv,
+            Tk,
+            (float)scale);
+        check_last_cuda_error("indexed_attention_d64_warp_f32");
+    } else {
+        indexed_attention_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            q.data_ptr<float>(),
+            k.data_ptr<float>(),
+            v.data_ptr<float>(),
+            indices.data_ptr<int64_t>(),
+            out.data_ptr<float>(),
+            B,
+            Hq,
+            Hkv,
+            Tq,
+            Nkv,
+            Tk,
+            D,
+            (float)scale);
+        check_last_cuda_error("indexed_attention_f32");
+    }
     return out;
 }
 
@@ -1293,6 +1482,7 @@ torch::Tensor taehv_tgrow_reshape_cuda(torch::Tensor x, int64_t stride) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu", &silu_cuda, "WorldModel SiLU (CUDA, f32)");
+    m.def("row_major_linear_fp16", &row_major_linear_fp16_cuda, "WorldModel row-major Linear using FP16 inputs/weights and FP32 output");
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
     m.def("ada_rms_norm", &ada_rms_norm_cuda, "WorldModel AdaRMSNorm (CUDA, f32)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");

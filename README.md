@@ -55,6 +55,19 @@ For terminal-only validation of the same resident runtime path:
 ./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --steps 4 --headless-smoke
 ```
 
+For a lower-latency interactive mode, use the fast realtime preset. It uses one
+scheduler step and clamps both local/global KV cache windows to one frame chunk:
+
+```sh
+./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --fast-realtime
+```
+
+`--cache-window N` can be used independently to trade temporal history for
+latency. On an RTX 4090 D, `--fast-realtime --warmup 8 --headless-smoke`
+stabilizes around 100-111 ms per decoded 4-frame RGB chunk, about 36-40 RGB fps.
+The full `--steps 4` path keeps the quality-oriented schedule and longer cache,
+but FPS drops as cache history grows.
+
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the controller vector. CUDA generation runs on a
 worker thread while the raylib main thread keeps polling input and presenting
@@ -88,8 +101,9 @@ With `--dump-prefix`, the standalone executable also writes
 `/tmp/world_full.cache_written_counts.f32` with one float count per layer so
 cache writes can be parity-checked.
 
-This executable is plain C+CUDA and currently links only CUDA runtime and
-cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
+This executable is plain C+CUDA and links CUDA runtime/cuBLAS, with optional
+cuDNN acceleration for the VAE decoder when cuDNN is available at configure time.
+It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and runs the scheduler through the WorldDiT
 path. The standalone transformer copies all requested layer weights to GPU once
 per run, then reuses those resident weights across scheduler steps. If `--out`
@@ -144,7 +158,9 @@ python generate_smoke.py --model-dir ../Waypoint-1.5-1B --steps 1 --cache-pass
 
 Notes:
 
-- Kernels currently target float32 parity first.
+- Kernels currently target float32 parity first, with resident realtime fast
+  paths for FP16-weight GEMM, warp-level D=64 indexed attention, and optional
+  cuDNN VAE convolutions.
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,
@@ -154,8 +170,9 @@ Notes:
   token forward, value residual, optional ctrl fusion with
   `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
-  conversion, resident VAE decoder weights/scratch buffers, TAEHV direct
-  conv/MemBlock/TGrow/upsample decode, pixel shuffle, and 4-frame PPM output.
+  conversion, resident VAE decoder weights/scratch buffers, TAEHV
+  cuDNN-accelerated or built-in direct conv/MemBlock/TGrow/upsample decode,
+  pixel shuffle, and 4-frame PPM output.
   Multi-frame standalone rollout recomputes the controller embedding from the
   current frame's control vector before each denoise/cache pass pair.
   `test_standalone_probe.py` checks the standalone normal-noise fixture,
