@@ -662,6 +662,30 @@ __global__ static void gather_indexed_kv_d64_f32_kernel(
     v_compact[i] = cache_v[src];
 }
 
+__global__ static void gather_indexed_kv_hkv_d64_f32_kernel(
+        const float *__restrict__ cache_k,
+        const float *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ k_compact,
+        float *__restrict__ v_compact,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Hkv * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hk = (int)(q / Nkv);
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
+    k_compact[i] = cache_k[src];
+    v_compact[i] = cache_v[src];
+}
+
 __global__ static void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
     __shared__ float red[256];
     int row = blockIdx.x;
@@ -1506,6 +1530,19 @@ typedef struct {
     int in_c;
     int kernel;
     int has_bias;
+#ifdef WORLD_USE_CUDNN
+    cudnnTensorDescriptor_t in_desc;
+    cudnnTensorDescriptor_t out_desc;
+    cudnnTensorDescriptor_t bias_desc;
+    cudnnFilterDescriptor_t filter_desc;
+    cudnnConvolutionDescriptor_t conv_desc;
+    cudnnConvolutionFwdAlgo_t algo;
+    size_t workspace_bytes;
+    int plan_ready;
+    int plan_n;
+    int plan_h;
+    int plan_w;
+#endif
 } DeviceVaeConvWeight;
 
 typedef struct {
@@ -1560,6 +1597,13 @@ static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COU
 
 static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT]) {
     for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+#ifdef WORLD_USE_CUDNN
+        if (dev[i].bias_desc) cudnnDestroyTensorDescriptor(dev[i].bias_desc);
+        if (dev[i].conv_desc) cudnnDestroyConvolutionDescriptor(dev[i].conv_desc);
+        if (dev[i].filter_desc) cudnnDestroyFilterDescriptor(dev[i].filter_desc);
+        if (dev[i].out_desc) cudnnDestroyTensorDescriptor(dev[i].out_desc);
+        if (dev[i].in_desc) cudnnDestroyTensorDescriptor(dev[i].in_desc);
+#endif
         cudaFree(dev[i].weight);
         cudaFree(dev[i].bias);
         dev[i].weight = NULL;
@@ -1578,9 +1622,135 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     cudaFree(dec->buf1);
     cudaFree(dec->buf2);
     cudaFree(dec->d_rgb);
-    free(dec->h_rgb);
+    cudaFreeHost(dec->h_rgb);
     memset(dec, 0, sizeof(*dec));
 }
+
+#ifdef WORLD_USE_CUDNN
+static int taehv_prepare_conv_plan(DeviceVaeDecoder *dec, DeviceVaeConvWeight *conv, int N, int H, int W) {
+    if (!dec || !dec->cudnn || !conv) return 1;
+    size_t workspace_bytes = 0;
+
+#define VAE_CUDNN_PLAN_OK(expr) do { \
+    cudnnStatus_t _s = (expr); \
+    if (_s != CUDNN_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
+        return 1; \
+    } \
+} while (0)
+
+    VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->in_desc));
+    VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->out_desc));
+    VAE_CUDNN_PLAN_OK(cudnnCreateFilterDescriptor(&conv->filter_desc));
+    VAE_CUDNN_PLAN_OK(cudnnCreateConvolutionDescriptor(&conv->conv_desc));
+    VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
+        conv->in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->in_c, H, W));
+    VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
+        conv->out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->out_c, H, W));
+    VAE_CUDNN_PLAN_OK(cudnnSetFilter4dDescriptor(
+        conv->filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, conv->out_c, conv->in_c, conv->kernel, conv->kernel));
+    VAE_CUDNN_PLAN_OK(cudnnSetConvolution2dDescriptor(
+        conv->conv_desc, conv->kernel / 2, conv->kernel / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
+    VAE_CUDNN_PLAN_OK(cudnnSetConvolutionMathType(conv->conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
+
+    conv->algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
+    {
+        int algo_count = 0;
+        int returned = 0;
+        cudnnConvolutionFwdAlgoPerf_t perf[16];
+        if (cudnnGetConvolutionForwardAlgorithmMaxCount(dec->cudnn, &algo_count) == CUDNN_STATUS_SUCCESS) {
+            if (algo_count > (int)(sizeof(perf) / sizeof(perf[0]))) algo_count = (int)(sizeof(perf) / sizeof(perf[0]));
+            if (algo_count > 0 &&
+                cudnnGetConvolutionForwardAlgorithm_v7(
+                    dec->cudnn, conv->in_desc, conv->filter_desc, conv->conv_desc, conv->out_desc,
+                    algo_count, &returned, perf) == CUDNN_STATUS_SUCCESS) {
+                for (int i = 0; i < returned; ++i) {
+                    if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= dec->cudnn_workspace_bytes) {
+                        conv->algo = perf[i].algo;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (cudnnGetConvolutionForwardWorkspaceSize(
+                dec->cudnn, conv->in_desc, conv->filter_desc, conv->conv_desc, conv->out_desc,
+                conv->algo, &workspace_bytes) != CUDNN_STATUS_SUCCESS ||
+            workspace_bytes > dec->cudnn_workspace_bytes) {
+        conv->algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+        workspace_bytes = 0;
+    }
+    conv->workspace_bytes = workspace_bytes;
+
+    if (conv->has_bias) {
+        VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->bias_desc));
+        VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
+            conv->bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, conv->out_c, 1, 1));
+    }
+    conv->plan_ready = 1;
+    conv->plan_n = N;
+    conv->plan_h = H;
+    conv->plan_w = W;
+#undef VAE_CUDNN_PLAN_OK
+    return 0;
+}
+
+static int taehv_prepare_conv_plans(DeviceVaeDecoder *dec, const WorldConfig *cfg) {
+    int H0 = cfg->height * cfg->patch_h;
+    int W0 = cfg->width * cfg->patch_w;
+    int N = 4;
+    int H = H0;
+    int W = W0;
+
+#define VAE_PLAN(idx) do { \
+    if (taehv_prepare_conv_plan(dec, &dec->convs[(idx)], N, H, W)) return 1; \
+} while (0)
+#define VAE_PLAN_MEMBLOCK(a, b, c) do { \
+    VAE_PLAN(a); \
+    VAE_PLAN(b); \
+    VAE_PLAN(c); \
+} while (0)
+#define VAE_PLAN_UPSAMPLE2() do { \
+    H *= 2; \
+    W *= 2; \
+} while (0)
+#define VAE_PLAN_TGROW(idx, stride_value) do { \
+    int _stride = (stride_value); \
+    VAE_PLAN(idx); \
+    N *= _stride; \
+} while (0)
+
+    VAE_PLAN(WORLD_VAE_DEC_CONV_IN);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
+    VAE_PLAN_UPSAMPLE2();
+    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW7, 1);
+
+    VAE_PLAN(WORLD_VAE_DEC_CONV8);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
+    VAE_PLAN_UPSAMPLE2();
+    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW13, 2);
+
+    VAE_PLAN(WORLD_VAE_DEC_CONV14);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
+    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
+    VAE_PLAN_UPSAMPLE2();
+    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW19, 2);
+
+    VAE_PLAN(WORLD_VAE_DEC_CONV20);
+    VAE_PLAN(WORLD_VAE_DEC_CONV_OUT);
+
+#undef VAE_PLAN
+#undef VAE_PLAN_MEMBLOCK
+#undef VAE_PLAN_UPSAMPLE2
+#undef VAE_PLAN_TGROW
+    return 0;
+}
+#endif
 
 static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, const WorldVaeDecoderWeights *host) {
     memset(dec, 0, sizeof(*dec));
@@ -1615,17 +1785,14 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     }
     dec->cudnn_workspace_bytes = 128ull * 1024ull * 1024ull;
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->cudnn_workspace, dec->cudnn_workspace_bytes));
+    if (taehv_prepare_conv_plans(dec, cfg)) goto fail;
 #endif
-    dec->h_rgb = (unsigned char *)malloc(dec->rgb_elems);
-    if (!dec->h_rgb) {
-        fprintf(stderr, "failed to allocate VAE RGB host buffer\n");
-        goto fail;
-    }
+    VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3%s\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3%s, pinned RGB host buffer\n",
             dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
 #ifdef WORLD_USE_CUDNN
-            ", cuDNN conv enabled"
+            ", cuDNN conv plans enabled"
 #else
             ""
 #endif
@@ -1641,75 +1808,37 @@ fail:
 
 static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
 #ifdef WORLD_USE_CUDNN
-    if (dec && dec->cudnn) {
-        cudnnTensorDescriptor_t in_desc = NULL;
-        cudnnTensorDescriptor_t out_desc = NULL;
-        cudnnTensorDescriptor_t bias_desc = NULL;
-        cudnnFilterDescriptor_t filter_desc = NULL;
-        cudnnConvolutionDescriptor_t conv_desc = NULL;
-        cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-        size_t workspace_bytes = 0;
-        int rc = 1;
-
+    if (dec && dec->cudnn && conv->plan_ready && conv->plan_n == N && conv->plan_h == H && conv->plan_w == W) {
+        {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
 #define CUDNN_CONV_OK(expr) do { \
     cudnnStatus_t _s = (expr); \
     if (_s != CUDNN_STATUS_SUCCESS) { \
         fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        goto cleanup; \
+        return 1; \
     } \
 } while (0)
-
-        CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&in_desc));
-        CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&out_desc));
-        CUDNN_CONV_OK(cudnnCreateFilterDescriptor(&filter_desc));
-        CUDNN_CONV_OK(cudnnCreateConvolutionDescriptor(&conv_desc));
-        CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->in_c, H, W));
-        CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->out_c, H, W));
-        CUDNN_CONV_OK(cudnnSetFilter4dDescriptor(filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, conv->out_c, conv->in_c, conv->kernel, conv->kernel));
-        CUDNN_CONV_OK(cudnnSetConvolution2dDescriptor(
-            conv_desc, conv->kernel / 2, conv->kernel / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
-        CUDNN_CONV_OK(cudnnSetConvolutionMathType(conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
-        if (cudnnGetConvolutionForwardWorkspaceSize(
-                    dec->cudnn, in_desc, filter_desc, conv_desc, out_desc, algo, &workspace_bytes) != CUDNN_STATUS_SUCCESS ||
-                workspace_bytes > dec->cudnn_workspace_bytes) {
-            algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-            workspace_bytes = 0;
-        }
-
-        {
-            const float alpha = 1.0f;
-            const float beta = 0.0f;
             CUDNN_CONV_OK(cudnnConvolutionForward(
                 dec->cudnn,
                 &alpha,
-                in_desc,
+                conv->in_desc,
                 in,
-                filter_desc,
+                conv->filter_desc,
                 conv->weight,
-                conv_desc,
-                algo,
+                conv->conv_desc,
+                conv->algo,
                 dec->cudnn_workspace,
-                workspace_bytes,
+                conv->workspace_bytes,
                 &beta,
-                out_desc,
+                conv->out_desc,
                 out));
             if (conv->has_bias) {
-                CUDNN_CONV_OK(cudnnCreateTensorDescriptor(&bias_desc));
-                CUDNN_CONV_OK(cudnnSetTensor4dDescriptor(
-                    bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, conv->out_c, 1, 1));
-                CUDNN_CONV_OK(cudnnAddTensor(dec->cudnn, &alpha, bias_desc, conv->bias, &alpha, out_desc, out));
+                CUDNN_CONV_OK(cudnnAddTensor(dec->cudnn, &alpha, conv->bias_desc, conv->bias, &alpha, conv->out_desc, out));
             }
-        }
-        rc = 0;
-
-cleanup:
-        if (bias_desc) cudnnDestroyTensorDescriptor(bias_desc);
-        if (conv_desc) cudnnDestroyConvolutionDescriptor(conv_desc);
-        if (filter_desc) cudnnDestroyFilterDescriptor(filter_desc);
-        if (out_desc) cudnnDestroyTensorDescriptor(out_desc);
-        if (in_desc) cudnnDestroyTensorDescriptor(in_desc);
 #undef CUDNN_CONV_OK
-        return rc;
+        }
+        return 0;
     }
 #endif
     int64_t total = (int64_t)N * conv->out_c * H * W;
@@ -2026,6 +2155,18 @@ struct WorldCudaRuntime {
     float *d_attn_k_compact;
     float *d_attn_v_compact;
     float *d_attn_out;
+    const float **h_attn_qk_a;
+    const float **h_attn_qk_b;
+    float **h_attn_qk_c;
+    const float **h_attn_av_a;
+    const float **h_attn_av_b;
+    float **h_attn_av_c;
+    const float **d_attn_qk_a;
+    const float **d_attn_qk_b;
+    float **d_attn_qk_c;
+    const float **d_attn_av_a;
+    const float **d_attn_av_b;
+    float **d_attn_av_c;
     float *d_tokens_after_attn;
     float *d_ctrl_norm;
     float *d_ctrl_cond_by_layer;
@@ -2043,6 +2184,7 @@ struct WorldCudaRuntime {
     int64_t *d_t_pos;
     __half *d_linear_half;
     int attn_cublas_enabled;
+    int attn_cublas_gqa_enabled;
     int attn_cublas_max_tokens;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
@@ -2129,6 +2271,94 @@ static int indexed_attention_cache_d64_cublas(
     return 0;
 }
 
+static int upload_attention_gqa_pointers(WorldCudaRuntime *rt, int Nkv) {
+    if (!rt || Nkv <= 0) return 1;
+    int Hq = rt->cfg.n_heads;
+    int Hkv = rt->cfg.n_kv_heads;
+    int Tq = rt->T;
+    int group = Hq / Hkv;
+    if (group <= 0 || Hq % Hkv != 0) return 1;
+    for (int hq = 0; hq < Hq; ++hq) {
+        int hk = hq / group;
+        rt->h_attn_qk_a[hq] = rt->d_attn_k_compact + (int64_t)hk * Nkv * 64;
+        rt->h_attn_qk_b[hq] = rt->d_q + (int64_t)hq * Tq * 64;
+        rt->h_attn_qk_c[hq] = rt->d_attn_scores + (int64_t)hq * Tq * Nkv;
+        rt->h_attn_av_a[hq] = rt->d_attn_v_compact + (int64_t)hk * Nkv * 64;
+        rt->h_attn_av_b[hq] = rt->d_attn_scores + (int64_t)hq * Tq * Nkv;
+        rt->h_attn_av_c[hq] = rt->d_attn + (int64_t)hq * 64;
+    }
+    size_t ptr_bytes = (size_t)Hq * sizeof(float *);
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_a, rt->h_attn_qk_a, ptr_bytes, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_b, rt->h_attn_qk_b, ptr_bytes, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_c, rt->h_attn_qk_c, ptr_bytes, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_a, rt->h_attn_av_a, ptr_bytes, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_b, rt->h_attn_av_b, ptr_bytes, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_c, rt->h_attn_av_c, ptr_bytes, cudaMemcpyHostToDevice));
+    return 0;
+}
+
+static int indexed_attention_cache_d64_cublas_gqa(
+        WorldCudaRuntime *rt,
+        const DeviceWorldLayerCache *cache,
+        int Nkv,
+        float scale) {
+    if (!rt || !cache || Nkv <= 0 || Nkv > rt->attn_cublas_max_tokens) return 1;
+    int Hq = rt->cfg.n_heads;
+    int Hkv = rt->cfg.n_kv_heads;
+    int Tq = rt->T;
+    int group = Hq / Hkv;
+    if (group <= 0 || Hq % Hkv != 0) return 1;
+
+    int64_t compact_elems = (int64_t)Hkv * Nkv * 64;
+    gather_indexed_kv_hkv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256>>>(
+        cache->k, cache->v, cache->indices,
+        rt->d_attn_k_compact, rt->d_attn_v_compact,
+        Hkv, Nkv, cache->capacity);
+    CUDA_OK(cudaGetLastError());
+    if (upload_attention_gqa_pointers(rt, Nkv)) return 1;
+
+    const float alpha_qk = scale;
+    const float alpha_av = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_OK(cublasSgemmBatched(
+        rt->handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        Nkv,
+        Tq,
+        64,
+        &alpha_qk,
+        rt->d_attn_qk_a,
+        64,
+        rt->d_attn_qk_b,
+        64,
+        &beta,
+        rt->d_attn_qk_c,
+        Nkv,
+        Hq));
+
+    softmax_rows_inplace_f32_kernel<<<Hq * Tq, 256>>>(rt->d_attn_scores, Hq * Tq, Nkv);
+    CUDA_OK(cudaGetLastError());
+
+    CUBLAS_OK(cublasSgemmBatched(
+        rt->handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        64,
+        Tq,
+        Nkv,
+        &alpha_av,
+        rt->d_attn_av_a,
+        64,
+        rt->d_attn_av_b,
+        Nkv,
+        &beta,
+        rt->d_attn_av_c,
+        Hq * 64,
+        Hq));
+    return 0;
+}
+
 static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
     if (!rt || !rt->d_layer_mod_table) return 1;
     const WorldConfig *cfg = &rt->cfg;
@@ -2205,6 +2435,18 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_attn_k_compact);
     cudaFree(rt->d_attn_v_compact);
     cudaFree(rt->d_attn_out);
+    free(rt->h_attn_qk_a);
+    free(rt->h_attn_qk_b);
+    free(rt->h_attn_qk_c);
+    free(rt->h_attn_av_a);
+    free(rt->h_attn_av_b);
+    free(rt->h_attn_av_c);
+    cudaFree(rt->d_attn_qk_a);
+    cudaFree(rt->d_attn_qk_b);
+    cudaFree(rt->d_attn_qk_c);
+    cudaFree(rt->d_attn_av_a);
+    cudaFree(rt->d_attn_av_b);
+    cudaFree(rt->d_attn_av_c);
     cudaFree(rt->d_tokens_after_attn);
     cudaFree(rt->d_ctrl_norm);
     cudaFree(rt->d_ctrl_cond_by_layer);
@@ -2296,6 +2538,7 @@ extern "C" int world_cuda_runtime_create(
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     size_t layer_mod_table_elems = (size_t)rt->total_passes * layers_to_run * 6 * rt->D;
     const char *cublas_attn_env = NULL;
+    const char *cublas_attn_gqa_env = NULL;
     int cublas_attn_max_tokens = 0;
     int cublas_attn_supported = 1;
 
@@ -2378,6 +2621,8 @@ extern "C" int world_cuda_runtime_create(
     if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
     if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head)) goto fail;
     cublas_attn_env = getenv("WORLD_CUBLAS_ATTN");
+    cublas_attn_gqa_env = getenv("WORLD_CUBLAS_ATTN_GQA");
+    rt->attn_cublas_gqa_enabled = cublas_attn_gqa_env ? cublas_attn_gqa_env[0] != '0' : 1;
     if ((!cublas_attn_env || cublas_attn_env[0] != '0') && rt->d_head == 64 && cfg->n_heads % cfg->n_kv_heads == 0) {
         cublas_attn_max_tokens = 0;
         cublas_attn_supported = 1;
@@ -2392,7 +2637,28 @@ extern "C" int world_cuda_runtime_create(
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_scores, (size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)));
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_k_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_v_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
-            fprintf(stderr, "cuBLAS attention enabled: max_tokens=%d score_scratch=%.2f MiB\n",
+            if (rt->attn_cublas_gqa_enabled) {
+                size_t ptr_bytes = (size_t)cfg->n_heads * sizeof(float *);
+                rt->h_attn_qk_a = (const float **)malloc(ptr_bytes);
+                rt->h_attn_qk_b = (const float **)malloc(ptr_bytes);
+                rt->h_attn_qk_c = (float **)malloc(ptr_bytes);
+                rt->h_attn_av_a = (const float **)malloc(ptr_bytes);
+                rt->h_attn_av_b = (const float **)malloc(ptr_bytes);
+                rt->h_attn_av_c = (float **)malloc(ptr_bytes);
+                if (!rt->h_attn_qk_a || !rt->h_attn_qk_b || !rt->h_attn_qk_c ||
+                    !rt->h_attn_av_a || !rt->h_attn_av_b || !rt->h_attn_av_c) {
+                    fprintf(stderr, "runtime attention pointer host allocation failed\n");
+                    goto fail;
+                }
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_a, ptr_bytes));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_b, ptr_bytes));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_c, ptr_bytes));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_a, ptr_bytes));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_b, ptr_bytes));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_c, ptr_bytes));
+            }
+            fprintf(stderr, "cuBLAS attention enabled%s: max_tokens=%d score_scratch=%.2f MiB\n",
+                    rt->attn_cublas_gqa_enabled ? " (GQA pointer batched)" : "",
                     cublas_attn_max_tokens,
                     (double)((size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)) / (1024.0 * 1024.0));
         } else {
@@ -2555,7 +2821,11 @@ extern "C" int world_cuda_runtime_step_rgb(
                 if (rt->attn_cublas_enabled && cache->pinned_dilation == 1) {
                     int n_tokens = visible_cache_tokens_pinned1_host(cache, rt->T, current_frame_idx);
                     if (n_tokens > 0 && n_tokens <= rt->attn_cublas_max_tokens) {
-                        if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        if (rt->attn_cublas_gqa_enabled) {
+                            if (indexed_attention_cache_d64_cublas_gqa(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        } else {
+                            if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        }
                         cublas_attn_ok = 1;
                     }
                 }

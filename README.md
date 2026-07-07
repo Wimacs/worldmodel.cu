@@ -92,12 +92,13 @@ ring slot is masked during attention, so no previous-frame history is visible
 and rollout looks like a fresh sample every frame. Use `--cache-window 2` or
 higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
 --headless-smoke`
-stabilizes around 70 ms per decoded 4-frame RGB chunk, about 57 RGB fps. With
+stabilizes around 63 ms per decoded 4-frame RGB chunk, about 64 RGB fps. With
 `--steps 4 --cache-window 8 --warmup 9 --headless-smoke`, the current CUDA path
-stabilizes around 273 ms per decoded chunk, about 14.6 RGB fps. D=64 cache
+stabilizes around 258 ms per decoded chunk, about 15.5 RGB fps. D=64 cache
 attention uses the cuBLAS path by default when every cache has
 `pinned_dilation=1` and at most 8192 visible tokens; set
-`WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback.
+`WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback, or
+`WORLD_CUBLAS_ATTN_GQA=0` to force the older cuBLAS compact-KV expansion path.
 
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the PyTorch controller layout
@@ -140,6 +141,8 @@ cache writes can be parity-checked.
 
 This executable is plain C+CUDA and links CUDA runtime/cuBLAS, with optional
 cuDNN acceleration for the VAE decoder when cuDNN is available at configure time.
+The VAE decoder prebuilds cuDNN conv plans and uses pinned host RGB transfer in
+the resident realtime path.
 It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and runs the scheduler through the WorldDiT
 path. The standalone transformer copies all requested layer weights to GPU once

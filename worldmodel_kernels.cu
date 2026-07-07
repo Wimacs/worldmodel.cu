@@ -633,6 +633,32 @@ __global__ void gather_indexed_kv_d64_f32_kernel(
     v_compact[i] = v[src];
 }
 
+__global__ void gather_indexed_kv_hkv_d64_f32_kernel(
+        const float *__restrict__ k,
+        const float *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ k_compact,
+        float *__restrict__ v_compact,
+        int B,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Hkv * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hk = (int)((q / Nkv) % Hkv);
+    int b = (int)(q / ((int64_t)Nkv * Hkv));
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = (((int64_t)b * Hkv + hk) * Tk + tk) * 64 + d;
+    k_compact[i] = k[src];
+    v_compact[i] = v[src];
+}
+
 __global__ void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
     __shared__ float red[256];
     int row = blockIdx.x;
@@ -1478,6 +1504,147 @@ torch::Tensor indexed_attention_cublas_cuda(
     return out;
 }
 
+torch::Tensor indexed_attention_cublas_gqa_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F32(k);
+    WM_CHECK_F32(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "indexed_attention_cublas_gqa currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(Nkv > 0, "indices must be non-empty");
+
+    auto out = torch::empty_like(q);
+    auto k_compact = torch::empty({B, Hkv, Nkv, 64}, q.options());
+    auto v_compact = torch::empty({B, Hkv, Nkv, 64}, q.options());
+    auto scores = torch::empty({B, Hq, Tq, Nkv}, q.options());
+
+    int64_t compact_elems = (int64_t)B * Hkv * Nkv * 64;
+    gather_indexed_kv_hkv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        indices.data_ptr<int64_t>(),
+        k_compact.data_ptr<float>(),
+        v_compact.data_ptr<float>(),
+        B,
+        Hkv,
+        Nkv,
+        Tk);
+    check_last_cuda_error("gather_indexed_kv_hkv_d64_f32");
+
+    int group = Hq / Hkv;
+    int batch = B * Hq;
+    std::vector<const float *> qk_a((size_t)batch);
+    std::vector<const float *> qk_b((size_t)batch);
+    std::vector<float *> qk_c((size_t)batch);
+    std::vector<const float *> av_a((size_t)batch);
+    std::vector<const float *> av_b((size_t)batch);
+    std::vector<float *> av_c((size_t)batch);
+    for (int b = 0; b < B; ++b) {
+        for (int hq = 0; hq < Hq; ++hq) {
+            int bi = b * Hq + hq;
+            int hk = hq / group;
+            qk_a[(size_t)bi] = k_compact.data_ptr<float>() + ((int64_t)b * Hkv + hk) * Nkv * 64;
+            qk_b[(size_t)bi] = q.data_ptr<float>() + ((int64_t)b * Hq + hq) * Tq * 64;
+            qk_c[(size_t)bi] = scores.data_ptr<float>() + ((int64_t)b * Hq + hq) * Tq * Nkv;
+            av_a[(size_t)bi] = v_compact.data_ptr<float>() + ((int64_t)b * Hkv + hk) * Nkv * 64;
+            av_b[(size_t)bi] = scores.data_ptr<float>() + ((int64_t)b * Hq + hq) * Tq * Nkv;
+            av_c[(size_t)bi] = out.data_ptr<float>() + ((int64_t)b * Hq + hq) * Tq * 64;
+        }
+    }
+
+    const float **d_qk_a = nullptr;
+    const float **d_qk_b = nullptr;
+    float **d_qk_c = nullptr;
+    const float **d_av_a = nullptr;
+    const float **d_av_b = nullptr;
+    float **d_av_c = nullptr;
+    size_t ptr_bytes = (size_t)batch * sizeof(float *);
+    TORCH_CHECK(cudaMalloc((void **)&d_qk_a, ptr_bytes) == cudaSuccess, "cudaMalloc d_qk_a failed");
+    TORCH_CHECK(cudaMalloc((void **)&d_qk_b, ptr_bytes) == cudaSuccess, "cudaMalloc d_qk_b failed");
+    TORCH_CHECK(cudaMalloc((void **)&d_qk_c, ptr_bytes) == cudaSuccess, "cudaMalloc d_qk_c failed");
+    TORCH_CHECK(cudaMalloc((void **)&d_av_a, ptr_bytes) == cudaSuccess, "cudaMalloc d_av_a failed");
+    TORCH_CHECK(cudaMalloc((void **)&d_av_b, ptr_bytes) == cudaSuccess, "cudaMalloc d_av_b failed");
+    TORCH_CHECK(cudaMalloc((void **)&d_av_c, ptr_bytes) == cudaSuccess, "cudaMalloc d_av_c failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_qk_a, qk_a.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_qk_a failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_qk_b, qk_b.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_qk_b failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_qk_c, qk_c.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_qk_c failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_av_a, av_a.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_av_a failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_av_b, av_b.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_av_b failed");
+    TORCH_CHECK(cudaMemcpyAsync(d_av_c, av_c.data(), ptr_bytes, cudaMemcpyHostToDevice, at::cuda::getCurrentCUDAStream()) == cudaSuccess, "copy d_av_c failed");
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    const float alpha_qk = (float)scale;
+    const float alpha_av = 1.0f;
+    const float beta = 0.0f;
+    TORCH_CHECK(cublasSgemmBatched(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        Nkv,
+        Tq,
+        64,
+        &alpha_qk,
+        d_qk_a,
+        64,
+        d_qk_b,
+        64,
+        &beta,
+        d_qk_c,
+        Nkv,
+        batch) == CUBLAS_STATUS_SUCCESS, "cublas batched GQA QK failed");
+
+    softmax_rows_inplace_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scores.data_ptr<float>(), B * Hq * Tq, Nkv);
+    check_last_cuda_error("softmax_rows_inplace_f32");
+
+    TORCH_CHECK(cublasSgemmBatched(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        64,
+        Tq,
+        Nkv,
+        &alpha_av,
+        d_av_a,
+        64,
+        d_av_b,
+        Nkv,
+        &beta,
+        d_av_c,
+        64,
+        batch) == CUBLAS_STATUS_SUCCESS, "cublas batched GQA AV failed");
+    cudaFree(d_qk_a);
+    cudaFree(d_qk_b);
+    cudaFree(d_qk_c);
+    cudaFree(d_av_a);
+    cudaFree(d_av_b);
+    cudaFree(d_av_c);
+    return out;
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -1848,6 +2015,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
     m.def("indexed_attention", &indexed_attention_cuda, "WorldModel indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_cublas", &indexed_attention_cublas_cuda, "WorldModel indexed GQA attention (cuBLAS prototype, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("indexed_attention_cublas_gqa", &indexed_attention_cublas_gqa_cuda, "WorldModel indexed GQA attention without duplicated compact KV (cuBLAS prototype, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
