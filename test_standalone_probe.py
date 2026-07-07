@@ -1,4 +1,5 @@
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -108,6 +109,13 @@ def _read_ppm(path):
     if arr.size != expected:
         raise AssertionError(f"{path}: expected {expected} bytes, got {arr.size}")
     return arr.reshape(height, width, 3).copy()
+
+
+def _assert_rgb_close(name, actual_rgb, ref_rgb, max_atol, mean_atol):
+    diff = np.abs(actual_rgb.astype(np.int16) - ref_rgb.astype(np.int16))
+    if diff.max() > max_atol or diff.mean() > mean_atol:
+        raise AssertionError(f"{name} max_diff={diff.max()} mean_diff={diff.mean():.6f}")
+    print(f"{name}: ok max_abs={diff.max()} mean_abs={diff.mean():.6g}")
 
 
 def _frame_path(path, frame_idx):
@@ -696,22 +704,45 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 .numpy()
             )
         actual_rgb = _read_ppm(out_path)
-        diff = np.abs(actual_rgb.astype(np.int16) - ref_rgb[0].astype(np.int16))
-        if diff.max() > 4 or diff.mean() > 0.2:
-            raise AssertionError(f"vae_decode_ppm max_diff={diff.max()} mean_diff={diff.mean():.6f}")
-        print(f"vae_decode_ppm: ok max_abs={diff.max()} mean_abs={diff.mean():.6g}")
-
+        _assert_rgb_close("vae_decode_ppm_fp16_nhwc", actual_rgb, ref_rgb[0], max_atol=8, mean_atol=0.25)
         for frame_idx in range(4):
             actual_frame = _read_ppm(_frame_path(out_path, frame_idx))
-            frame_diff = np.abs(actual_frame.astype(np.int16) - ref_rgb[frame_idx].astype(np.int16))
-            if frame_diff.max() > 4 or frame_diff.mean() > 0.2:
-                raise AssertionError(
-                    f"vae_decode_frame{frame_idx}_ppm max_diff={frame_diff.max()} "
-                    f"mean_diff={frame_diff.mean():.6f}"
-                )
-            print(
-                f"vae_decode_frame{frame_idx}_ppm: ok "
-                f"max_abs={frame_diff.max()} mean_abs={frame_diff.mean():.6g}"
+            _assert_rgb_close(
+                f"vae_decode_frame{frame_idx}_ppm_fp16_nhwc",
+                actual_frame,
+                ref_rgb[frame_idx],
+                max_atol=8,
+                mean_atol=0.25,
+            )
+
+        latent_final_path = Path(td) / "latent_final.f32"
+        latent_final.detach().cpu().numpy().astype(np.float32).tofile(latent_final_path)
+        f32_out_path = str(Path(td) / "out_f32.ppm")
+        f32_env = os.environ.copy()
+        f32_env["WORLD_VAE_FP16_NHWC"] = "0"
+        subprocess.run(
+            [
+                str(exe),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--vae-only",
+                "--latent",
+                str(latent_final_path),
+                "--out",
+                f32_out_path,
+            ],
+            check=True,
+            cwd=str(ROOT),
+            env=f32_env,
+        )
+        _assert_rgb_close("vae_decode_ppm_f32_nchw", _read_ppm(f32_out_path), ref_rgb[0], max_atol=4, mean_atol=0.2)
+        for frame_idx in range(4):
+            _assert_rgb_close(
+                f"vae_decode_frame{frame_idx}_ppm_f32_nchw",
+                _read_ppm(_frame_path(f32_out_path, frame_idx)),
+                ref_rgb[frame_idx],
+                max_atol=4,
+                mean_atol=0.2,
             )
 
 

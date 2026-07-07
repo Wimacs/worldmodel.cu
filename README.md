@@ -92,13 +92,17 @@ ring slot is masked during attention, so no previous-frame history is visible
 and rollout looks like a fresh sample every frame. Use `--cache-window 2` or
 higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
 --headless-smoke`
-stabilizes around 63 ms per decoded 4-frame RGB chunk, about 64 RGB fps. With
+stabilizes around 53 ms per decoded 4-frame RGB chunk, about 75 RGB fps. With
 `--steps 4 --cache-window 8 --warmup 9 --headless-smoke`, the current CUDA path
-stabilizes around 258 ms per decoded chunk, about 15.5 RGB fps. D=64 cache
+stabilizes around 248 ms per decoded chunk, about 16.1 RGB fps. D=64 cache
 attention uses the cuBLAS path by default when every cache has
 `pinned_dilation=1` and at most 8192 visible tokens; set
 `WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback, or
 `WORLD_CUBLAS_ATTN_GQA=0` to force the older cuBLAS compact-KV expansion path.
+Set `WORLD_FLASH_ATTN=1` to try the fused online-softmax indexed attention
+prototype. It avoids the score matrix allocation and matches the masked
+attention tests, but it is not the default because the current scalar CUDA
+kernel is slower than the cuBLAS GQA path on the RTX 4090 D.
 
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the PyTorch controller layout
@@ -141,8 +145,10 @@ cache writes can be parity-checked.
 
 This executable is plain C+CUDA and links CUDA runtime/cuBLAS, with optional
 cuDNN acceleration for the VAE decoder when cuDNN is available at configure time.
-The VAE decoder prebuilds cuDNN conv plans and uses pinned host RGB transfer in
-the resident realtime path.
+The VAE decoder prebuilds cuDNN conv plans, uses pinned host RGB transfer in
+the resident realtime path, and defaults to an FP16/NHWC cuDNN path when cuDNN
+is available. Set `WORLD_VAE_FP16_NHWC=0` to force the older F32/NCHW decoder
+path.
 It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and runs the scheduler through the WorldDiT
 path. The standalone transformer copies all requested layer weights to GPU once
@@ -200,7 +206,8 @@ Notes:
 
 - Kernels currently target float32 parity first, with resident realtime fast
   paths for FP16-weight GEMM, cuBLAS-backed D=64 indexed cache attention, and
-  optional cuDNN VAE convolutions.
+  optional FP16/NHWC cuDNN VAE convolutions. `WORLD_FLASH_ATTN=1` enables a
+  fused online-softmax attention prototype for parity/perf experiments.
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,
@@ -211,8 +218,8 @@ Notes:
   `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
   conversion, resident VAE decoder weights/scratch buffers, TAEHV
-  cuDNN-accelerated or built-in direct conv/MemBlock/TGrow/upsample decode,
-  pixel shuffle, and 4-frame PPM output.
+  FP16/NHWC cuDNN-accelerated or built-in F32/NCHW direct
+  conv/MemBlock/TGrow/upsample decode, pixel shuffle, and 4-frame PPM output.
   Multi-frame standalone rollout recomputes the controller embedding from the
   current frame's control vector before each denoise/cache pass pair.
   `test_standalone_probe.py` checks the standalone normal-noise fixture,
