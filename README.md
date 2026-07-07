@@ -67,7 +67,7 @@ expands the final latent to a `1024x512` RGB frame:
 ```text
 sigma embedding -> denoise MLP
 random latent -> patchify
-24x (cond head -> AdaRMSNorm -> Q/K/V -> RMS+OrthoRoPE -> current-frame GQA attention
+24x (cond head -> AdaRMSNorm -> Q/K/V -> RMS+OrthoRoPE -> KV cache indexed GQA attention
      -> out projection -> gated residual add -> optional controller ctrl fusion
      -> MLP AdaRMSNorm -> DiT MLP -> gated residual add)
 out_norm modulation -> token RMS+SiLU -> unpatchify -> latent_out [32,32,64]
@@ -105,9 +105,10 @@ Notes:
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,
-  controller input loading, controller embedding, 24-layer transformer token
-  forward, value residual, current-frame GQA attention, optional ctrl fusion
-  with `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
+  controller input loading, controller embedding, per-layer local/global KV
+  ring-cache allocation, frozen tail upsert, indexed GQA attention, 24-layer
+  transformer token forward, value residual, optional ctrl fusion with
+  `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
   conversion, TAEHV direct conv/MemBlock/TGrow/upsample decode, pixel shuffle,
   and 4-frame PPM output.
@@ -118,8 +119,11 @@ Notes:
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
 - `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
-- `masked_attention` is an online-softmax GQA written-mask kernel. It is a
-  correctness-oriented bridge toward the real ring-cache/block-mask attention.
+- `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
+  the standalone transformer path. The current executable still runs a single
+  frozen frame; unfrozen multi-frame cache persistence is the next runtime step.
+- `masked_attention` is an online-softmax GQA written-mask kernel kept for
+  focused extension parity coverage.
 - `kv_cache_upsert` mirrors the Python ring-cache/tail-frame update semantics.
 - `patchify` and `unpatchify` fuse the WorldModel layout transforms with their
   Conv2d/Linear math.

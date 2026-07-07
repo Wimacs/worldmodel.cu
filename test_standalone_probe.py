@@ -441,6 +441,20 @@ def test_standalone_two_layer_transformer_matches_pytorch():
         t_pos = torch.zeros_like(idx)
         xy, inv_t = _world_rope_tables(d_head, height, width, device)
         v_first = None
+        caches = []
+        period = int(cfg["global_attn_period"])
+        offset = int(cfg["global_attn_offset"]) % period
+        for layer in range(layers):
+            is_global = ((layer - offset) % period) == 0
+            window = int(cfg["global_window"] if is_global else cfg["local_window"])
+            ring_length = window * tpf
+            capacity = ring_length + tpf
+            cache_k = torch.zeros((n_kv_heads, capacity, d_head), device=device, dtype=torch.float32)
+            cache_v = torch.zeros_like(cache_k)
+            written = torch.zeros((capacity,), device=device, dtype=torch.bool)
+            written[ring_length:] = True
+            pinned = int(cfg["global_pinned_dilation"] if is_global else 1)
+            caches.append((cache_k, cache_v, written, ring_length, pinned))
 
         for layer in range(layers):
             p = f"transformer.blocks.{layer}"
@@ -467,10 +481,27 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             else:
                 v = torch.lerp(v, v_first, state[f"{p}.attn.v_lamb"].float())
 
+            cache_k, cache_v, written, ring_length, pinned = caches[layer]
+            frame_idx = 0
+            bucket = (frame_idx + (pinned - 1)) // pinned
+            num_buckets = (ring_length // tpf) // pinned
+            base = (bucket % num_buckets) * tpf
+            ring_idx = torch.arange(base, base + tpf, device=device)
+            tail_idx = torch.arange(ring_length, ring_length + tpf, device=device)
+            write_step = frame_idx % pinned == 0
+            mask_written = written.clone()
+            if write_step:
+                mask_written[ring_idx] = False
+            cache_k[:, tail_idx, :] = k
+            cache_v[:, tail_idx, :] = v
+            indices = torch.nonzero(mask_written, as_tuple=False).flatten()
+
             group = n_heads // n_kv_heads
-            scores = torch.einsum("htd,hkd->htk", q, k.repeat_interleave(group, dim=0)) * (d_head ** -0.5)
+            k_indexed = cache_k[:, indices, :].repeat_interleave(group, dim=0)
+            v_indexed = cache_v[:, indices, :].repeat_interleave(group, dim=0)
+            scores = torch.einsum("htd,hnd->htn", q, k_indexed) * (d_head ** -0.5)
             probs = torch.softmax(scores, dim=-1)
-            attn_heads = torch.einsum("htk,hkd->htd", probs, v.repeat_interleave(group, dim=0))
+            attn_heads = torch.einsum("htn,hnd->htd", probs, v_indexed)
             attn = attn_heads.permute(1, 0, 2).reshape(tpf, d_model).contiguous()
             tokens = tokens + F.linear(attn, state[f"{p}.attn.out_proj.weight"]) * g0
 

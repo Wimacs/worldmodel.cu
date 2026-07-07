@@ -312,6 +312,150 @@ __global__ static void current_frame_attention_f32_kernel(
     }
 }
 
+__global__ static void init_cache_written_kernel(bool *written, int ring_length, int T) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int capacity = ring_length + T;
+    if (i < capacity) written[i] = i >= ring_length;
+}
+
+__global__ static void kv_cache_mask_kernel(
+        const bool *written,
+        bool *mask_written,
+        int capacity,
+        int T,
+        int base,
+        bool write_step) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= capacity) return;
+    bool value = written[i];
+    if (write_step && i >= base && i < base + T) value = false;
+    mask_written[i] = value;
+}
+
+__global__ static void kv_cache_upsert_copy_f32_kernel(
+        float *cache_k,
+        float *cache_v,
+        const float *k,
+        const float *v,
+        bool *written,
+        int H,
+        int T,
+        int D,
+        int ring_length,
+        int base,
+        bool write_step,
+        bool frozen) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H * T * D;
+    if (i >= total) return;
+
+    int d = (int)(i % D);
+    int64_t q = i / D;
+    int t = (int)(q % T);
+    int h = (int)(q / T);
+
+    int tail_idx = ring_length + t;
+    int ring_idx = base + t;
+    int dst_idx = (!frozen && write_step) ? ring_idx : tail_idx;
+
+    int capacity = ring_length + T;
+    int64_t src = ((int64_t)h * T + t) * D + d;
+    int64_t tail = ((int64_t)h * capacity + tail_idx) * D + d;
+    int64_t dst = ((int64_t)h * capacity + dst_idx) * D + d;
+
+    float kv = k[src];
+    float vv = v[src];
+    cache_k[tail] = kv;
+    cache_v[tail] = vv;
+    if (!frozen) {
+        cache_k[dst] = kv;
+        cache_v[dst] = vv;
+    }
+
+    if (h == 0 && d == 0) {
+        written[tail_idx] = true;
+        if (!frozen) written[dst_idx] = true;
+    }
+}
+
+__global__ static void collect_cache_indices_kernel(
+        const bool *mask_written,
+        int64_t *indices,
+        int *count,
+        int capacity) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int n = 0;
+    for (int i = 0; i < capacity; ++i) {
+        if (mask_written[i]) indices[n++] = (int64_t)i;
+    }
+    *count = n;
+}
+
+__global__ static void indexed_attention_cache_f32_kernel(
+        const float *q,
+        const float *cache_k,
+        const float *cache_v,
+        const int64_t *indices,
+        float *out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        int D,
+        float scale) {
+    __shared__ float red[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int tq = row % Tq;
+    int hq = row / Tq;
+    int group = Hq / Hkv;
+    int hk = hq / group;
+
+    const float *qrow = q + (((int64_t)hq * Tq + tq) * D);
+    const float *kbase = cache_k + (int64_t)hk * Tk * D;
+    const float *vbase = cache_v + (int64_t)hk * Tk * D;
+    float *orow = out_tokens + (int64_t)tq * (Hq * D) + hq * D;
+
+    float acc = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        float partial = 0.0f;
+        const float *krow = kbase + (int64_t)tk * D;
+        for (int d = tid; d < D; d += blockDim.x) {
+            partial += qrow[d] * krow[d];
+        }
+
+        red[tid] = partial;
+        __syncthreads();
+
+        for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+            if (tid < step) red[tid] += red[tid + step];
+            __syncthreads();
+        }
+
+        float score = red[0] * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+
+        if (tid < D) {
+            acc = acc * alpha + beta * vbase[(int64_t)tk * D + tid];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+        __syncthreads();
+    }
+
+    if (tid < D) {
+        orow[tid] = Nkv > 0 ? acc / l : 0.0f;
+    }
+}
+
 __global__ static void gated_residual_add_f32_kernel(
         const float *residual,
         const float *update,
@@ -707,6 +851,24 @@ typedef struct {
     int has_ctrl;
 } DeviceWorldLayerWeights;
 
+typedef struct {
+    float *k;
+    float *v;
+    bool *written;
+    bool *mask_written;
+    int64_t *indices;
+    int *index_count;
+    int ring_length;
+    int capacity;
+    int pinned_dilation;
+    int is_global;
+} DeviceWorldLayerCache;
+
+static int positive_mod_int(int x, int m) {
+    int r = x % m;
+    return r < 0 ? r + m : r;
+}
+
 static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_layers) {
     if (!layers) return;
     for (int i = 0; i < n_layers; ++i) {
@@ -728,6 +890,63 @@ static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_laye
         cudaFree(layers[i].dit_mlp_fc2_weight);
     }
     free(layers);
+}
+
+static void free_device_world_caches(DeviceWorldLayerCache *caches, int n_layers) {
+    if (!caches) return;
+    for (int i = 0; i < n_layers; ++i) {
+        cudaFree(caches[i].k);
+        cudaFree(caches[i].v);
+        cudaFree(caches[i].written);
+        cudaFree(caches[i].mask_written);
+        cudaFree(caches[i].indices);
+        cudaFree(caches[i].index_count);
+    }
+    free(caches);
+}
+
+static int alloc_device_world_caches(
+        DeviceWorldLayerCache **dst_caches,
+        const WorldConfig *cfg,
+        int n_layers,
+        int T,
+        int n_kv_heads,
+        int d_head) {
+    *dst_caches = NULL;
+    DeviceWorldLayerCache *caches = (DeviceWorldLayerCache *)calloc((size_t)n_layers, sizeof(*caches));
+    if (!caches) return 1;
+
+    int period = cfg->global_attn_period > 0 ? cfg->global_attn_period : 1;
+    int offset = positive_mod_int(cfg->global_attn_offset, period);
+    for (int layer = 0; layer < n_layers; ++layer) {
+        DeviceWorldLayerCache *c = &caches[layer];
+        c->is_global = ((layer - offset) % period) == 0;
+        int window = c->is_global ? cfg->global_window : cfg->local_window;
+        c->pinned_dilation = c->is_global ? cfg->global_pinned_dilation : 1;
+        if (window <= 0 || c->pinned_dilation <= 0) goto fail;
+        c->ring_length = window * T;
+        c->capacity = c->ring_length + T;
+        if (c->ring_length % T != 0 || ((c->ring_length / T) % c->pinned_dilation) != 0) goto fail;
+
+        size_t kv_elems = (size_t)n_kv_heads * c->capacity * d_head;
+        if (cudaMalloc((void **)&c->k, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->v, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->mask_written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->indices, (size_t)c->capacity * sizeof(int64_t)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->index_count, sizeof(int)) != cudaSuccess) goto fail;
+        if (cudaMemset(c->k, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        if (cudaMemset(c->v, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        init_cache_written_kernel<<<div_up_i64(c->capacity, 256), 256>>>(c->written, c->ring_length, T);
+        if (cudaGetLastError() != cudaSuccess) goto fail;
+    }
+
+    *dst_caches = caches;
+    return 0;
+
+fail:
+    free_device_world_caches(caches, n_layers);
+    return 1;
 }
 
 static int copy_world_layers_to_device(
@@ -1813,6 +2032,7 @@ extern "C" int world_cuda_transformer_probe(
     int64_t *d_y_pos = NULL;
     int64_t *d_t_pos = NULL;
     DeviceWorldLayerWeights *d_layers = NULL;
+    DeviceWorldLayerCache *d_caches = NULL;
     cublasHandle_t handle = NULL;
 
 #define TRY_CUDA2(expr) do { \
@@ -1887,6 +2107,7 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_f32_to_device(&d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto cleanup_device;
     if (copy_f32_to_device(&d_unpatch_b, weights->unpatchify_bias, (size_t)C)) goto cleanup_device;
     if (copy_world_layers_to_device(&d_layers, weights->layers, layers_to_run, D, kv_dim, mlp_hidden)) goto cleanup_device;
+    if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head)) goto cleanup_device;
 
     TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_control_input, weights->control_input, (size_t)ctrl_dim * sizeof(float), cudaMemcpyHostToDevice));
@@ -1925,6 +2146,7 @@ extern "C" int world_cuda_transformer_probe(
 
         for (int layer_idx = 0; layer_idx < layers_to_run; ++layer_idx) {
             const DeviceWorldLayerWeights *lw = &d_layers[layer_idx];
+            DeviceWorldLayerCache *cache = &d_caches[layer_idx];
             fprintf(stderr, "  standalone layer %02d/%02d\n", layer_idx, layers_to_run);
 
             add_bias_silu_f32_kernel<<<div_up_i64(D, 256), 256>>>(d_cond, lw->cond_bias, d_cond_act, D);
@@ -1963,9 +2185,30 @@ extern "C" int world_cuda_transformer_probe(
                 }
             }
 
-            current_frame_attention_f32_kernel<<<cfg->n_heads * T, 256>>>(
-                d_q, d_k, d_v, d_attn,
-                cfg->n_heads, cfg->n_kv_heads, T, d_head, 1.0f / sqrtf((float)d_head));
+            {
+                int frame_idx = 0;
+                int bucket = (frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
+                int num_buckets = (cache->ring_length / T) / cache->pinned_dilation;
+                int base = (bucket % num_buckets) * T;
+                bool write_step = (frame_idx % cache->pinned_dilation) == 0;
+                bool frozen = true;
+                kv_cache_mask_kernel<<<div_up_i64(cache->capacity, 256), 256>>>(
+                    cache->written, cache->mask_written, cache->capacity, T, base, write_step);
+                TRY_CUDA2(cudaGetLastError());
+                kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * T * d_head, 256), 256>>>(
+                    cache->k, cache->v, d_k, d_v, cache->written,
+                    cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, frozen);
+                TRY_CUDA2(cudaGetLastError());
+                collect_cache_indices_kernel<<<1, 1>>>(
+                    cache->mask_written, cache->indices, cache->index_count, cache->capacity);
+                TRY_CUDA2(cudaGetLastError());
+                int h_index_count = 0;
+                TRY_CUDA2(cudaMemcpy(&h_index_count, cache->index_count, sizeof(int), cudaMemcpyDeviceToHost));
+                indexed_attention_cache_f32_kernel<<<cfg->n_heads * T, 256>>>(
+                    d_q, cache->k, cache->v, cache->indices, d_attn,
+                    cfg->n_heads, cfg->n_kv_heads, T, h_index_count, cache->capacity, d_head,
+                    1.0f / sqrtf((float)d_head));
+            }
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_attn, lw->out_proj_weight, d_attn_out, T, D, D);
             gated_residual_add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
@@ -2036,6 +2279,7 @@ extern "C" int world_cuda_transformer_probe(
 cleanup_device:
     if (handle) cublasDestroy(handle);
     free_device_world_layers(d_layers, layers_to_run);
+    free_device_world_caches(d_caches, layers_to_run);
     cudaFree(d_latent);
     cudaFree(d_patch);
     cudaFree(d_noise);
