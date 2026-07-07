@@ -24,6 +24,7 @@ typedef struct {
     WorldCudaRuntime *rt;
     float *control;
     int ctrl_dim;
+    int n_buttons;
     unsigned char *rgb;
     size_t rgb_bytes;
     int width;
@@ -35,6 +36,18 @@ typedef struct {
     int produced_chunks;
     float generation_seconds;
 } LiveShared;
+
+enum {
+    WORLD_VK_LMB = 0x01,
+    WORLD_VK_RMB = 0x02,
+    WORLD_VK_SHIFT = 0x10,
+    WORLD_VK_SPACE = 0x20,
+    WORLD_VK_A = 0x41,
+    WORLD_VK_D = 0x44,
+    WORLD_VK_S = 0x53,
+    WORLD_VK_W = 0x57,
+    WORLD_VK_LSHIFT = 0xA0,
+};
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
@@ -127,22 +140,44 @@ static int load_live_model_weights(
     return 0;
 }
 
+static void set_button_vk(float *control, int n_buttons, int vk, int down) {
+    if (vk >= 0 && vk < n_buttons) control[2 + vk] = down ? 1.0f : 0.0f;
+}
+
+static float clamp_scroll_sign(float x) {
+    if (x > 0.0f) return 1.0f;
+    if (x < 0.0f) return -1.0f;
+    return 0.0f;
+}
+
 static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
-    if (n_buttons > 0) control[0] = IsKeyDown(KEY_W) ? 1.0f : 0.0f;
-    if (n_buttons > 1) control[1] = IsKeyDown(KEY_S) ? 1.0f : 0.0f;
-    if (n_buttons > 2) control[2] = IsKeyDown(KEY_A) ? 1.0f : 0.0f;
-    if (n_buttons > 3) control[3] = IsKeyDown(KEY_D) ? 1.0f : 0.0f;
-    if (n_buttons > 4) control[4] = IsKeyDown(KEY_SPACE) ? 1.0f : 0.0f;
-    if (n_buttons > 5) control[5] = IsKeyDown(KEY_LEFT_SHIFT) ? 1.0f : 0.0f;
-    if (n_buttons > 6) control[6] = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1.0f : 0.0f;
-    if (n_buttons > 7) control[7] = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ? 1.0f : 0.0f;
     Vector2 delta = GetMouseDelta();
     if (ctrl_dim >= n_buttons + 3) {
-        control[n_buttons + 0] = delta.x * 0.01f;
-        control[n_buttons + 1] = delta.y * 0.01f;
-        control[n_buttons + 2] = GetMouseWheelMove() * 0.05f;
+        control[0] = delta.x * 0.01f;
+        control[1] = delta.y * 0.01f;
+        set_button_vk(control, n_buttons, WORLD_VK_W, IsKeyDown(KEY_W));
+        set_button_vk(control, n_buttons, WORLD_VK_S, IsKeyDown(KEY_S));
+        set_button_vk(control, n_buttons, WORLD_VK_A, IsKeyDown(KEY_A));
+        set_button_vk(control, n_buttons, WORLD_VK_D, IsKeyDown(KEY_D));
+        set_button_vk(control, n_buttons, WORLD_VK_SPACE, IsKeyDown(KEY_SPACE));
+        set_button_vk(control, n_buttons, WORLD_VK_SHIFT, IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
+        set_button_vk(control, n_buttons, WORLD_VK_LSHIFT, IsKeyDown(KEY_LEFT_SHIFT));
+        set_button_vk(control, n_buttons, WORLD_VK_LMB, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        set_button_vk(control, n_buttons, WORLD_VK_RMB, IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
+        control[2 + n_buttons] = clamp_scroll_sign(GetMouseWheelMove());
     }
+}
+
+static void merge_frame_control(LiveShared *s, const float *frame_control) {
+    if (s->ctrl_dim < s->n_buttons + 3) return;
+    s->control[0] += frame_control[0];
+    s->control[1] += frame_control[1];
+    for (int i = 0; i < s->n_buttons; ++i) {
+        s->control[2 + i] = frame_control[2 + i];
+    }
+    s->control[2 + s->n_buttons] =
+        clamp_scroll_sign(s->control[2 + s->n_buttons] + frame_control[2 + s->n_buttons]);
 }
 
 static void *generation_worker(void *arg) {
@@ -159,6 +194,11 @@ static void *generation_worker(void *arg) {
         pthread_mutex_lock(&s->mutex);
         int stop = s->stop;
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
+        if (s->ctrl_dim >= s->n_buttons + 3) {
+            s->control[0] = 0.0f;
+            s->control[1] = 0.0f;
+            s->control[2 + s->n_buttons] = 0.0f;
+        }
         pthread_mutex_unlock(&s->mutex);
         if (stop) break;
 
@@ -360,16 +400,17 @@ int main(int argc, char **argv) {
     DisableCursor();
     SetTargetFPS(60);
 
-    Image image = {display_rgb, rgb_w, rgb_h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8};
+    int latest_frame = rgb_frames - 1;
+    Image image = {display_rgb + (size_t)latest_frame * frame_bytes, rgb_w, rgb_h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8};
     Texture2D texture = LoadTextureFromImage(image);
-    int texture_frame = 0;
-    UpdateTexture(texture, display_rgb);
+    UpdateTexture(texture, display_rgb + (size_t)latest_frame * frame_bytes);
 
     LiveShared shared;
     memset(&shared, 0, sizeof(shared));
     pthread_mutex_init(&shared.mutex, NULL);
     shared.rt = rt;
     shared.ctrl_dim = ctrl_dim;
+    shared.n_buttons = cfg.n_buttons;
     shared.rgb_bytes = rgb_bytes;
     shared.width = rgb_w;
     shared.height = rgb_h;
@@ -395,7 +436,6 @@ int main(int argc, char **argv) {
         goto cleanup_runtime_only;
     }
 
-    double chunk_start = GetTime();
     float last_generation_seconds = warm_seconds;
     int chunk_id = 0;
     float *frame_control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
@@ -409,26 +449,20 @@ int main(int argc, char **argv) {
         if (!frame_control) break;
         fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons);
         pthread_mutex_lock(&shared.mutex);
-        memcpy(shared.control, frame_control, (size_t)ctrl_dim * sizeof(float));
+        merge_frame_control(&shared, frame_control);
         int failed = shared.failed;
         if (shared.ready) {
             memcpy(display_rgb, shared.rgb, rgb_bytes);
             last_generation_seconds = shared.generation_seconds;
             chunk_id = shared.produced_chunks;
             shared.ready = 0;
-            chunk_start = GetTime();
+            UpdateTexture(texture, display_rgb + (size_t)(rgb_frames - 1) * frame_bytes);
         }
         pthread_mutex_unlock(&shared.mutex);
         if (failed) break;
 
-        double elapsed = GetTime() - chunk_start;
-        int next_texture_frame = (int)(elapsed * (double)cfg.base_fps) % rgb_frames;
-        if (next_texture_frame != texture_frame) {
-            texture_frame = next_texture_frame;
-            UpdateTexture(texture, display_rgb + (size_t)texture_frame * frame_bytes);
-        }
         char title[256];
-        snprintf(title, sizeof(title), "worldmodel.cu | chunk %d | gen %.2fs | %.2f rgb fps", chunk_id, last_generation_seconds, rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
+        snprintf(title, sizeof(title), "worldmodel.cu | latest chunk %d | gen %.2fs | %.2f rgb fps", chunk_id, last_generation_seconds, rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
         SetWindowTitle(title);
 
         BeginDrawing();
