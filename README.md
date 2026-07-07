@@ -47,10 +47,19 @@ Run the current standalone generation probe:
 
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
-loads real `patchify.weight` and layer-0 `q_proj.weight`, then runs:
+loads the real layer-0 weights needed for the first attention input path, then
+runs:
 
 ```text
-random latent -> patchify CUDA kernel -> layer0 q_proj cuBLAS GEMM
+sigma embedding -> denoise MLP -> layer0 cond head
+random latent -> patchify -> AdaRMSNorm -> Q/K/V projections -> RMS+OrthoRoPE
+current-frame GQA attention -> out projection -> gated residual add
+```
+
+Run the standalone executable parity test against PyTorch reference math:
+
+```sh
+python test_standalone_probe.py
 ```
 
 Run a real-weight latent generation smoke test:
@@ -71,8 +80,10 @@ Notes:
 
 - Kernels currently target float32 parity first.
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
-  config parsing, safetensors loading, device allocation, patchify, and the
-  first real transformer projection.
+  config parsing, safetensors loading, device allocation, denoise conditioning,
+  layer-0 cond projection, patchify, AdaRMSNorm, Q/K/V GEMMs, and Q/K
+  RMS+OrthoRoPE, current-frame GQA attention, attention out projection, and
+  gated residual add.
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
