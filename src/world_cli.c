@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--latent FILE] [--seed N] [--noise normal|uniform] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--latent FILE] [--seed N] [--noise normal|uniform] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--vae-only] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -261,6 +261,7 @@ int main(int argc, char **argv) {
     int frames_to_run = 1;
     int frame_idx = 0;
     int cache_pass = 0;
+    int vae_only = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -299,6 +300,8 @@ int main(int argc, char **argv) {
             frame_idx = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cache-pass") == 0) {
             cache_pass = 1;
+        } else if (strcmp(argv[i], "--vae-only") == 0) {
+            vae_only = 1;
         } else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
             dump_prefix = argv[++i];
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
@@ -328,7 +331,7 @@ int main(int argc, char **argv) {
     }
 
     char default_vae_weights[PATH_BUF];
-    if (!vae_weights && out_path) {
+    if (!vae_weights && (out_path || vae_only)) {
         if (join_path(default_vae_weights, sizeof(default_vae_weights), model_dir, "vae/diffusion_pytorch_model.safetensors")) {
             fprintf(stderr, "VAE weights path too long\n");
             return 1;
@@ -338,6 +341,27 @@ int main(int argc, char **argv) {
 
     WorldConfig cfg;
     if (world_config_load(&cfg, config_path)) return 1;
+    if (vae_only) {
+        if (!latent_path || !out_path) {
+            fprintf(stderr, "--vae-only requires --latent FILE and --out PATH\n");
+            return 1;
+        }
+        world_config_print(&cfg);
+        WorldVaeDecoderWeights vae;
+        float *latent = NULL;
+        memset(&vae, 0, sizeof(vae));
+        size_t latent_elems = (size_t)cfg.channels *
+                              (size_t)(cfg.height * cfg.patch_h) *
+                              (size_t)(cfg.width * cfg.patch_w);
+        int rc = 1;
+        if (load_vae_decoder_weights(vae_weights, &vae)) goto vae_only_cleanup;
+        if (read_f32_file_exact(latent_path, latent_elems, &latent)) goto vae_only_cleanup;
+        rc = world_cuda_vae_decode_probe(&cfg, latent, &vae, out_path);
+vae_only_cleanup:
+        free(latent);
+        free_vae_decoder_weights(&vae);
+        return rc;
+    }
     if (layers_to_run < 0) layers_to_run = cfg.n_layers;
     if (layers_to_run <= 0 || layers_to_run > cfg.n_layers) {
         fprintf(stderr, "invalid --layers %d, expected 1..%d\n", layers_to_run, cfg.n_layers);

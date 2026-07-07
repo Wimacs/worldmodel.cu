@@ -5,6 +5,7 @@
 
 #include <pthread.h>
 #include <math.h>
+#include <errno.h>
 
 typedef struct {
     WorldModelProbeWeights probe;
@@ -51,7 +52,7 @@ enum {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
             "then renders decoded RGB frames to a raylib texture without writing images.\n",
@@ -246,11 +247,50 @@ static Rectangle fit_rect(int dst_w, int dst_h, int src_w, int src_h) {
     return r;
 }
 
+static int ray_write_ppm(const char *path, const unsigned char *rgb, int width, int height) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "failed to open debug image %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    fprintf(f, "P6\n%d %d\n255\n", width, height);
+    size_t n = (size_t)width * height * 3;
+    int ok = fwrite(rgb, 1, n, f) == n;
+    fclose(f);
+    if (!ok) {
+        fprintf(stderr, "failed to write debug image %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+static int ray_make_frame_path(char *out, size_t out_size, const char *path, int frame_idx) {
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    const char *dot = strrchr(name, '.');
+    int stem_len = dot ? (int)(dot - path) : (int)strlen(path);
+    const char *ext = dot ? dot : "";
+    int n = snprintf(out, out_size, "%.*s.%d%s", stem_len, path, frame_idx, ext);
+    return n < 0 || (size_t)n >= out_size;
+}
+
+static int ray_write_ppm_frames(const char *path, const unsigned char *rgb, int frame_count, int width, int height) {
+    size_t frame_bytes = (size_t)width * height * 3;
+    if (ray_write_ppm(path, rgb, width, height)) return 1;
+    for (int i = 0; i < frame_count; ++i) {
+        char frame_path[PATH_BUF];
+        if (ray_make_frame_path(frame_path, sizeof(frame_path), path, i)) return 1;
+        if (ray_write_ppm(frame_path, rgb + (size_t)i * frame_bytes, width, height)) return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
     const char *vae_weights = NULL;
     const char *seed_latent_path = NULL;
+    const char *headless_out_path = NULL;
     int steps_to_run = -1;
     int layers_to_run = -1;
     int frame_idx = 0;
@@ -300,6 +340,8 @@ int main(int argc, char **argv) {
             warmup_chunks = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--headless-smoke") == 0) {
             headless_smoke = 1;
+        } else if (strcmp(argv[i], "--headless-out") == 0 && i + 1 < argc) {
+            headless_out_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             ray_usage(argv[0]);
             return 0;
@@ -408,9 +450,16 @@ int main(int argc, char **argv) {
     if (!display_rgb) goto cleanup_before_window;
     memcpy(display_rgb, warm_rgb, rgb_bytes);
     if (headless_smoke) {
+        if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h)) {
+            free(display_rgb);
+            free(seed_latent);
+            world_cuda_runtime_destroy(rt);
+            return 1;
+        }
         fprintf(stderr,
-                "headless smoke: resident runtime produced %d RGB frame(s) %dx%d in %.3fs, no image files written\n",
-                rgb_frames, rgb_w, rgb_h, warm_seconds);
+                "headless smoke: resident runtime produced %d RGB frame(s) %dx%d in %.3fs%s\n",
+                rgb_frames, rgb_w, rgb_h, warm_seconds,
+                headless_out_path ? ", wrote debug frames" : ", no image files written");
         free(display_rgb);
         free(seed_latent);
         world_cuda_runtime_destroy(rt);

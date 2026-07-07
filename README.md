@@ -74,6 +74,10 @@ For terminal-only validation of the same resident runtime path:
   --headless-smoke
 ```
 
+Add `--headless-out /tmp/world_runtime.ppm` to the smoke command when you want
+debug PPM frames for the latest resident-runtime chunk. This is only a debugging
+path; the interactive raylib loop still renders directly to the framebuffer.
+
 For a lower-latency interactive mode, use the fast realtime preset. It uses one
 scheduler step and clamps both local/global KV cache windows to two frame chunks:
 
@@ -111,6 +115,8 @@ Pass `--latent latent.f32` to load external little-endian float32 latent values
 instead of sampling noise; the file must contain
 `frames * channels * height * patch_h * width * patch_w` values, with one
 latent frame after another.
+Pass `--vae-only --latent latent.f32 --out out.ppm` to debug only the TAEHV
+decoder, bypassing the transformer path entirely.
 Pass `--control controls.f32` to provide one little-endian float32 controller
 vector of length `n_buttons + 3`; it is broadcast to every generated frame. Pass
 `--control-seq controls_seq.f32` to provide `frames * (n_buttons + 3)` float32

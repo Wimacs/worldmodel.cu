@@ -156,6 +156,12 @@ int world_cuda_transformer_probe(
         const WorldVaeDecoderWeights *vae,
         const char *out_path);
 
+int world_cuda_vae_decode_probe(
+        const WorldConfig *cfg,
+        const float *latent,
+        const WorldVaeDecoderWeights *vae,
+        const char *out_path);
+
 int world_cuda_runtime_create(
         WorldCudaRuntime **out,
         const WorldConfig *cfg,

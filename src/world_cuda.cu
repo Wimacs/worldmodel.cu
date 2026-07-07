@@ -1838,6 +1838,32 @@ static int world_cuda_decode_vae_to_ppm(
     return 0;
 }
 
+extern "C" int world_cuda_vae_decode_probe(
+        const WorldConfig *cfg,
+        const float *latent,
+        const WorldVaeDecoderWeights *vae,
+        const char *out_path) {
+    if (!cfg || !latent || !vae || !out_path || !out_path[0]) return 1;
+    DeviceVaeDecoder d_vae;
+    memset(&d_vae, 0, sizeof(d_vae));
+    float *d_latent = NULL;
+    int rc = 1;
+    size_t latent_elems = (size_t)cfg->channels *
+                          (size_t)(cfg->height * cfg->patch_h) *
+                          (size_t)(cfg->width * cfg->patch_w);
+
+    if (cudaMalloc((void **)&d_latent, latent_elems * sizeof(float)) != cudaSuccess) goto cleanup;
+    if (cudaMemcpy(d_latent, latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
+    if (taehv_decoder_init(&d_vae, cfg, vae)) goto cleanup;
+    if (world_cuda_decode_vae_to_ppm(cfg, &d_vae, d_latent, out_path, 0)) goto cleanup;
+    rc = 0;
+
+cleanup:
+    taehv_decoder_free(&d_vae);
+    cudaFree(d_latent);
+    return rc;
+}
+
 struct WorldCudaRuntime {
     WorldConfig cfg;
     int layers_to_run;
