@@ -125,10 +125,10 @@ Notes:
   transformer token forward, value residual, optional ctrl fusion with
   `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
-  conversion, TAEHV direct conv/MemBlock/TGrow/upsample decode, pixel shuffle,
-  and 4-frame PPM output. Multi-frame standalone rollout recomputes the
-  controller embedding from the current frame's control vector before each
-  denoise/cache pass pair.
+  conversion, resident VAE decoder weights/scratch buffers, TAEHV direct
+  conv/MemBlock/TGrow/upsample decode, pixel shuffle, and 4-frame PPM output.
+  Multi-frame standalone rollout recomputes the controller embedding from the
+  current frame's control vector before each denoise/cache pass pair.
   `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
   two-layer transformer + latent output + one-step scheduler update + VAE PPM
   decode path against PyTorch reference math for all 4 decoded frames.
