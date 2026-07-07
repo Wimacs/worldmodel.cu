@@ -415,13 +415,21 @@ int main(int argc, char **argv) {
     }
     if (cache_window_override > 0) {
         cfg.local_window = cache_window_override;
+        cfg.global_window = cache_window_override;
         if (fast_realtime) {
-            cfg.global_window = cache_window_override;
             cfg.global_pinned_dilation = 1;
             fprintf(stderr, "fast realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
                     cfg.local_window, cfg.global_window);
         } else {
-            fprintf(stderr, "local cache override: local_window=%d, keeping global_window=%d global_pinned_dilation=%d\n",
+            if (cfg.global_window % cfg.global_pinned_dilation != 0) {
+                int adjusted = ((cfg.global_window + cfg.global_pinned_dilation - 1) / cfg.global_pinned_dilation) *
+                    cfg.global_pinned_dilation;
+                fprintf(stderr,
+                        "global cache override rounded from %d to %d to preserve global_pinned_dilation=%d\n",
+                        cfg.global_window, adjusted, cfg.global_pinned_dilation);
+                cfg.global_window = adjusted;
+            }
+            fprintf(stderr, "cache override: local_window=%d global_window=%d global_pinned_dilation=%d\n",
                     cfg.local_window, cfg.global_window, cfg.global_pinned_dilation);
         }
         if (cache_window_override == 1) {

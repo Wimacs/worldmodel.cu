@@ -53,7 +53,7 @@ python export_seed_latent.py \
 ./build/worldmodel_raylib \
   --model-dir ../Waypoint-1.5-1B \
   --steps 4 \
-  --cache-window 2 \
+  --cache-window 8 \
   --mouse-scale 0.1 \
   --seed-latent /tmp/world_seed_latent.f32
 ```
@@ -70,7 +70,7 @@ For terminal-only validation of the same resident runtime path:
 ./build/worldmodel_raylib \
   --model-dir ../Waypoint-1.5-1B \
   --steps 4 \
-  --cache-window 2 \
+  --cache-window 8 \
   --seed-latent /tmp/world_seed_latent.f32 \
   --headless-smoke
 ```
@@ -87,22 +87,21 @@ scheduler step and clamps both local/global KV cache windows to two frame chunks
 ```
 
 `--cache-window N` can be used independently to trade temporal history for
-latency. `--cache-window 1` is a debug-only minimum-latency mode: the current
-ring slot is masked during attention, so no previous-frame history is visible
-and rollout looks like a fresh sample every frame. Use `--cache-window 2` or
-higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
---headless-smoke`
-stabilizes around 53 ms per decoded 4-frame RGB chunk, about 75 RGB fps. With
-`--steps 4 --cache-window 8 --warmup 9 --headless-smoke`, the current CUDA path
-stabilizes around 248 ms per decoded chunk, about 16.1 RGB fps. D=64 cache
-attention uses the cuBLAS path by default when every cache has
-`pinned_dilation=1` and at most 8192 visible tokens; set
-`WORLD_CUBLAS_ATTN=0` to force the older warp attention fallback, or
-`WORLD_CUBLAS_ATTN_GQA=0` to force the older cuBLAS compact-KV expansion path.
-Set `WORLD_FLASH_ATTN=1` to try the fused online-softmax indexed attention
-prototype. It avoids the score matrix allocation and matches the masked
-attention tests, but it is not the default because the current scalar CUDA
-kernel is slower than the cuBLAS GQA path on the RTX 4090 D.
+latency. It clamps both local and global KV cache windows; non-fast global
+windows keep the checkpoint's `global_pinned_dilation` and are rounded up when
+needed so the dilated cache buckets stay valid. `--cache-window 1` is a
+debug-only minimum-latency mode: the current ring slot is masked during
+attention, so no previous-frame history is visible and rollout looks like a
+fresh sample every frame. Use `--cache-window 2` or higher for interactive
+control. On an RTX 4090 D, `--steps 4 --cache-window 8 --warmup 24
+--headless-smoke` stabilizes around 235-254 ms per decoded 4-frame RGB chunk,
+about 15.7-17.0 RGB fps. D=64 cache attention uses cuBLAS by default for
+contiguous `pinned_dilation=1` cache layers, while sparse/global layers keep the
+indexed warp fallback. Set `WORLD_CUBLAS_ATTN=0` to force the older all-warp
+attention fallback, `WORLD_CUBLAS_ATTN_GQA=1` to try pointer-batched GQA cuBLAS,
+or `WORLD_FLASH_ATTN=1` to try the online-softmax indexed attention prototype.
+The experimental paths match the masked attention tests, but are not the
+default on the RTX 4090 D because they are slower in the current kernels.
 
 The raylib frontend samples WASD, Space, Shift, left/right mouse buttons, mouse
 delta, and mouse wheel into the PyTorch controller layout
