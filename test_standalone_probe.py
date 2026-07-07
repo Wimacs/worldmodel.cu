@@ -304,6 +304,8 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 str(sigma),
                 "--layers",
                 str(layers),
+                "--steps",
+                "1",
                 "--dump-prefix",
                 prefix,
             ],
@@ -423,11 +425,20 @@ def test_standalone_two_layer_transformer_matches_pytorch():
         unpatch_b = state["unpatchify.bias"][:, None, None].expand(c, ph, pw).reshape(c * ph * pw).contiguous()
         latent_out = F.linear(final_tokens, unpatch_w, unpatch_b)
         latent_out = latent_out.view(height, width, c, ph, pw).permute(2, 0, 3, 1, 4).reshape(c, h, w).contiguous()
+        dsigma = float(cfg["scheduler_sigmas"][1]) - sigma
+        latent_final = (latent[0] + latent_out * dsigma).contiguous()
 
         _assert_close(
             "transformer_tokens_2_layers",
             _read_dump(prefix, "transformer_tokens", (tpf, d_model)),
             tokens,
+            rtol=1.2e-3,
+            atol=1.2e-3,
+        )
+        _assert_close(
+            "latent_final_2_layers",
+            _read_dump(prefix, "latent_final", (c, h, w)),
+            latent_final,
             rtol=1.2e-3,
             atol=1.2e-3,
         )

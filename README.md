@@ -42,14 +42,16 @@ cmake --build build -j
 Run the current standalone transformer probe:
 
 ```sh
-./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B
+./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --dump-prefix /tmp/world_sched4
 ```
 
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
-loads the real transformer weights, and by default runs all 24 WorldDiT layers
-through the latent-token path, then converts the final tokens back to a latent
-velocity tensor:
+loads the real transformer weights, and runs the latent-only scheduler through
+the WorldDiT path. The default is one scheduler step for quick parity checks;
+`--steps 4` follows the current config schedule `1 -> 0.9 -> 0.75 -> 0.3 -> 0`.
+Each step runs all requested WorldDiT layers, converts the final tokens back to
+a latent velocity tensor, and updates the latent on GPU:
 
 ```text
 sigma embedding -> denoise MLP
@@ -58,11 +60,12 @@ random latent -> patchify
      -> out projection -> gated residual add -> optional zero-control ctrl fusion
      -> MLP AdaRMSNorm -> DiT MLP -> gated residual add)
 out_norm modulation -> token RMS+SiLU -> unpatchify -> latent_out [32,32,64]
+latent += (next_sigma - sigma) * latent_out
 ```
 
 Use `--layers 1` to run only the fully instrumented layer-0 parity path. Pass
 `--dump-prefix /tmp/world` to write binary f32 dumps such as
-`/tmp/world.latent_out.f32`.
+`/tmp/world.latent_out.f32` and `/tmp/world.latent_final.f32`.
 
 Run the standalone executable parity test against PyTorch reference math:
 
@@ -91,9 +94,11 @@ Notes:
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, 24-layer transformer token forward,
   value residual, current-frame GQA attention, optional zero-control ctrl
-  fusion, DiT MLP, final out_norm modulation, and unpatchify back to latent.
+  fusion, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
+  and scheduler latent updates through the config sigma schedule.
   `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
-  two-layer transformer + latent output path against PyTorch reference math.
+  two-layer transformer + latent output + one-step scheduler update path against
+  PyTorch reference math.
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.

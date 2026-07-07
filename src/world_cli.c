@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--seed N] [--sigma X] [--layers N] [--dump-prefix PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path.\n",
@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
     unsigned int seed = 1234;
     float sigma = 1.0f;
     int layers_to_run = -1;
+    int steps_to_run = 1;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -122,6 +123,8 @@ int main(int argc, char **argv) {
             sigma = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
             layers_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
+            steps_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
             dump_prefix = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -153,6 +156,10 @@ int main(int argc, char **argv) {
     if (layers_to_run < 0) layers_to_run = cfg.n_layers;
     if (layers_to_run <= 0 || layers_to_run > cfg.n_layers) {
         fprintf(stderr, "invalid --layers %d, expected 1..%d\n", layers_to_run, cfg.n_layers);
+        return 1;
+    }
+    if (steps_to_run <= 0 || steps_to_run >= cfg.scheduler_sigmas_count) {
+        fprintf(stderr, "invalid --steps %d, expected 1..%d\n", steps_to_run, cfg.scheduler_sigmas_count - 1);
         return 1;
     }
     world_config_print(&cfg);
@@ -253,7 +260,7 @@ int main(int argc, char **argv) {
             unpatchify_weight,
             unpatchify_bias,
         };
-        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, sigma, seed, dump_prefix);
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, sigma, seed, dump_prefix);
         goto cleanup;
     }
 
