@@ -1603,7 +1603,11 @@ extern "C" int world_cuda_layer0_probe(
         free(h_t_pos);
         return 1;
     }
-    fill_latent(h_latent, (int)latent_elems, seed, noise_mode);
+    if (weights->initial_latent) {
+        memcpy(h_latent, weights->initial_latent, latent_elems * sizeof(float));
+    } else {
+        fill_latent(h_latent, (int)latent_elems, seed, noise_mode);
+    }
     fill_noise_embedding(h_noise, sigma);
     fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, 0);
     fill_rope_tables(h_xy, h_inv_t, d_head, cfg->height, cfg->width);
@@ -2256,7 +2260,13 @@ extern "C" int world_cuda_transformer_probe(
         TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
         rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
         TRY_CUDA2(cudaGetLastError());
-        fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal, noise_mode);
+        if (weights->initial_latents) {
+            memcpy(h_latent,
+                   weights->initial_latents + (size_t)frame_ordinal * latent_elems,
+                   latent_elems * sizeof(float));
+        } else {
+            fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal, noise_mode);
+        }
         fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
         TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
         TRY_CUDA2(cudaMemcpy(d_x_pos, h_x_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));

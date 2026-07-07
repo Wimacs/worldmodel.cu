@@ -70,6 +70,7 @@ typedef struct {
     const float *ctrl_emb_fc1_weight;
     const float *ctrl_emb_fc2_weight;
     const float *control_input;
+    const float *initial_latent;
     const float *layer0_cond_bias;
     const float *layer0_attn_cond_s_weight;
     const float *layer0_attn_cond_b_weight;
@@ -116,6 +117,7 @@ typedef struct {
     const float *ctrl_emb_fc1_weight;
     const float *ctrl_emb_fc2_weight;
     const float *control_inputs;
+    const float *initial_latents;
     const WorldLayerWeights *layers;
     int n_layers;
     const float *out_norm_fc_weight;

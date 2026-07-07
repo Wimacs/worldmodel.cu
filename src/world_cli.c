@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--seed N] [--noise normal|uniform] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--control-seq FILE] [--latent FILE] [--seed N] [--noise normal|uniform] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -249,6 +249,7 @@ int main(int argc, char **argv) {
     const char *vae_weights = NULL;
     const char *control_path = NULL;
     const char *control_seq_path = NULL;
+    const char *latent_path = NULL;
     const char *dump_prefix = NULL;
     const char *out_path = NULL;
     unsigned int seed = 1234;
@@ -271,6 +272,8 @@ int main(int argc, char **argv) {
             control_path = argv[++i];
         } else if (strcmp(argv[i], "--control-seq") == 0 && i + 1 < argc) {
             control_seq_path = argv[++i];
+        } else if (strcmp(argv[i], "--latent") == 0 && i + 1 < argc) {
+            latent_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
@@ -388,6 +391,7 @@ int main(int argc, char **argv) {
     float *ctrl_emb_fc1_weight = NULL;
     float *ctrl_emb_fc2_weight = NULL;
     float *control_inputs = NULL;
+    float *initial_latents = NULL;
     float *out_norm_fc_weight = NULL;
     float *unpatchify_weight = NULL;
     float *unpatchify_bias = NULL;
@@ -414,6 +418,14 @@ int main(int argc, char **argv) {
 
     if (out_path && load_vae_decoder_weights(vae_weights, &vae)) {
         goto cleanup;
+    }
+
+    size_t latent_elems_per_frame = (size_t)cfg.channels * (size_t)(cfg.height * cfg.patch_h) * (size_t)(cfg.width * cfg.patch_w);
+    size_t latent_elems = (size_t)frames_to_run * latent_elems_per_frame;
+    if (latent_path) {
+        if (read_f32_file_exact(latent_path, latent_elems, &initial_latents)) goto cleanup;
+        fprintf(stderr, "loaded initial latent(s): %s frames=%d elems_per_frame=%zu\n",
+                latent_path, frames_to_run, latent_elems_per_frame);
     }
 
     size_t control_elems = (size_t)frames_to_run * (size_t)ctrl_dim;
@@ -499,6 +511,7 @@ int main(int argc, char **argv) {
             ctrl_emb_fc1_weight,
             ctrl_emb_fc2_weight,
             control_inputs,
+            initial_latents,
             layers,
             layers_to_run,
             out_norm_fc_weight,
@@ -565,6 +578,7 @@ int main(int argc, char **argv) {
         ctrl_emb_fc1_weight,
         ctrl_emb_fc2_weight,
         control_inputs,
+        initial_latents,
         layer0_cond_bias,
         layer0_attn_cond_s_weight,
         layer0_attn_cond_b_weight,
@@ -591,6 +605,7 @@ cleanup:
     free(ctrl_emb_fc1_weight);
     free(ctrl_emb_fc2_weight);
     free(control_inputs);
+    free(initial_latents);
     free(out_norm_fc_weight);
     free(unpatchify_weight);
     free(unpatchify_bias);

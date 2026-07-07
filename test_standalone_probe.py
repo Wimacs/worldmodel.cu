@@ -75,6 +75,12 @@ def _lcg_normal_latent(shape, seed):
     return out.reshape(shape)
 
 
+def _fixture_latent(shape):
+    idx = np.arange(int(np.prod(shape)), dtype=np.float32)
+    data = 0.5 * np.sin(idx * np.float32(0.013)) + 0.25 * np.cos(idx * np.float32(0.031))
+    return data.astype(np.float32).reshape(shape)
+
+
 def _control_vector(cfg):
     n = int(cfg["n_buttons"]) + 3
     idx = np.arange(n, dtype=np.float32)
@@ -201,6 +207,47 @@ def test_standalone_normal_noise_dump_matches_reference():
         h, w = cfg["height"] * ph, cfg["width"] * pw
         expected = torch.from_numpy(_lcg_normal_latent((1, c, h, w), seed)).to(device)
         _assert_close("normal_noise_latent", _read_dump(prefix, "latent", (1, c, h, w)), expected, rtol=0, atol=2.0e-6)
+
+
+def test_standalone_external_latent_dump_matches_input():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not WEIGHTS_PATH.exists():
+        pytest.skip(f"missing Waypoint weights: {WEIGHTS_PATH}")
+
+    cfg = _load_config()
+    exe = _build_executable()
+    device = torch.device("cuda")
+
+    with tempfile.TemporaryDirectory(prefix="world_external_latent_probe_") as td:
+        prefix = str(Path(td) / "dump")
+        c = cfg["channels"]
+        ph, pw = int(cfg["patch"][0]), int(cfg["patch"][1])
+        h, w = cfg["height"] * ph, cfg["width"] * pw
+        latent_np = _fixture_latent((1, c, h, w))
+        latent_path = Path(td) / "latent.f32"
+        latent_np.tofile(latent_path)
+
+        subprocess.run(
+            [
+                str(exe),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--latent",
+                str(latent_path),
+                "--sigma",
+                "1.0",
+                "--layers",
+                "1",
+                "--dump-prefix",
+                prefix,
+            ],
+            check=True,
+            cwd=str(ROOT),
+        )
+
+        expected = torch.from_numpy(latent_np).to(device)
+        _assert_close("external_latent", _read_dump(prefix, "latent", (1, c, h, w)), expected, rtol=0, atol=0)
 
 
 def test_standalone_layer0_probe_matches_pytorch():
@@ -945,6 +992,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
 
 if __name__ == "__main__":
     test_standalone_normal_noise_dump_matches_reference()
+    test_standalone_external_latent_dump_matches_input()
     test_standalone_layer0_probe_matches_pytorch()
     test_standalone_two_layer_transformer_matches_pytorch()
     test_standalone_two_frame_cache_rollout_matches_pytorch()
