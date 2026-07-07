@@ -54,6 +54,7 @@ python export_seed_latent.py \
   --model-dir ../Waypoint-1.5-1B \
   --steps 4 \
   --cache-window 2 \
+  --mouse-scale 0.1 \
   --seed-latent /tmp/world_seed_latent.f32
 ```
 
@@ -101,7 +102,8 @@ delta, and mouse wheel into the PyTorch controller layout
 codes for the button indices. CUDA generation runs on a worker thread while the
 raylib main thread keeps polling input. When a new decoded chunk arrives, the
 frontend presents its frames once in order and then holds on the last frame until
-the next chunk arrives.
+the next chunk arrives. Mouse deltas are multiplied by `--mouse-scale`, which
+defaults to `0.1`; lower it to `0.05` if camera motion feels too strong.
 
 Run the current standalone image probe:
 

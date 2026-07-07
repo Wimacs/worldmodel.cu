@@ -52,7 +52,7 @@ enum {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
             "then renders decoded RGB frames to a raylib texture without writing images.\n",
@@ -151,12 +151,12 @@ static float clamp_scroll_sign(float x) {
     return 0.0f;
 }
 
-static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons) {
+static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, float mouse_scale) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
     if (ctrl_dim >= n_buttons + 3) {
-        control[0] = delta.x * 0.01f;
-        control[1] = delta.y * 0.01f;
+        control[0] = delta.x * mouse_scale;
+        control[1] = delta.y * mouse_scale;
         set_button_vk(control, n_buttons, WORLD_VK_W, IsKeyDown(KEY_W));
         set_button_vk(control, n_buttons, WORLD_VK_S, IsKeyDown(KEY_S));
         set_button_vk(control, n_buttons, WORLD_VK_A, IsKeyDown(KEY_A));
@@ -305,6 +305,7 @@ int main(int argc, char **argv) {
     int headless_smoke = 0;
     int fast_realtime = 0;
     int cache_window_override = -1;
+    float mouse_scale = 0.1f;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
 
@@ -335,6 +336,12 @@ int main(int argc, char **argv) {
             else if (strcmp(mode, "uniform") == 0) noise_mode = WORLD_NOISE_UNIFORM;
             else {
                 fprintf(stderr, "invalid --noise %s\n", mode);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--mouse-scale") == 0 && i + 1 < argc) {
+            mouse_scale = (float)atof(argv[++i]);
+            if (mouse_scale <= 0.0f) {
+                fprintf(stderr, "invalid --mouse-scale %.6f\n", mouse_scale);
                 return 1;
             }
         } else if (strcmp(argv[i], "--window-width") == 0 && i + 1 < argc) {
@@ -392,6 +399,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid --layers/--steps for config\n");
         return 1;
     }
+    fprintf(stderr, "raylib mouse scale: %.4f\n", mouse_scale);
     world_config_print(&cfg);
 
     SafeTensors st;
@@ -527,7 +535,7 @@ int main(int argc, char **argv) {
     }
     while (!WindowShouldClose()) {
         if (!frame_control) break;
-        fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons);
+        fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons, mouse_scale);
         pthread_mutex_lock(&shared.mutex);
         merge_frame_control(&shared, frame_control);
         int failed = shared.failed;
