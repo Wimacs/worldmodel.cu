@@ -3273,18 +3273,20 @@ extern "C" int world_cuda_runtime_create(
     cublas_attn_env = getenv("WORLD_CUBLAS_ATTN");
     cublas_attn_gqa_env = getenv("WORLD_CUBLAS_ATTN_GQA");
     flash_attn_env = getenv("WORLD_FLASH_ATTN");
-    rt->attn_cublas_gqa_enabled = cublas_attn_gqa_env ? cublas_attn_gqa_env[0] != '0' : 1;
+    rt->attn_cublas_gqa_enabled = cublas_attn_gqa_env ? cublas_attn_gqa_env[0] != '0' : 0;
     rt->attn_flash_enabled = flash_attn_env ? flash_attn_env[0] != '0' : 0;
     if (rt->attn_flash_enabled) {
-        fprintf(stderr, "fused flash-like attention enabled by WORLD_FLASH_ATTN=1\n");
+        fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for non-cuBLAS cache layers\n");
     }
     if ((!cublas_attn_env || cublas_attn_env[0] != '0') && rt->d_head == 64 && cfg->n_heads % cfg->n_kv_heads == 0) {
         cublas_attn_max_tokens = 0;
-        cublas_attn_supported = 1;
+        cublas_attn_supported = 0;
         for (int i = 0; i < layers_to_run; ++i) {
             DeviceWorldLayerCache *cache = &rt->d_caches[i];
-            if (cache->pinned_dilation != 1) cublas_attn_supported = 0;
-            if (cache->ring_length > cublas_attn_max_tokens) cublas_attn_max_tokens = cache->ring_length;
+            if (cache->pinned_dilation == 1) {
+                cublas_attn_supported = 1;
+                if (cache->ring_length > cublas_attn_max_tokens) cublas_attn_max_tokens = cache->ring_length;
+            }
         }
         if (cublas_attn_supported && cublas_attn_max_tokens > 0 && cublas_attn_max_tokens <= 8192) {
             rt->attn_cublas_enabled = 1;
@@ -3482,7 +3484,17 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_CUDA(cudaGetLastError());
             if (rt->d_head == 64) {
                 int cublas_attn_ok = 0;
-                if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
+                if (rt->attn_cublas_enabled && cache->pinned_dilation == 1) {
+                    int n_tokens = visible_cache_tokens_pinned1_host(cache, rt->T, current_frame_idx);
+                    if (n_tokens > 0 && n_tokens <= rt->attn_cublas_max_tokens) {
+                        if (rt->attn_cublas_gqa_enabled) {
+                            if (indexed_attention_cache_d64_cublas_gqa(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        } else {
+                            if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
+                        }
+                        cublas_attn_ok = 1;
+                    }
+                } else if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
                     int group = cfg->n_heads / cfg->n_kv_heads;
                     int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
                     if (q_per_h < 1) q_per_h = 1;
@@ -3493,16 +3505,6 @@ extern "C" int world_cuda_runtime_step_rgb(
                         cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
                         1.0f / 8.0f);
                     cublas_attn_ok = 1;
-                } else if (rt->attn_cublas_enabled && cache->pinned_dilation == 1) {
-                    int n_tokens = visible_cache_tokens_pinned1_host(cache, rt->T, current_frame_idx);
-                    if (n_tokens > 0 && n_tokens <= rt->attn_cublas_max_tokens) {
-                        if (rt->attn_cublas_gqa_enabled) {
-                            if (indexed_attention_cache_d64_cublas_gqa(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
-                        } else {
-                            if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
-                        }
-                        cublas_attn_ok = 1;
-                    }
                 }
                 if (!cublas_attn_ok) {
                     indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
