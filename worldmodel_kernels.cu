@@ -450,6 +450,43 @@ __global__ void kv_cache_mask_kernel(
     mask_written[i] = value;
 }
 
+__global__ void cache_frame_indices_kernel(
+        const bool *written,
+        int64_t *indices,
+        int *count,
+        int capacity,
+        int T,
+        int base,
+        bool write_step) {
+    __shared__ int out_base;
+    int slot = blockIdx.x;
+    int tid = threadIdx.x;
+    int slots = capacity / T;
+    if (slot >= slots) return;
+
+    int slot_base = slot * T;
+    bool slot_written = written[slot_base] && !(write_step && slot_base == base);
+    if (tid == 0) {
+        int prefix_slots = 0;
+        for (int s = 0; s < slot; ++s) {
+            int prev_base = s * T;
+            bool prev_written = written[prev_base] && !(write_step && prev_base == base);
+            if (prev_written) ++prefix_slots;
+        }
+        out_base = prefix_slots * T;
+        if (slot == slots - 1) {
+            *count = (prefix_slots + (slot_written ? 1 : 0)) * T;
+        }
+    }
+    __syncthreads();
+
+    if (slot_written) {
+        for (int t = tid; t < T; t += blockDim.x) {
+            indices[out_base + t] = (int64_t)(slot_base + t);
+        }
+    }
+}
+
 __global__ void patchify_f32_kernel(
         const float *x,
         const float *weight,
@@ -1036,6 +1073,38 @@ torch::Tensor kv_cache_upsert_cuda(
     return mask_written;
 }
 
+std::vector<torch::Tensor> cache_frame_indices_cuda(
+        torch::Tensor written,
+        int64_t tokens_per_frame,
+        int64_t base,
+        bool write_step) {
+    WM_CHECK_CUDA(written);
+    WM_CHECK_CONTIGUOUS(written);
+    TORCH_CHECK(written.scalar_type() == at::ScalarType::Bool, "written must be bool");
+    TORCH_CHECK(written.dim() == 1, "written must be 1D");
+    TORCH_CHECK(tokens_per_frame > 0, "tokens_per_frame must be positive");
+
+    int capacity = (int)written.numel();
+    int T = (int)tokens_per_frame;
+    TORCH_CHECK(capacity > 0, "written must not be empty");
+    TORCH_CHECK(capacity % T == 0, "written length must be divisible by tokens_per_frame");
+    TORCH_CHECK(base >= 0 && base + T <= capacity, "base frame slot out of range");
+    TORCH_CHECK((base % T) == 0, "base must point to a frame slot boundary");
+
+    auto indices = torch::empty({capacity}, written.options().dtype(torch::kLong));
+    auto count = torch::empty({1}, written.options().dtype(torch::kInt32));
+    cache_frame_indices_kernel<<<capacity / T, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        written.data_ptr<bool>(),
+        indices.data_ptr<int64_t>(),
+        count.data_ptr<int>(),
+        capacity,
+        T,
+        (int)base,
+        write_step);
+    check_last_cuda_error("cache_frame_indices");
+    return {indices, count};
+}
+
 torch::Tensor patchify_cuda(torch::Tensor x, torch::Tensor weight) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(weight);
@@ -1231,6 +1300,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
     m.def("indexed_attention", &indexed_attention_cuda, "WorldModel indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
+    m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
     m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
     m.def("taehv_conv2d", &taehv_conv2d_cuda, "TAEHV direct same-padding Conv2d (CUDA, f32)");

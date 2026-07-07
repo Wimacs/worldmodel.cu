@@ -17,6 +17,7 @@ Implemented CUDA ops:
 - `qkv_rms_rope`
 - `masked_attention`
 - `kv_cache_upsert`
+- `cache_frame_indices`
 - `patchify`
 - `unpatchify`
 
@@ -157,6 +158,9 @@ Notes:
 - Indexed cache attention now consumes the cache index count directly from GPU
   memory, avoiding a per-layer host round trip between index collection and
   attention launch.
+- Standalone cache index collection now expands whole-frame cache slots directly
+  from `written` flags, preserving ascending index order while removing the
+  separate per-token mask kernel and mask buffer.
 - The standalone transformer alternates two token buffers between layers and
   aliases the no-controller path, removing per-layer device-to-device token
   copies.

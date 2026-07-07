@@ -392,20 +392,6 @@ __global__ static void init_cache_written_kernel(bool *written, int ring_length,
     if (i < capacity) written[i] = i >= ring_length;
 }
 
-__global__ static void kv_cache_mask_kernel(
-        const bool *written,
-        bool *mask_written,
-        int capacity,
-        int T,
-        int base,
-        bool write_step) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= capacity) return;
-    bool value = written[i];
-    if (write_step && i >= base && i < base + T) value = false;
-    mask_written[i] = value;
-}
-
 __global__ static void kv_cache_upsert_copy_f32_kernel(
         float *cache_k,
         float *cache_v,
@@ -452,17 +438,41 @@ __global__ static void kv_cache_upsert_copy_f32_kernel(
     }
 }
 
-__global__ static void collect_cache_indices_kernel(
-        const bool *mask_written,
+__global__ static void collect_cache_frame_indices_kernel(
+        const bool *written,
         int64_t *indices,
         int *count,
-        int capacity) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    int n = 0;
-    for (int i = 0; i < capacity; ++i) {
-        if (mask_written[i]) indices[n++] = (int64_t)i;
+        int capacity,
+        int T,
+        int base,
+        bool write_step) {
+    __shared__ int out_base;
+    int slot = blockIdx.x;
+    int tid = threadIdx.x;
+    int slots = capacity / T;
+    if (slot >= slots) return;
+
+    int slot_base = slot * T;
+    bool slot_written = written[slot_base] && !(write_step && slot_base == base);
+    if (tid == 0) {
+        int prefix_slots = 0;
+        for (int s = 0; s < slot; ++s) {
+            int prev_base = s * T;
+            bool prev_written = written[prev_base] && !(write_step && prev_base == base);
+            if (prev_written) ++prefix_slots;
+        }
+        out_base = prefix_slots * T;
+        if (slot == slots - 1) {
+            *count = (prefix_slots + (slot_written ? 1 : 0)) * T;
+        }
     }
-    *count = n;
+    __syncthreads();
+
+    if (slot_written) {
+        for (int t = tid; t < T; t += blockDim.x) {
+            indices[out_base + t] = (int64_t)(slot_base + t);
+        }
+    }
 }
 
 __global__ static void indexed_attention_cache_f32_kernel(
@@ -949,7 +959,6 @@ typedef struct {
     float *k;
     float *v;
     bool *written;
-    bool *mask_written;
     int64_t *indices;
     int *index_count;
     int ring_length;
@@ -985,7 +994,6 @@ static void free_device_world_caches(DeviceWorldLayerCache *caches, int n_layers
         cudaFree(caches[i].k);
         cudaFree(caches[i].v);
         cudaFree(caches[i].written);
-        cudaFree(caches[i].mask_written);
         cudaFree(caches[i].indices);
         cudaFree(caches[i].index_count);
     }
@@ -1019,7 +1027,6 @@ static int alloc_device_world_caches(
         if (cudaMalloc((void **)&c->k, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->v, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
-        if (cudaMalloc((void **)&c->mask_written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->indices, (size_t)c->capacity * sizeof(int64_t)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->index_count, sizeof(int)) != cudaSuccess) goto fail;
         if (cudaMemset(c->k, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
@@ -2436,15 +2443,13 @@ extern "C" int world_cuda_transformer_probe(
                 int num_buckets = (cache->ring_length / T) / cache->pinned_dilation;
                 int base = (bucket % num_buckets) * T;
                 bool write_step = (current_frame_idx % cache->pinned_dilation) == 0;
-                kv_cache_mask_kernel<<<div_up_i64(cache->capacity, 256), 256>>>(
-                    cache->written, cache->mask_written, cache->capacity, T, base, write_step);
-                TRY_CUDA2(cudaGetLastError());
                 kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * T * d_head, 256), 256>>>(
                     cache->k, cache->v, d_k, d_v_cur, cache->written,
                     cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
                 TRY_CUDA2(cudaGetLastError());
-                collect_cache_indices_kernel<<<1, 1>>>(
-                    cache->mask_written, cache->indices, cache->index_count, cache->capacity);
+                collect_cache_frame_indices_kernel<<<cache->capacity / T, 256>>>(
+                    cache->written, cache->indices, cache->index_count,
+                    cache->capacity, T, base, write_step);
                 TRY_CUDA2(cudaGetLastError());
                 indexed_attention_cache_f32_kernel<<<cfg->n_heads * T, 256>>>(
                     d_q, cache->k, cache->v, cache->indices, cache->index_count, d_attn,

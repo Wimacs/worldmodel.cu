@@ -266,6 +266,30 @@ def test_kv_cache_upsert_matches_unfrozen_pinned_dilation(wm_cuda):
     torch.testing.assert_close(mask, ref_mask, rtol=0, atol=0)
 
 
+def test_cache_frame_indices_matches_mask_nonzero_reference(wm_cuda):
+    t = 4
+    slots = 9
+    capacity = t * slots
+    written = torch.zeros(capacity, device="cuda", dtype=torch.bool)
+    for slot in (0, 2, 5, 8):
+        written[slot * t : (slot + 1) * t] = True
+
+    base = 2 * t
+    indices, count = wm_cuda.cache_frame_indices(written, t, base, True)
+    mask = written.clone()
+    mask[base : base + t] = False
+    ref = torch.nonzero(mask, as_tuple=False).flatten()
+    n = int(count.cpu()[0])
+    assert n == ref.numel()
+    torch.testing.assert_close(indices[:n], ref, rtol=0, atol=0)
+
+    indices, count = wm_cuda.cache_frame_indices(written, t, 0, False)
+    ref = torch.nonzero(written, as_tuple=False).flatten()
+    n = int(count.cpu()[0])
+    assert n == ref.numel()
+    torch.testing.assert_close(indices[:n], ref, rtol=0, atol=0)
+
+
 def test_patchify_matches_torch_conv2d_layout(wm_cuda):
     torch.manual_seed(9)
     b, c, h, w = 2, 5, 8, 10
@@ -346,6 +370,7 @@ if __name__ == "__main__":
         test_indexed_attention_matches_masked_attention_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
+        test_cache_frame_indices_matches_mask_nonzero_reference,
         test_patchify_matches_torch_conv2d_layout,
         test_unpatchify_matches_torch_linear_layout,
         test_taehv_conv2d_matches_torch_same_padding,
