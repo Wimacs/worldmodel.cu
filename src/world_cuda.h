@@ -19,6 +19,13 @@ typedef struct {
     const float *layer0_k_proj_weight;
     const float *layer0_v_proj_weight;
     const float *layer0_out_proj_weight;
+    const float *layer0_mlp_cond_s_weight;
+    const float *layer0_mlp_cond_b_weight;
+    const float *layer0_mlp_cond_g_weight;
+    const float *layer0_ctrl_fc1_x_weight;
+    const float *layer0_ctrl_fc2_weight;
+    const float *layer0_dit_mlp_fc1_weight;
+    const float *layer0_dit_mlp_fc2_weight;
 } WorldLayer0ProbeWeights;
 
 int world_cuda_generation_probe(

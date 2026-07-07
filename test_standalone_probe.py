@@ -168,6 +168,13 @@ def test_standalone_layer0_probe_matches_pytorch():
             "transformer.blocks.0.attn.k_proj.weight",
             "transformer.blocks.0.attn.v_proj.weight",
             "transformer.blocks.0.attn.out_proj.weight",
+            "transformer.blocks.0.mlp_cond_head.cond_proj.0.weight",
+            "transformer.blocks.0.mlp_cond_head.cond_proj.1.weight",
+            "transformer.blocks.0.mlp_cond_head.cond_proj.2.weight",
+            "transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight",
+            "transformer.blocks.0.ctrl_mlpfusion.fc2.weight",
+            "transformer.blocks.0.dit_mlp.fc1.weight",
+            "transformer.blocks.0.dit_mlp.fc2.weight",
         ]
         state = _load_required_tensors(names, device)
 
@@ -181,6 +188,9 @@ def test_standalone_layer0_probe_matches_pytorch():
         s0 = F.linear(cond_act, state["transformer.blocks.0.attn_cond_head.cond_proj.0.weight"])
         b0 = F.linear(cond_act, state["transformer.blocks.0.attn_cond_head.cond_proj.1.weight"])
         g0 = F.linear(cond_act, state["transformer.blocks.0.attn_cond_head.cond_proj.2.weight"])
+        s1 = F.linear(cond_act, state["transformer.blocks.0.mlp_cond_head.cond_proj.0.weight"])
+        b1 = F.linear(cond_act, state["transformer.blocks.0.mlp_cond_head.cond_proj.1.weight"])
+        g1 = F.linear(cond_act, state["transformer.blocks.0.mlp_cond_head.cond_proj.2.weight"])
 
         tokens = F.conv2d(latent, state["patchify.weight"], bias=None, stride=(ph, pw))
         tokens = tokens.permute(0, 2, 3, 1).reshape(1, tpf, d_model).contiguous()
@@ -208,6 +218,18 @@ def test_standalone_layer0_probe_matches_pytorch():
         attn = attn_heads.permute(1, 0, 2).reshape(tpf, d_model).contiguous()
         attn_out = F.linear(attn, state["transformer.blocks.0.attn.out_proj.weight"])
         tokens_after_attn = tokens.reshape(tpf, d_model) + attn_out * g0
+        ctrl_hidden = F.linear(
+            F.rms_norm(tokens_after_attn, (d_model,), eps=1.0e-6),
+            state["transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight"],
+        )
+        ctrl_out = F.linear(F.silu(ctrl_hidden), state["transformer.blocks.0.ctrl_mlpfusion.fc2.weight"])
+        tokens_after_ctrl = tokens_after_attn + ctrl_out
+        mlp_in = F.rms_norm(tokens_after_ctrl, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+        mlp_out = F.linear(
+            F.silu(F.linear(mlp_in, state["transformer.blocks.0.dit_mlp.fc1.weight"])),
+            state["transformer.blocks.0.dit_mlp.fc2.weight"],
+        )
+        tokens_after_mlp = tokens_after_ctrl + mlp_out * g1
 
         assert hidden == state["denoise_step_emb.mlp.fc1.weight"].shape[0]
         _assert_close("latent", _read_dump(prefix, "latent", (1, c, h, w)), latent)
@@ -216,6 +238,9 @@ def test_standalone_layer0_probe_matches_pytorch():
         _assert_close("s0", _read_dump(prefix, "s0", (d_model,)), s0)
         _assert_close("b0", _read_dump(prefix, "b0", (d_model,)), b0)
         _assert_close("g0", _read_dump(prefix, "g0", (d_model,)), g0)
+        _assert_close("s1", _read_dump(prefix, "s1", (d_model,)), s1)
+        _assert_close("b1", _read_dump(prefix, "b1", (d_model,)), b1)
+        _assert_close("g1", _read_dump(prefix, "g1", (d_model,)), g1)
         _assert_close("norm", _read_dump(prefix, "norm", (1, tpf, d_model)), norm)
         _assert_close("q_raw", _read_dump(prefix, "q_raw", (tpf, d_model)), q_raw)
         _assert_close("k_raw", _read_dump(prefix, "k_raw", (tpf, kv_dim)), k_raw)
@@ -231,6 +256,23 @@ def test_standalone_layer0_probe_matches_pytorch():
             tokens_after_attn,
             rtol=6.0e-4,
             atol=6.0e-4,
+        )
+        _assert_close("ctrl_out", _read_dump(prefix, "ctrl_out", (tpf, d_model)), ctrl_out, rtol=6.0e-4, atol=6.0e-4)
+        _assert_close(
+            "tokens_after_ctrl",
+            _read_dump(prefix, "tokens_after_ctrl", (tpf, d_model)),
+            tokens_after_ctrl,
+            rtol=7.0e-4,
+            atol=7.0e-4,
+        )
+        _assert_close("mlp_in", _read_dump(prefix, "mlp_in", (tpf, d_model)), mlp_in, rtol=8.0e-4, atol=8.0e-4)
+        _assert_close("mlp_out", _read_dump(prefix, "mlp_out", (tpf, d_model)), mlp_out, rtol=8.0e-4, atol=8.0e-4)
+        _assert_close(
+            "tokens_after_mlp",
+            _read_dump(prefix, "tokens_after_mlp", (tpf, d_model)),
+            tokens_after_mlp,
+            rtol=1.0e-3,
+            atol=1.0e-3,
         )
 
 

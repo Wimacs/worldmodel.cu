@@ -114,6 +114,7 @@ int main(int argc, char **argv) {
     int kv_dim = cfg.n_kv_heads * d_head;
     int64_t denoise_fc1_shape[2] = {hidden, 512};
     int64_t denoise_fc2_shape[2] = {cfg.d_model, hidden};
+    int64_t hidden_d_shape[2] = {hidden, cfg.d_model};
     int64_t d_shape[1] = {cfg.d_model};
     int64_t dxd_shape[2] = {cfg.d_model, cfg.d_model};
     int64_t kv_proj_shape[2] = {kv_dim, cfg.d_model};
@@ -128,6 +129,13 @@ int main(int argc, char **argv) {
     float *layer0_k_proj_weight = NULL;
     float *layer0_v_proj_weight = NULL;
     float *layer0_out_proj_weight = NULL;
+    float *layer0_mlp_cond_s_weight = NULL;
+    float *layer0_mlp_cond_b_weight = NULL;
+    float *layer0_mlp_cond_g_weight = NULL;
+    float *layer0_ctrl_fc1_x_weight = NULL;
+    float *layer0_ctrl_fc2_weight = NULL;
+    float *layer0_dit_mlp_fc1_weight = NULL;
+    float *layer0_dit_mlp_fc2_weight = NULL;
     int rc = 1;
 
     if (load_required_f32(&st, "patchify.weight", patch_shape, 4, &patchify_weight)) {
@@ -163,6 +171,27 @@ int main(int argc, char **argv) {
     if (load_required_f32(&st, "transformer.blocks.0.attn.out_proj.weight", dxd_shape, 2, &layer0_out_proj_weight)) {
         goto cleanup;
     }
+    if (load_required_f32(&st, "transformer.blocks.0.mlp_cond_head.cond_proj.0.weight", dxd_shape, 2, &layer0_mlp_cond_s_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.mlp_cond_head.cond_proj.1.weight", dxd_shape, 2, &layer0_mlp_cond_b_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, &layer0_mlp_cond_g_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, &layer0_ctrl_fc1_x_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.ctrl_mlpfusion.fc2.weight", dxd_shape, 2, &layer0_ctrl_fc2_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.dit_mlp.fc1.weight", hidden_d_shape, 2, &layer0_dit_mlp_fc1_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "transformer.blocks.0.dit_mlp.fc2.weight", denoise_fc2_shape, 2, &layer0_dit_mlp_fc2_weight)) {
+        goto cleanup;
+    }
 
     WorldLayer0ProbeWeights layer0 = {
         patchify_weight,
@@ -176,6 +205,13 @@ int main(int argc, char **argv) {
         layer0_k_proj_weight,
         layer0_v_proj_weight,
         layer0_out_proj_weight,
+        layer0_mlp_cond_s_weight,
+        layer0_mlp_cond_b_weight,
+        layer0_mlp_cond_g_weight,
+        layer0_ctrl_fc1_x_weight,
+        layer0_ctrl_fc2_weight,
+        layer0_dit_mlp_fc1_weight,
+        layer0_dit_mlp_fc2_weight,
     };
     rc = world_cuda_layer0_probe(&cfg, &layer0, sigma, seed, dump_prefix);
 
@@ -191,6 +227,13 @@ cleanup:
     free(layer0_k_proj_weight);
     free(layer0_v_proj_weight);
     free(layer0_out_proj_weight);
+    free(layer0_mlp_cond_s_weight);
+    free(layer0_mlp_cond_b_weight);
+    free(layer0_mlp_cond_g_weight);
+    free(layer0_ctrl_fc1_x_weight);
+    free(layer0_ctrl_fc2_weight);
+    free(layer0_dit_mlp_fc1_weight);
+    free(layer0_dit_mlp_fc2_weight);
     safetensors_close(&st);
     return rc;
 }

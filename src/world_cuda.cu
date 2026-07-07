@@ -103,6 +103,38 @@ __global__ static void ada_rms_norm_single_f32_kernel(
     }
 }
 
+__global__ static void rms_norm_rows_f32_kernel(
+        const float *x,
+        float *y,
+        int rows,
+        int D,
+        float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (int64_t)row * D;
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = row_x[d];
+        sum += v * v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)D + eps);
+    float *row_y = y + (int64_t)row * D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        row_y[d] = row_x[d] * inv;
+    }
+}
+
 __global__ static void qkv_separate_rms_rope_f32_kernel(
         const float *q_raw,
         const float *k_raw,
@@ -251,6 +283,11 @@ __global__ static void gated_residual_add_f32_kernel(
     if (i >= total) return;
     int d = (int)(i % D);
     out[i] = residual[i] + update[i] * gate[d];
+}
+
+__global__ static void add_f32_kernel(const float *a, const float *b, float *out, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
 }
 
 __global__ static void patchify_f32_kernel(
@@ -539,6 +576,9 @@ extern "C" int world_cuda_layer0_probe(
     float *h_s0 = (float *)malloc((size_t)D * sizeof(float));
     float *h_b0 = (float *)malloc((size_t)D * sizeof(float));
     float *h_g0 = (float *)malloc((size_t)D * sizeof(float));
+    float *h_s1 = (float *)malloc((size_t)D * sizeof(float));
+    float *h_b1 = (float *)malloc((size_t)D * sizeof(float));
+    float *h_g1 = (float *)malloc((size_t)D * sizeof(float));
     float *h_norm = (float *)malloc(token_elems * sizeof(float));
     float *h_q_raw = (float *)malloc(token_elems * sizeof(float));
     float *h_k_raw = (float *)malloc(kv_token_elems * sizeof(float));
@@ -549,6 +589,11 @@ extern "C" int world_cuda_layer0_probe(
     float *h_attn = (float *)malloc(token_elems * sizeof(float));
     float *h_attn_out = (float *)malloc(token_elems * sizeof(float));
     float *h_tokens_after_attn = (float *)malloc(token_elems * sizeof(float));
+    float *h_ctrl_out = (float *)malloc(token_elems * sizeof(float));
+    float *h_tokens_after_ctrl = (float *)malloc(token_elems * sizeof(float));
+    float *h_mlp_in = (float *)malloc(token_elems * sizeof(float));
+    float *h_mlp_out = (float *)malloc(token_elems * sizeof(float));
+    float *h_tokens_after_mlp = (float *)malloc(token_elems * sizeof(float));
     float *h_xy = (float *)malloc((size_t)d_xy * sizeof(float));
     float *h_inv_t = (float *)malloc((size_t)d_t * sizeof(float));
     int64_t *h_x_pos = (int64_t *)malloc((size_t)T * sizeof(int64_t));
@@ -556,8 +601,10 @@ extern "C" int world_cuda_layer0_probe(
     int64_t *h_t_pos = (int64_t *)malloc((size_t)T * sizeof(int64_t));
 
     if (!h_latent || !h_noise || !h_tokens || !h_cond || !h_s0 || !h_b0 || !h_g0 ||
+        !h_s1 || !h_b1 || !h_g1 ||
         !h_norm || !h_q_raw || !h_k_raw || !h_v_raw || !h_q || !h_k || !h_v ||
         !h_attn || !h_attn_out || !h_tokens_after_attn ||
+        !h_ctrl_out || !h_tokens_after_ctrl || !h_mlp_in || !h_mlp_out || !h_tokens_after_mlp ||
         !h_xy || !h_inv_t || !h_x_pos || !h_y_pos || !h_t_pos) {
         fprintf(stderr, "host allocation failed\n");
         free(h_latent);
@@ -567,6 +614,9 @@ extern "C" int world_cuda_layer0_probe(
         free(h_s0);
         free(h_b0);
         free(h_g0);
+        free(h_s1);
+        free(h_b1);
+        free(h_g1);
         free(h_norm);
         free(h_q_raw);
         free(h_k_raw);
@@ -577,6 +627,11 @@ extern "C" int world_cuda_layer0_probe(
         free(h_attn);
         free(h_attn_out);
         free(h_tokens_after_attn);
+        free(h_ctrl_out);
+        free(h_tokens_after_ctrl);
+        free(h_mlp_in);
+        free(h_mlp_out);
+        free(h_tokens_after_mlp);
         free(h_xy);
         free(h_inv_t);
         free(h_x_pos);
@@ -601,15 +656,25 @@ extern "C" int world_cuda_layer0_probe(
     float *d_cond_s_w = NULL;
     float *d_cond_b_w = NULL;
     float *d_cond_g_w = NULL;
+    float *d_mlp_cond_s_w = NULL;
+    float *d_mlp_cond_b_w = NULL;
+    float *d_mlp_cond_g_w = NULL;
     float *d_s0 = NULL;
     float *d_b0 = NULL;
     float *d_g0 = NULL;
+    float *d_s1 = NULL;
+    float *d_b1 = NULL;
+    float *d_g1 = NULL;
     float *d_tokens = NULL;
     float *d_norm = NULL;
     float *d_q_w = NULL;
     float *d_k_w = NULL;
     float *d_v_w = NULL;
     float *d_out_w = NULL;
+    float *d_ctrl_fc1_x_w = NULL;
+    float *d_ctrl_fc2_w = NULL;
+    float *d_dit_mlp_fc1_w = NULL;
+    float *d_dit_mlp_fc2_w = NULL;
     float *d_q_raw = NULL;
     float *d_k_raw = NULL;
     float *d_v_raw = NULL;
@@ -619,6 +684,14 @@ extern "C" int world_cuda_layer0_probe(
     float *d_attn = NULL;
     float *d_attn_out = NULL;
     float *d_tokens_after_attn = NULL;
+    float *d_ctrl_norm = NULL;
+    float *d_ctrl_hidden = NULL;
+    float *d_ctrl_out = NULL;
+    float *d_tokens_after_ctrl = NULL;
+    float *d_mlp_in = NULL;
+    float *d_mlp_hidden = NULL;
+    float *d_mlp_out = NULL;
+    float *d_tokens_after_mlp = NULL;
     float *d_xy_table = NULL;
     float *d_inv_t = NULL;
     int64_t *d_x_pos = NULL;
@@ -652,6 +725,9 @@ extern "C" int world_cuda_layer0_probe(
     TRY_CUDA(cudaMalloc((void **)&d_s0, (size_t)D * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_b0, (size_t)D * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_g0, (size_t)D * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_s1, (size_t)D * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_b1, (size_t)D * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_g1, (size_t)D * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_tokens, token_elems * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_norm, token_elems * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_q_raw, token_elems * sizeof(float)));
@@ -663,6 +739,14 @@ extern "C" int world_cuda_layer0_probe(
     TRY_CUDA(cudaMalloc((void **)&d_attn, token_elems * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_attn_out, token_elems * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_tokens_after_attn, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_ctrl_norm, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_ctrl_hidden, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_ctrl_out, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_tokens_after_ctrl, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_mlp_in, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_mlp_hidden, (size_t)T * mlp_hidden * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_mlp_out, token_elems * sizeof(float)));
+    TRY_CUDA(cudaMalloc((void **)&d_tokens_after_mlp, token_elems * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_xy_table, (size_t)d_xy * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_inv_t, (size_t)d_t * sizeof(float)));
     TRY_CUDA(cudaMalloc((void **)&d_x_pos, (size_t)T * sizeof(int64_t)));
@@ -680,6 +764,13 @@ extern "C" int world_cuda_layer0_probe(
     if (copy_f32_to_device(&d_k_w, weights->layer0_k_proj_weight, (size_t)kv_dim * D)) goto cleanup_device;
     if (copy_f32_to_device(&d_v_w, weights->layer0_v_proj_weight, (size_t)kv_dim * D)) goto cleanup_device;
     if (copy_f32_to_device(&d_out_w, weights->layer0_out_proj_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_mlp_cond_s_w, weights->layer0_mlp_cond_s_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_mlp_cond_b_w, weights->layer0_mlp_cond_b_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_mlp_cond_g_w, weights->layer0_mlp_cond_g_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_ctrl_fc1_x_w, weights->layer0_ctrl_fc1_x_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_ctrl_fc2_w, weights->layer0_ctrl_fc2_weight, (size_t)D * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_dit_mlp_fc1_w, weights->layer0_dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto cleanup_device;
+    if (copy_f32_to_device(&d_dit_mlp_fc2_w, weights->layer0_dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto cleanup_device;
 
     TRY_CUDA(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA(cudaMemcpy(d_noise, h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
@@ -701,6 +792,9 @@ extern "C" int world_cuda_layer0_probe(
     TRY_LINEAR(d_cond_act, d_cond_s_w, d_s0, 1, D, D);
     TRY_LINEAR(d_cond_act, d_cond_b_w, d_b0, 1, D, D);
     TRY_LINEAR(d_cond_act, d_cond_g_w, d_g0, 1, D, D);
+    TRY_LINEAR(d_cond_act, d_mlp_cond_s_w, d_s1, 1, D, D);
+    TRY_LINEAR(d_cond_act, d_mlp_cond_b_w, d_b1, 1, D, D);
+    TRY_LINEAR(d_cond_act, d_mlp_cond_g_w, d_g1, 1, D, D);
 
     patchify_f32_kernel<<<T * D, 256>>>(d_latent, d_patch, d_tokens, C, H, W, D, ph, pw, cfg->height, cfg->width);
     TRY_CUDA(cudaGetLastError());
@@ -731,11 +825,35 @@ extern "C" int world_cuda_layer0_probe(
         d_tokens, d_attn_out, d_g0, d_tokens_after_attn, T, D);
     TRY_CUDA(cudaGetLastError());
 
+    rms_norm_rows_f32_kernel<<<T, 256>>>(d_tokens_after_attn, d_ctrl_norm, T, D, 1.0e-6f);
+    TRY_CUDA(cudaGetLastError());
+    TRY_LINEAR(d_ctrl_norm, d_ctrl_fc1_x_w, d_ctrl_hidden, T, D, D);
+    silu_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(d_ctrl_hidden, d_ctrl_hidden, token_elems);
+    TRY_CUDA(cudaGetLastError());
+    TRY_LINEAR(d_ctrl_hidden, d_ctrl_fc2_w, d_ctrl_out, T, D, D);
+    add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
+        d_tokens_after_attn, d_ctrl_out, d_tokens_after_ctrl, token_elems);
+    TRY_CUDA(cudaGetLastError());
+
+    ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens_after_ctrl, d_s1, d_b1, d_mlp_in, T, D, 1.0e-6f);
+    TRY_CUDA(cudaGetLastError());
+    TRY_LINEAR(d_mlp_in, d_dit_mlp_fc1_w, d_mlp_hidden, T, D, mlp_hidden);
+    silu_f32_kernel<<<div_up_i64((int64_t)T * mlp_hidden, 256), 256>>>(
+        d_mlp_hidden, d_mlp_hidden, (int64_t)T * mlp_hidden);
+    TRY_CUDA(cudaGetLastError());
+    TRY_LINEAR(d_mlp_hidden, d_dit_mlp_fc2_w, d_mlp_out, T, mlp_hidden, D);
+    gated_residual_add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
+        d_tokens_after_ctrl, d_mlp_out, d_g1, d_tokens_after_mlp, T, D);
+    TRY_CUDA(cudaGetLastError());
+
     TRY_CUDA(cudaMemcpy(h_tokens, d_tokens, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_cond, d_cond, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_s0, d_s0, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_b0, d_b0, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_g0, d_g0, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_s1, d_s1, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_b1, d_b1, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_g1, d_g1, (size_t)D * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_norm, d_norm, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_q_raw, d_q_raw, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_k_raw, d_k_raw, kv_token_elems * sizeof(float), cudaMemcpyDeviceToHost));
@@ -746,15 +864,23 @@ extern "C" int world_cuda_layer0_probe(
     TRY_CUDA(cudaMemcpy(h_attn, d_attn, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_attn_out, d_attn_out, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaMemcpy(h_tokens_after_attn, d_tokens_after_attn, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_ctrl_out, d_ctrl_out, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_tokens_after_ctrl, d_tokens_after_ctrl, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_mlp_in, d_mlp_in, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_mlp_out, d_mlp_out, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    TRY_CUDA(cudaMemcpy(h_tokens_after_mlp, d_tokens_after_mlp, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA(cudaDeviceSynchronize());
 
-    fprintf(stderr, "layer0 probe: sigma -> cond -> patchify -> AdaRMSNorm -> Q/K/V -> RMS+OrthoRoPE -> attention -> out_proj\n");
+    fprintf(stderr, "layer0 probe: full layer0 through attention, ctrl fusion, and DiT MLP\n");
     print_stats("latent", h_latent, (int)latent_elems);
     print_stats("tokens", h_tokens, (int)token_elems);
     print_stats("cond", h_cond, D);
     print_stats("layer0_s0", h_s0, D);
     print_stats("layer0_b0", h_b0, D);
     print_stats("layer0_g0", h_g0, D);
+    print_stats("layer0_s1", h_s1, D);
+    print_stats("layer0_b1", h_b1, D);
+    print_stats("layer0_g1", h_g1, D);
     print_stats("layer0_norm", h_norm, (int)token_elems);
     print_stats("layer0_q_raw", h_q_raw, (int)token_elems);
     print_stats("layer0_k_raw", h_k_raw, (int)kv_token_elems);
@@ -765,6 +891,11 @@ extern "C" int world_cuda_layer0_probe(
     print_stats("layer0_attn", h_attn, (int)token_elems);
     print_stats("layer0_attn_out", h_attn_out, (int)token_elems);
     print_stats("layer0_tokens_after_attn", h_tokens_after_attn, (int)token_elems);
+    print_stats("layer0_ctrl_out", h_ctrl_out, (int)token_elems);
+    print_stats("layer0_tokens_after_ctrl", h_tokens_after_ctrl, (int)token_elems);
+    print_stats("layer0_mlp_in", h_mlp_in, (int)token_elems);
+    print_stats("layer0_mlp_out", h_mlp_out, (int)token_elems);
+    print_stats("layer0_tokens_after_mlp", h_tokens_after_mlp, (int)token_elems);
 
     if (dump_f32(dump_prefix, "latent", h_latent, latent_elems) ||
         dump_f32(dump_prefix, "tokens", h_tokens, token_elems) ||
@@ -772,6 +903,9 @@ extern "C" int world_cuda_layer0_probe(
         dump_f32(dump_prefix, "s0", h_s0, (size_t)D) ||
         dump_f32(dump_prefix, "b0", h_b0, (size_t)D) ||
         dump_f32(dump_prefix, "g0", h_g0, (size_t)D) ||
+        dump_f32(dump_prefix, "s1", h_s1, (size_t)D) ||
+        dump_f32(dump_prefix, "b1", h_b1, (size_t)D) ||
+        dump_f32(dump_prefix, "g1", h_g1, (size_t)D) ||
         dump_f32(dump_prefix, "norm", h_norm, token_elems) ||
         dump_f32(dump_prefix, "q_raw", h_q_raw, token_elems) ||
         dump_f32(dump_prefix, "k_raw", h_k_raw, kv_token_elems) ||
@@ -781,7 +915,12 @@ extern "C" int world_cuda_layer0_probe(
         dump_f32(dump_prefix, "v", h_v, kv_rope_elems) ||
         dump_f32(dump_prefix, "attn", h_attn, token_elems) ||
         dump_f32(dump_prefix, "attn_out", h_attn_out, token_elems) ||
-        dump_f32(dump_prefix, "tokens_after_attn", h_tokens_after_attn, token_elems)) {
+        dump_f32(dump_prefix, "tokens_after_attn", h_tokens_after_attn, token_elems) ||
+        dump_f32(dump_prefix, "ctrl_out", h_ctrl_out, token_elems) ||
+        dump_f32(dump_prefix, "tokens_after_ctrl", h_tokens_after_ctrl, token_elems) ||
+        dump_f32(dump_prefix, "mlp_in", h_mlp_in, token_elems) ||
+        dump_f32(dump_prefix, "mlp_out", h_mlp_out, token_elems) ||
+        dump_f32(dump_prefix, "tokens_after_mlp", h_tokens_after_mlp, token_elems)) {
         goto cleanup_device;
     }
 
@@ -801,15 +940,25 @@ cleanup_device:
     cudaFree(d_cond_s_w);
     cudaFree(d_cond_b_w);
     cudaFree(d_cond_g_w);
+    cudaFree(d_mlp_cond_s_w);
+    cudaFree(d_mlp_cond_b_w);
+    cudaFree(d_mlp_cond_g_w);
     cudaFree(d_s0);
     cudaFree(d_b0);
     cudaFree(d_g0);
+    cudaFree(d_s1);
+    cudaFree(d_b1);
+    cudaFree(d_g1);
     cudaFree(d_tokens);
     cudaFree(d_norm);
     cudaFree(d_q_w);
     cudaFree(d_k_w);
     cudaFree(d_v_w);
     cudaFree(d_out_w);
+    cudaFree(d_ctrl_fc1_x_w);
+    cudaFree(d_ctrl_fc2_w);
+    cudaFree(d_dit_mlp_fc1_w);
+    cudaFree(d_dit_mlp_fc2_w);
     cudaFree(d_q_raw);
     cudaFree(d_k_raw);
     cudaFree(d_v_raw);
@@ -819,6 +968,14 @@ cleanup_device:
     cudaFree(d_attn);
     cudaFree(d_attn_out);
     cudaFree(d_tokens_after_attn);
+    cudaFree(d_ctrl_norm);
+    cudaFree(d_ctrl_hidden);
+    cudaFree(d_ctrl_out);
+    cudaFree(d_tokens_after_ctrl);
+    cudaFree(d_mlp_in);
+    cudaFree(d_mlp_hidden);
+    cudaFree(d_mlp_out);
+    cudaFree(d_tokens_after_mlp);
     cudaFree(d_xy_table);
     cudaFree(d_inv_t);
     cudaFree(d_x_pos);
@@ -836,6 +993,9 @@ cleanup_device:
     free(h_s0);
     free(h_b0);
     free(h_g0);
+    free(h_s1);
+    free(h_b1);
+    free(h_g1);
     free(h_norm);
     free(h_q_raw);
     free(h_k_raw);
@@ -846,6 +1006,11 @@ cleanup_device:
     free(h_attn);
     free(h_attn_out);
     free(h_tokens_after_attn);
+    free(h_ctrl_out);
+    free(h_tokens_after_ctrl);
+    free(h_mlp_in);
+    free(h_mlp_out);
+    free(h_tokens_after_mlp);
     free(h_xy);
     free(h_inv_t);
     free(h_x_pos);
