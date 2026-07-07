@@ -157,6 +157,9 @@ Notes:
 - Indexed cache attention now consumes the cache index count directly from GPU
   memory, avoiding a per-layer host round trip between index collection and
   attention launch.
+- The standalone transformer alternates two token buffers between layers and
+  aliases the no-controller path, removing per-layer device-to-device token
+  copies.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
   and a simple multi-frame rollout loop with cache history persisting across

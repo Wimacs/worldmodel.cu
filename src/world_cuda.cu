@@ -2389,6 +2389,8 @@ extern "C" int world_cuda_transformer_probe(
 
         patchify_f32_kernel<<<T * D, 256>>>(d_latent, d_patch, d_tokens, C, H, W, D, ph, pw, cfg->height, cfg->width);
         TRY_CUDA2(cudaGetLastError());
+        float *d_tokens_cur = d_tokens;
+        float *d_tokens_next = d_tokens_after_mlp;
 
         for (int layer_idx = 0; layer_idx < layers_to_run; ++layer_idx) {
             const DeviceWorldLayerWeights *lw = &d_layers[layer_idx];
@@ -2405,7 +2407,7 @@ extern "C" int world_cuda_transformer_probe(
             float *d_b1 = d_layer_mod + 4 * D;
             float *d_g1 = d_layer_mod + 5 * D;
 
-            ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens, d_s0, d_b0, d_norm, T, D, 1.0e-6f);
+            ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens_cur, d_s0, d_b0, d_norm, T, D, 1.0e-6f);
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_norm, lw->qkv_proj_weight, d_qkv_raw, T, D, D + 2 * kv_dim);
 
@@ -2453,9 +2455,10 @@ extern "C" int world_cuda_transformer_probe(
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_attn, lw->out_proj_weight, d_attn_out, T, D, D);
             gated_residual_add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
-                d_tokens, d_attn_out, d_g0, d_tokens_after_attn, T, D);
+                d_tokens_cur, d_attn_out, d_g0, d_tokens_after_attn, T, D);
             TRY_CUDA2(cudaGetLastError());
 
+            float *d_tokens_ctrl = d_tokens_after_attn;
             if (lw->has_ctrl) {
                 rms_norm_rows_f32_kernel<<<T, 256>>>(d_tokens_after_attn, d_ctrl_norm, T, D, 1.0e-6f);
                 TRY_CUDA2(cudaGetLastError());
@@ -2467,11 +2470,10 @@ extern "C" int world_cuda_transformer_probe(
                 add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
                     d_tokens_after_attn, d_ctrl_out, d_tokens_after_ctrl, token_elems);
                 TRY_CUDA2(cudaGetLastError());
-            } else {
-                TRY_CUDA2(cudaMemcpy(d_tokens_after_ctrl, d_tokens_after_attn, token_elems * sizeof(float), cudaMemcpyDeviceToDevice));
+                d_tokens_ctrl = d_tokens_after_ctrl;
             }
 
-            ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens_after_ctrl, d_s1, d_b1, d_mlp_in, T, D, 1.0e-6f);
+            ada_rms_norm_single_f32_kernel<<<T, 256>>>(d_tokens_ctrl, d_s1, d_b1, d_mlp_in, T, D, 1.0e-6f);
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_mlp_in, lw->dit_mlp_fc1_weight, d_mlp_hidden, T, D, mlp_hidden);
             silu_f32_kernel<<<div_up_i64((int64_t)T * mlp_hidden, 256), 256>>>(
@@ -2479,10 +2481,12 @@ extern "C" int world_cuda_transformer_probe(
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_mlp_hidden, lw->dit_mlp_fc2_weight, d_mlp_out, T, mlp_hidden, D);
             gated_residual_add_f32_kernel<<<div_up_i64(token_elems, 256), 256>>>(
-                d_tokens_after_ctrl, d_mlp_out, d_g1, d_tokens_after_mlp, T, D);
+                d_tokens_ctrl, d_mlp_out, d_g1, d_tokens_next, T, D);
             TRY_CUDA2(cudaGetLastError());
 
-            TRY_CUDA2(cudaMemcpy(d_tokens, d_tokens_after_mlp, token_elems * sizeof(float), cudaMemcpyDeviceToDevice));
+            float *d_swap = d_tokens_cur;
+            d_tokens_cur = d_tokens_next;
+            d_tokens_next = d_swap;
         }
 
         if (is_cache_pass) {
@@ -2492,7 +2496,7 @@ extern "C" int world_cuda_transformer_probe(
         silu_f32_kernel<<<div_up_i64(D, 256), 256>>>(d_cond, d_cond_act, D);
         TRY_CUDA2(cudaGetLastError());
         TRY_LINEAR2(d_cond_act, d_out_norm_w, d_out_mod, 1, D, 2 * D);
-        out_norm_silu_f32_kernel<<<T, 256>>>(d_tokens, d_out_mod, d_final_tokens, T, D, 1.0e-6f);
+        out_norm_silu_f32_kernel<<<T, 256>>>(d_tokens_cur, d_out_mod, d_final_tokens, T, D, 1.0e-6f);
         TRY_CUDA2(cudaGetLastError());
         unpatchify_orig_f32_kernel<<<T * out_dim, 256>>>(
             d_final_tokens, d_unpatch_w, d_unpatch_b, d_latent_out,
@@ -2500,7 +2504,7 @@ extern "C" int world_cuda_transformer_probe(
         TRY_CUDA2(cudaGetLastError());
 
         if (is_last_step) {
-            TRY_CUDA2(cudaMemcpy(h_tokens, d_tokens, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+            TRY_CUDA2(cudaMemcpy(h_tokens, d_tokens_cur, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
             TRY_CUDA2(cudaMemcpy(h_latent_out, d_latent_out, latent_elems * sizeof(float), cudaMemcpyDeviceToHost));
         }
 
