@@ -54,6 +54,9 @@ typedef struct {
     const float *denoise_fc2_weight;
     const WorldLayerWeights *layers;
     int n_layers;
+    const float *out_norm_fc_weight;
+    const float *unpatchify_weight;
+    const float *unpatchify_bias;
 } WorldModelProbeWeights;
 
 int world_cuda_generation_probe(

@@ -48,7 +48,8 @@ Run the current standalone transformer probe:
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and by default runs all 24 WorldDiT layers
-through the latent-token path:
+through the latent-token path, then converts the final tokens back to a latent
+velocity tensor:
 
 ```text
 sigma embedding -> denoise MLP
@@ -56,9 +57,12 @@ random latent -> patchify
 24x (cond head -> AdaRMSNorm -> Q/K/V -> RMS+OrthoRoPE -> current-frame GQA attention
      -> out projection -> gated residual add -> optional zero-control ctrl fusion
      -> MLP AdaRMSNorm -> DiT MLP -> gated residual add)
+out_norm modulation -> token RMS+SiLU -> unpatchify -> latent_out [32,32,64]
 ```
 
-Use `--layers 1` to run only the fully instrumented layer-0 parity path.
+Use `--layers 1` to run only the fully instrumented layer-0 parity path. Pass
+`--dump-prefix /tmp/world` to write binary f32 dumps such as
+`/tmp/world.latent_out.f32`.
 
 Run the standalone executable parity test against PyTorch reference math:
 
@@ -87,8 +91,9 @@ Notes:
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, 24-layer transformer token forward,
   value residual, current-frame GQA attention, optional zero-control ctrl
-  fusion, and DiT MLP. `test_standalone_probe.py` checks both the fully dumped
-  layer-0 path and a two-layer transformer loop against PyTorch reference math.
+  fusion, DiT MLP, final out_norm modulation, and unpatchify back to latent.
+  `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
+  two-layer transformer + latent output path against PyTorch reference math.
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.

@@ -326,6 +326,9 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             "patchify.weight",
             "denoise_step_emb.mlp.fc1.weight",
             "denoise_step_emb.mlp.fc2.weight",
+            "out_norm.fc.weight",
+            "unpatchify.weight",
+            "unpatchify.bias",
         ]
         for layer in range(layers):
             p = f"transformer.blocks.{layer}"
@@ -414,10 +417,24 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             )
             tokens = tokens + mlp_out * g1
 
+        mod = F.linear(F.silu(cond), state["out_norm.fc.weight"]).reshape(2, d_model)
+        final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + mod[0]) + mod[1])
+        unpatch_w = state["unpatchify.weight"].permute(1, 2, 3, 0).reshape(c * ph * pw, d_model).contiguous()
+        unpatch_b = state["unpatchify.bias"][:, None, None].expand(c, ph, pw).reshape(c * ph * pw).contiguous()
+        latent_out = F.linear(final_tokens, unpatch_w, unpatch_b)
+        latent_out = latent_out.view(height, width, c, ph, pw).permute(2, 0, 3, 1, 4).reshape(c, h, w).contiguous()
+
         _assert_close(
             "transformer_tokens_2_layers",
             _read_dump(prefix, "transformer_tokens", (tpf, d_model)),
             tokens,
+            rtol=1.2e-3,
+            atol=1.2e-3,
+        )
+        _assert_close(
+            "latent_out_2_layers",
+            _read_dump(prefix, "latent_out", (c, h, w)),
+            latent_out,
             rtol=1.2e-3,
             atol=1.2e-3,
         )

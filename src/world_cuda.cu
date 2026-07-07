@@ -135,6 +135,41 @@ __global__ static void rms_norm_rows_f32_kernel(
     }
 }
 
+__global__ static void out_norm_silu_f32_kernel(
+        const float *tokens,
+        const float *mod,
+        float *out,
+        int rows,
+        int D,
+        float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = tokens + (int64_t)row * D;
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = row_x[d];
+        sum += v * v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)D + eps);
+    float *row_y = out + (int64_t)row * D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float a = mod[d];
+        float b = mod[D + d];
+        row_y[d] = wm_silu(row_x[d] * inv * (1.0f + a) + b);
+    }
+}
+
 __global__ static void qkv_separate_rms_rope_f32_kernel(
         const float *q_raw,
         const float *k_raw,
@@ -338,6 +373,57 @@ __global__ static void patchify_f32_kernel(
         __syncthreads();
     }
     if (tid == 0) tokens[token * D + d] = red[0];
+}
+
+__global__ static void unpatchify_orig_f32_kernel(
+        const float *tokens,
+        const float *weight,
+        const float *bias,
+        float *x,
+        int T,
+        int D,
+        int C,
+        int H,
+        int W,
+        int ph,
+        int pw,
+        int Wp,
+        int out_dim) {
+    __shared__ float red[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int o = row % out_dim;
+    int token = row / out_dim;
+
+    int p = o;
+    int dx = p % pw;
+    p /= pw;
+    int dy = p % ph;
+    p /= ph;
+    int c = p;
+
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float wv = weight[(((int64_t)d * C + c) * ph + dy) * pw + dx];
+        sum += tokens[(int64_t)token * D + d] * wv;
+    }
+
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int oy = token / Wp;
+        int ox = token - oy * Wp;
+        int iy = oy * ph + dy;
+        int ix = ox * pw + dx;
+        x[(c * H + iy) * W + ix] = red[0] + bias[c];
+    }
 }
 
 static uint32_t lcg_next(uint32_t *state) {
@@ -1056,20 +1142,25 @@ extern "C" int world_cuda_transformer_probe(
     size_t kv_token_elems = (size_t)T * kv_dim;
     size_t q_rope_elems = (size_t)cfg->n_heads * T * d_head;
     size_t kv_rope_elems = (size_t)cfg->n_kv_heads * T * d_head;
+    size_t out_norm_weight_elems = (size_t)2 * D * D;
+    size_t unpatch_weight_elems = (size_t)D * C * ph * pw;
+    int out_dim = C * ph * pw;
 
     float *h_latent = (float *)malloc(latent_elems * sizeof(float));
     float *h_noise = (float *)malloc(512 * sizeof(float));
     float *h_tokens = (float *)malloc(token_elems * sizeof(float));
+    float *h_latent_out = (float *)malloc(latent_elems * sizeof(float));
     float *h_xy = (float *)malloc((size_t)d_xy * sizeof(float));
     float *h_inv_t = (float *)malloc((size_t)d_t * sizeof(float));
     int64_t *h_x_pos = (int64_t *)malloc((size_t)T * sizeof(int64_t));
     int64_t *h_y_pos = (int64_t *)malloc((size_t)T * sizeof(int64_t));
     int64_t *h_t_pos = (int64_t *)malloc((size_t)T * sizeof(int64_t));
-    if (!h_latent || !h_noise || !h_tokens || !h_xy || !h_inv_t || !h_x_pos || !h_y_pos || !h_t_pos) {
+    if (!h_latent || !h_noise || !h_tokens || !h_latent_out || !h_xy || !h_inv_t || !h_x_pos || !h_y_pos || !h_t_pos) {
         fprintf(stderr, "host allocation failed\n");
         free(h_latent);
         free(h_noise);
         free(h_tokens);
+        free(h_latent_out);
         free(h_xy);
         free(h_inv_t);
         free(h_x_pos);
@@ -1090,6 +1181,12 @@ extern "C" int world_cuda_transformer_probe(
     float *d_cond_act = NULL;
     float *d_denoise_fc1 = NULL;
     float *d_denoise_fc2 = NULL;
+    float *d_out_norm_w = NULL;
+    float *d_out_mod = NULL;
+    float *d_final_tokens = NULL;
+    float *d_unpatch_w = NULL;
+    float *d_unpatch_b = NULL;
+    float *d_latent_out = NULL;
     float *d_cond_bias = NULL;
     float *d_cond_s_w = NULL;
     float *d_cond_b_w = NULL;
@@ -1178,6 +1275,9 @@ extern "C" int world_cuda_transformer_probe(
     TRY_CUDA2(cudaMalloc((void **)&d_noise_hidden, (size_t)mlp_hidden * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_cond, (size_t)D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_cond_act, (size_t)D * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_out_mod, (size_t)2 * D * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_final_tokens, token_elems * sizeof(float)));
+    TRY_CUDA2(cudaMalloc((void **)&d_latent_out, latent_elems * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_s0, (size_t)D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_b0, (size_t)D * sizeof(float)));
     TRY_CUDA2(cudaMalloc((void **)&d_g0, (size_t)D * sizeof(float)));
@@ -1213,6 +1313,9 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_f32_to_device(&d_patch, weights->patchify_weight, patch_weight_elems)) goto cleanup_device;
     if (copy_f32_to_device(&d_denoise_fc1, weights->denoise_fc1_weight, (size_t)mlp_hidden * 512)) goto cleanup_device;
     if (copy_f32_to_device(&d_denoise_fc2, weights->denoise_fc2_weight, (size_t)D * mlp_hidden)) goto cleanup_device;
+    if (copy_f32_to_device(&d_out_norm_w, weights->out_norm_fc_weight, out_norm_weight_elems)) goto cleanup_device;
+    if (copy_f32_to_device(&d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto cleanup_device;
+    if (copy_f32_to_device(&d_unpatch_b, weights->unpatchify_bias, (size_t)C)) goto cleanup_device;
 
     TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_noise, h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
@@ -1329,10 +1432,22 @@ extern "C" int world_cuda_transformer_probe(
     }
 
     TRY_CUDA2(cudaMemcpy(h_tokens, d_tokens, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
+    silu_f32_kernel<<<div_up_i64(D, 256), 256>>>(d_cond, d_cond_act, D);
+    TRY_CUDA2(cudaGetLastError());
+    TRY_LINEAR2(d_cond_act, d_out_norm_w, d_out_mod, 1, D, 2 * D);
+    out_norm_silu_f32_kernel<<<T, 256>>>(d_tokens, d_out_mod, d_final_tokens, T, D, 1.0e-6f);
+    TRY_CUDA2(cudaGetLastError());
+    unpatchify_orig_f32_kernel<<<T * out_dim, 256>>>(
+        d_final_tokens, d_unpatch_w, d_unpatch_b, d_latent_out,
+        T, D, C, H, W, ph, pw, cfg->width, out_dim);
+    TRY_CUDA2(cudaGetLastError());
+    TRY_CUDA2(cudaMemcpy(h_latent_out, d_latent_out, latent_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA2(cudaDeviceSynchronize());
     fprintf(stderr, "transformer probe: completed %d layers\n", layers_to_run);
     print_stats("transformer_tokens", h_tokens, (int)token_elems);
-    if (dump_f32(dump_prefix, "transformer_tokens", h_tokens, token_elems)) goto cleanup_device;
+    print_stats("latent_out", h_latent_out, (int)latent_elems);
+    if (dump_f32(dump_prefix, "transformer_tokens", h_tokens, token_elems) ||
+        dump_f32(dump_prefix, "latent_out", h_latent_out, latent_elems)) goto cleanup_device;
     rc = 0;
 
 cleanup_device:
@@ -1346,6 +1461,12 @@ cleanup_device:
     cudaFree(d_cond_act);
     cudaFree(d_denoise_fc1);
     cudaFree(d_denoise_fc2);
+    cudaFree(d_out_norm_w);
+    cudaFree(d_out_mod);
+    cudaFree(d_final_tokens);
+    cudaFree(d_unpatch_w);
+    cudaFree(d_unpatch_b);
+    cudaFree(d_latent_out);
     cudaFree(d_s0);
     cudaFree(d_b0);
     cudaFree(d_g0);
@@ -1386,6 +1507,7 @@ cleanup_device:
     free(h_latent);
     free(h_noise);
     free(h_tokens);
+    free(h_latent_out);
     free(h_xy);
     free(h_inv_t);
     free(h_x_pos);

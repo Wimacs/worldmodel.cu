@@ -171,10 +171,15 @@ int main(int argc, char **argv) {
     int64_t hidden_d_shape[2] = {hidden, cfg.d_model};
     int64_t d_shape[1] = {cfg.d_model};
     int64_t dxd_shape[2] = {cfg.d_model, cfg.d_model};
+    int64_t out_norm_shape[2] = {cfg.d_model * 2, cfg.d_model};
     int64_t kv_proj_shape[2] = {kv_dim, cfg.d_model};
+    int64_t unpatch_bias_shape[1] = {cfg.channels};
     float *patchify_weight = NULL;
     float *denoise_fc1_weight = NULL;
     float *denoise_fc2_weight = NULL;
+    float *out_norm_fc_weight = NULL;
+    float *unpatchify_weight = NULL;
+    float *unpatchify_bias = NULL;
     float *layer0_cond_bias = NULL;
     float *layer0_attn_cond_s_weight = NULL;
     float *layer0_attn_cond_b_weight = NULL;
@@ -204,6 +209,15 @@ int main(int argc, char **argv) {
     }
 
     if (layers_to_run != 1) {
+        if (load_required_f32(&st, "out_norm.fc.weight", out_norm_shape, 2, &out_norm_fc_weight)) {
+            goto cleanup;
+        }
+        if (load_required_f32(&st, "unpatchify.weight", patch_shape, 4, &unpatchify_weight)) {
+            goto cleanup;
+        }
+        if (load_required_f32(&st, "unpatchify.bias", unpatch_bias_shape, 1, &unpatchify_bias)) {
+            goto cleanup;
+        }
         layers = (WorldLayerWeights *)calloc((size_t)layers_to_run, sizeof(*layers));
         if (!layers) {
             fprintf(stderr, "failed to allocate layer weights\n");
@@ -235,6 +249,9 @@ int main(int argc, char **argv) {
             denoise_fc2_weight,
             layers,
             layers_to_run,
+            out_norm_fc_weight,
+            unpatchify_weight,
+            unpatchify_bias,
         };
         rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, sigma, seed, dump_prefix);
         goto cleanup;
@@ -312,6 +329,9 @@ cleanup:
     free(patchify_weight);
     free(denoise_fc1_weight);
     free(denoise_fc2_weight);
+    free(out_norm_fc_weight);
+    free(unpatchify_weight);
+    free(unpatchify_bias);
     free(layer0_cond_bias);
     free(layer0_attn_cond_s_weight);
     free(layer0_attn_cond_b_weight);
