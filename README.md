@@ -45,6 +45,9 @@ Run the current standalone image probe:
 ./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
+Pass `--control controls.f32` to provide one little-endian float32 controller
+vector of length `n_buttons + 3`; if omitted, the executable uses zeros.
+
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and runs the scheduler through the WorldDiT
@@ -65,7 +68,7 @@ expands the final latent to a `1024x512` RGB frame:
 sigma embedding -> denoise MLP
 random latent -> patchify
 24x (cond head -> AdaRMSNorm -> Q/K/V -> RMS+OrthoRoPE -> current-frame GQA attention
-     -> out projection -> gated residual add -> optional zero-control ctrl fusion
+     -> out projection -> gated residual add -> optional controller ctrl fusion
      -> MLP AdaRMSNorm -> DiT MLP -> gated residual add)
 out_norm modulation -> token RMS+SiLU -> unpatchify -> latent_out [32,32,64]
 latent += (next_sigma - sigma) * latent_out
@@ -102,9 +105,9 @@ Notes:
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
   patchify, arrayized layer weight loading, resident GPU layer weights,
-  24-layer transformer token forward,
-  value residual, current-frame GQA attention, optional zero-control ctrl
-  fusion, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
+  controller input loading, controller embedding, 24-layer transformer token
+  forward, value residual, current-frame GQA attention, optional ctrl fusion
+  with `fc1_x + fc1_c`, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
   conversion, TAEHV direct conv/MemBlock/TGrow/upsample decode, pixel shuffle,
   and 4-frame PPM output.

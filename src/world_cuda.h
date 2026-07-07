@@ -64,6 +64,9 @@ typedef struct {
     const float *patchify_weight;
     const float *denoise_fc1_weight;
     const float *denoise_fc2_weight;
+    const float *ctrl_emb_fc1_weight;
+    const float *ctrl_emb_fc2_weight;
+    const float *control_input;
     const float *layer0_cond_bias;
     const float *layer0_attn_cond_s_weight;
     const float *layer0_attn_cond_b_weight;
@@ -76,6 +79,7 @@ typedef struct {
     const float *layer0_mlp_cond_b_weight;
     const float *layer0_mlp_cond_g_weight;
     const float *layer0_ctrl_fc1_x_weight;
+    const float *layer0_ctrl_fc1_c_weight;
     const float *layer0_ctrl_fc2_weight;
     const float *layer0_dit_mlp_fc1_weight;
     const float *layer0_dit_mlp_fc2_weight;
@@ -95,6 +99,7 @@ typedef struct {
     const float *mlp_cond_b_weight;
     const float *mlp_cond_g_weight;
     const float *ctrl_fc1_x_weight;
+    const float *ctrl_fc1_c_weight;
     const float *ctrl_fc2_weight;
     const float *dit_mlp_fc1_weight;
     const float *dit_mlp_fc2_weight;
@@ -105,6 +110,9 @@ typedef struct {
     const float *patchify_weight;
     const float *denoise_fc1_weight;
     const float *denoise_fc2_weight;
+    const float *ctrl_emb_fc1_weight;
+    const float *ctrl_emb_fc2_weight;
+    const float *control_input;
     const WorldLayerWeights *layers;
     int n_layers;
     const float *out_norm_fc_weight;

@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -103,6 +103,32 @@ static int load_optional_layer_f32(const SafeTensors *st, int layer, const char 
     return load_optional_f32(st, name, shape, ndim, out);
 }
 
+static int read_f32_file_exact(const char *path, size_t elems, float **out) {
+    *out = NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "failed to open f32 file: %s\n", path);
+        return 1;
+    }
+    float *data = (float *)malloc(elems * sizeof(float));
+    if (!data) {
+        fclose(f);
+        fprintf(stderr, "failed to allocate f32 file buffer\n");
+        return 1;
+    }
+    size_t got = fread(data, sizeof(float), elems, f);
+    int extra = fgetc(f);
+    fclose(f);
+    if (got != elems || extra != EOF) {
+        fprintf(stderr, "expected %zu f32 values in %s, got %zu%s\n",
+                elems, path, got, extra == EOF ? "" : "+");
+        free(data);
+        return 1;
+    }
+    *out = data;
+    return 0;
+}
+
 static void free_layer_weights(WorldLayerWeights *layers, int n_layers) {
     if (!layers) return;
     for (int i = 0; i < n_layers; ++i) {
@@ -119,6 +145,7 @@ static void free_layer_weights(WorldLayerWeights *layers, int n_layers) {
         free((void *)layers[i].mlp_cond_b_weight);
         free((void *)layers[i].mlp_cond_g_weight);
         free((void *)layers[i].ctrl_fc1_x_weight);
+        free((void *)layers[i].ctrl_fc1_c_weight);
         free((void *)layers[i].ctrl_fc2_weight);
         free((void *)layers[i].dit_mlp_fc1_weight);
         free((void *)layers[i].dit_mlp_fc2_weight);
@@ -220,6 +247,7 @@ int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
     const char *vae_weights = NULL;
+    const char *control_path = NULL;
     const char *dump_prefix = NULL;
     const char *out_path = NULL;
     unsigned int seed = 1234;
@@ -234,6 +262,8 @@ int main(int argc, char **argv) {
             weights = argv[++i];
         } else if (strcmp(argv[i], "--vae-weights") == 0 && i + 1 < argc) {
             vae_weights = argv[++i];
+        } else if (strcmp(argv[i], "--control") == 0 && i + 1 < argc) {
+            control_path = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
@@ -301,8 +331,11 @@ int main(int argc, char **argv) {
     int hidden = cfg.d_model * cfg.mlp_ratio;
     int d_head = cfg.d_model / cfg.n_heads;
     int kv_dim = cfg.n_kv_heads * d_head;
+    int ctrl_dim = cfg.n_buttons + 3;
     int64_t denoise_fc1_shape[2] = {hidden, 512};
     int64_t denoise_fc2_shape[2] = {cfg.d_model, hidden};
+    int64_t ctrl_emb_fc1_shape[2] = {hidden, ctrl_dim};
+    int64_t ctrl_emb_fc2_shape[2] = {cfg.d_model, hidden};
     int64_t hidden_d_shape[2] = {hidden, cfg.d_model};
     int64_t d_shape[1] = {cfg.d_model};
     int64_t dxd_shape[2] = {cfg.d_model, cfg.d_model};
@@ -312,6 +345,9 @@ int main(int argc, char **argv) {
     float *patchify_weight = NULL;
     float *denoise_fc1_weight = NULL;
     float *denoise_fc2_weight = NULL;
+    float *ctrl_emb_fc1_weight = NULL;
+    float *ctrl_emb_fc2_weight = NULL;
+    float *control_input = NULL;
     float *out_norm_fc_weight = NULL;
     float *unpatchify_weight = NULL;
     float *unpatchify_bias = NULL;
@@ -327,6 +363,7 @@ int main(int argc, char **argv) {
     float *layer0_mlp_cond_b_weight = NULL;
     float *layer0_mlp_cond_g_weight = NULL;
     float *layer0_ctrl_fc1_x_weight = NULL;
+    float *layer0_ctrl_fc1_c_weight = NULL;
     float *layer0_ctrl_fc2_weight = NULL;
     float *layer0_dit_mlp_fc1_weight = NULL;
     float *layer0_dit_mlp_fc2_weight = NULL;
@@ -339,6 +376,16 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    if (control_path) {
+        if (read_f32_file_exact(control_path, (size_t)ctrl_dim, &control_input)) goto cleanup;
+    } else {
+        control_input = (float *)calloc((size_t)ctrl_dim, sizeof(float));
+        if (!control_input) {
+            fprintf(stderr, "failed to allocate zero control input\n");
+            goto cleanup;
+        }
+    }
+
     if (load_required_f32(&st, "patchify.weight", patch_shape, 4, &patchify_weight)) {
         goto cleanup;
     }
@@ -346,6 +393,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     if (load_required_f32(&st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &denoise_fc2_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &ctrl_emb_fc1_weight)) {
+        goto cleanup;
+    }
+    if (load_required_f32(&st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &ctrl_emb_fc2_weight)) {
         goto cleanup;
     }
 
@@ -380,6 +433,7 @@ int main(int argc, char **argv) {
             if (load_layer_f32(&st, layer, "mlp_cond_head.cond_proj.2.weight", dxd_shape, 2, (float **)&lw->mlp_cond_g_weight)) goto cleanup;
             if (load_optional_layer_f32(&st, layer, "ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_x_weight)) goto cleanup;
             lw->has_ctrl = lw->ctrl_fc1_x_weight != NULL;
+            if (lw->has_ctrl && load_layer_f32(&st, layer, "ctrl_mlpfusion.fc1_c.weight", dxd_shape, 2, (float **)&lw->ctrl_fc1_c_weight)) goto cleanup;
             if (lw->has_ctrl && load_layer_f32(&st, layer, "ctrl_mlpfusion.fc2.weight", dxd_shape, 2, (float **)&lw->ctrl_fc2_weight)) goto cleanup;
             if (load_layer_f32(&st, layer, "dit_mlp.fc1.weight", hidden_d_shape, 2, (float **)&lw->dit_mlp_fc1_weight)) goto cleanup;
             if (load_layer_f32(&st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) goto cleanup;
@@ -388,6 +442,9 @@ int main(int argc, char **argv) {
             patchify_weight,
             denoise_fc1_weight,
             denoise_fc2_weight,
+            ctrl_emb_fc1_weight,
+            ctrl_emb_fc2_weight,
+            control_input,
             layers,
             layers_to_run,
             out_norm_fc_weight,
@@ -434,6 +491,9 @@ int main(int argc, char **argv) {
     if (load_required_f32(&st, "transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight", dxd_shape, 2, &layer0_ctrl_fc1_x_weight)) {
         goto cleanup;
     }
+    if (load_required_f32(&st, "transformer.blocks.0.ctrl_mlpfusion.fc1_c.weight", dxd_shape, 2, &layer0_ctrl_fc1_c_weight)) {
+        goto cleanup;
+    }
     if (load_required_f32(&st, "transformer.blocks.0.ctrl_mlpfusion.fc2.weight", dxd_shape, 2, &layer0_ctrl_fc2_weight)) {
         goto cleanup;
     }
@@ -448,6 +508,9 @@ int main(int argc, char **argv) {
         patchify_weight,
         denoise_fc1_weight,
         denoise_fc2_weight,
+        ctrl_emb_fc1_weight,
+        ctrl_emb_fc2_weight,
+        control_input,
         layer0_cond_bias,
         layer0_attn_cond_s_weight,
         layer0_attn_cond_b_weight,
@@ -460,6 +523,7 @@ int main(int argc, char **argv) {
         layer0_mlp_cond_b_weight,
         layer0_mlp_cond_g_weight,
         layer0_ctrl_fc1_x_weight,
+        layer0_ctrl_fc1_c_weight,
         layer0_ctrl_fc2_weight,
         layer0_dit_mlp_fc1_weight,
         layer0_dit_mlp_fc2_weight,
@@ -470,6 +534,9 @@ cleanup:
     free(patchify_weight);
     free(denoise_fc1_weight);
     free(denoise_fc2_weight);
+    free(ctrl_emb_fc1_weight);
+    free(ctrl_emb_fc2_weight);
+    free(control_input);
     free(out_norm_fc_weight);
     free(unpatchify_weight);
     free(unpatchify_bias);
@@ -485,6 +552,7 @@ cleanup:
     free(layer0_mlp_cond_b_weight);
     free(layer0_mlp_cond_g_weight);
     free(layer0_ctrl_fc1_x_weight);
+    free(layer0_ctrl_fc1_c_weight);
     free(layer0_ctrl_fc2_weight);
     free(layer0_dit_mlp_fc1_weight);
     free(layer0_dit_mlp_fc2_weight);
