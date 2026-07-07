@@ -53,7 +53,7 @@ python export_seed_latent.py \
 ./build/worldmodel_raylib \
   --model-dir ../Waypoint-1.5-1B \
   --steps 4 \
-  --cache-window 1 \
+  --cache-window 2 \
   --seed-latent /tmp/world_seed_latent.f32
 ```
 
@@ -69,20 +69,24 @@ For terminal-only validation of the same resident runtime path:
 ./build/worldmodel_raylib \
   --model-dir ../Waypoint-1.5-1B \
   --steps 4 \
-  --cache-window 1 \
+  --cache-window 2 \
   --seed-latent /tmp/world_seed_latent.f32 \
   --headless-smoke
 ```
 
 For a lower-latency interactive mode, use the fast realtime preset. It uses one
-scheduler step and clamps both local/global KV cache windows to one frame chunk:
+scheduler step and clamps both local/global KV cache windows to two frame chunks:
 
 ```sh
 ./build/worldmodel_raylib --model-dir ../Waypoint-1.5-1B --fast-realtime
 ```
 
 `--cache-window N` can be used independently to trade temporal history for
-latency. On an RTX 4090 D, `--fast-realtime --warmup 8 --headless-smoke`
+latency. `--cache-window 1` is a debug-only minimum-latency mode: the current
+ring slot is masked during attention, so no previous-frame history is visible
+and rollout looks like a fresh sample every frame. Use `--cache-window 2` or
+higher for interactive control. On an RTX 4090 D, `--fast-realtime --warmup 8
+--headless-smoke`
 stabilizes around 100-111 ms per decoded 4-frame RGB chunk, about 36-40 RGB fps.
 The full `--steps 4` path keeps the quality-oriented schedule and longer cache,
 but FPS drops as cache history grows.

@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
     if (world_config_load(&cfg, config_path)) return 1;
     if (fast_realtime) {
         if (steps_to_run < 0) steps_to_run = 1;
-        if (cache_window_override < 0) cache_window_override = 1;
+        if (cache_window_override < 0) cache_window_override = 2;
     }
     if (cache_window_override > 0) {
         cfg.local_window = cache_window_override;
@@ -334,6 +334,10 @@ int main(int argc, char **argv) {
         cfg.global_pinned_dilation = 1;
         fprintf(stderr, "realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
                 cfg.local_window, cfg.global_window);
+        if (cache_window_override == 1) {
+            fprintf(stderr,
+                    "warning: --cache-window 1 masks the current ring slot and leaves no previous-frame history; use --cache-window 2 or higher for controllable rollout\n");
+        }
     }
     if (layers_to_run < 0) layers_to_run = cfg.n_layers;
     if (steps_to_run < 0) steps_to_run = cfg.scheduler_sigmas_count - 1;

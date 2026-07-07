@@ -2374,6 +2374,10 @@ extern "C" int world_cuda_runtime_step_rgb(
     STEP_CUDA(cudaEventElapsedTime(&transformer_ms, rt->ev_after_setup, rt->ev_after_transformer));
     STEP_CUDA(cudaEventElapsedTime(&vae_ms, rt->ev_after_transformer, rt->ev_after_vae));
     STEP_CUDA(cudaEventElapsedTime(&total_ms, rt->ev_step_start, rt->ev_after_vae));
+    int cache_tokens_l0 = -1;
+    if (rt->layers_to_run > 0) {
+        STEP_CUDA(cudaMemcpy(&cache_tokens_l0, rt->d_caches[0].index_count, sizeof(int), cudaMemcpyDeviceToHost));
+    }
     rt->frame_ordinal += 1;
     rt->next_frame_idx += 1;
     if (seconds_out) *seconds_out = (float)(monotonic_seconds() - t0);
@@ -2381,10 +2385,12 @@ extern "C" int world_cuda_runtime_step_rgb(
         int frames = frames_out ? *frames_out : 4;
         float total_s = total_ms * 1.0e-3f;
         fprintf(stderr,
-                "live timing: setup=%.3fms transformer=%.3fms vae=%.3fms total=%.3fms chunk_fps=%.3f rgb_fps=%.3f\n",
+                "live timing: setup=%.3fms transformer=%.3fms vae=%.3fms total=%.3fms chunk_fps=%.3f rgb_fps=%.3f cache_tokens_l0=%d cache_frames_l0=%.1f\n",
                 setup_ms, transformer_ms, vae_ms, total_ms,
                 total_s > 0.0f ? 1.0f / total_s : 0.0f,
-                total_s > 0.0f ? (float)frames / total_s : 0.0f);
+                total_s > 0.0f ? (float)frames / total_s : 0.0f,
+                cache_tokens_l0,
+                (rt->T > 0 && cache_tokens_l0 >= 0) ? (float)cache_tokens_l0 / (float)rt->T : -1.0f);
     }
 #undef STEP_CUDA
 #undef STEP_LINEAR
