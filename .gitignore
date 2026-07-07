@@ -1,4 +1,5 @@
 .torch_extensions/
+build/
 __pycache__/
 *.pyc
 smoke_latent*.pt
