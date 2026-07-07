@@ -48,7 +48,9 @@ Run the current standalone image probe:
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
 loads the real transformer weights, and runs the scheduler through the WorldDiT
-path. If `--out` is provided, it also reads
+path. The standalone transformer copies all requested layer weights to GPU once
+per run, then reuses those resident weights across scheduler steps. If `--out`
+is provided, it also reads
 `vae/diffusion_pytorch_model.safetensors`, decodes the final latent with the
 TAEHV decoder, writes the first decoded RGB frame to the requested PPM path,
 and writes the full decoded 4-frame chunk as sibling files such as
@@ -99,7 +101,8 @@ Notes:
 - Kernels currently target float32 parity first.
 - `worldmodel_cuda` is the no-PyTorch path. At this milestone it verifies
   config parsing, safetensors loading, device allocation, denoise conditioning,
-  patchify, arrayized layer weight loading, 24-layer transformer token forward,
+  patchify, arrayized layer weight loading, resident GPU layer weights,
+  24-layer transformer token forward,
   value residual, current-frame GQA attention, optional zero-control ctrl
   fusion, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
   scheduler latent updates through the config sigma schedule, F16 VAE weight
