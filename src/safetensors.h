@@ -27,6 +27,7 @@ void safetensors_close(SafeTensors *st);
 const SafeTensorEntry *safetensors_find(const SafeTensors *st, const char *name);
 size_t safetensors_dtype_size(const char *dtype);
 int safetensors_read_tensor(const SafeTensors *st, const SafeTensorEntry *entry, void **data_out, size_t *bytes_out);
+int safetensors_read_tensor_f32(const SafeTensors *st, const SafeTensorEntry *entry, float **data_out, size_t *elems_out);
 void safetensors_print_entry(const SafeTensorEntry *entry);
 
 #endif

@@ -1,5 +1,6 @@
 import math
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from safetensors import safe_open
+from safetensors.torch import load_file
 
 try:
     import pytest
@@ -22,6 +24,8 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT.parent / "Waypoint-1.5-1B"
 WEIGHTS_PATH = MODEL_DIR / "transformer" / "diffusion_pytorch_model.safetensors"
+VAE_DIR = MODEL_DIR / "vae"
+VAE_WEIGHTS_PATH = VAE_DIR / "diffusion_pytorch_model.safetensors"
 
 
 def _load_config():
@@ -58,6 +62,20 @@ def _read_dump(prefix, name, shape):
     if arr.size != expected:
         raise AssertionError(f"{path.name}: expected {expected} floats, got {arr.size}")
     return torch.from_numpy(arr.reshape(shape).copy())
+
+
+def _read_ppm(path):
+    data = Path(path).read_bytes()
+    magic, width, height, maxval, body = data.split(None, 4)
+    if magic != b"P6" or maxval != b"255":
+        raise AssertionError(f"unsupported PPM header in {path}")
+    width = int(width)
+    height = int(height)
+    arr = np.frombuffer(body, dtype=np.uint8)
+    expected = width * height * 3
+    if arr.size != expected:
+        raise AssertionError(f"{path}: expected {expected} bytes, got {arr.size}")
+    return arr.reshape(height, width, 3).copy()
 
 
 def _load_required_tensors(names, device):
@@ -283,6 +301,8 @@ def test_standalone_two_layer_transformer_matches_pytorch():
         pytest.skip("CUDA is required")
     if not WEIGHTS_PATH.exists():
         pytest.skip(f"missing Waypoint weights: {WEIGHTS_PATH}")
+    if not VAE_WEIGHTS_PATH.exists():
+        pytest.skip(f"missing Waypoint VAE weights: {VAE_WEIGHTS_PATH}")
 
     cfg = _load_config()
     exe = _build_executable()
@@ -293,6 +313,7 @@ def test_standalone_two_layer_transformer_matches_pytorch():
 
     with tempfile.TemporaryDirectory(prefix="world_transformer2_probe_") as td:
         prefix = str(Path(td) / "dump")
+        out_path = str(Path(td) / "out.ppm")
         subprocess.run(
             [
                 str(exe),
@@ -308,6 +329,8 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 "1",
                 "--dump-prefix",
                 prefix,
+                "--out",
+                out_path,
             ],
             check=True,
             cwd=str(ROOT),
@@ -449,6 +472,35 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             rtol=1.2e-3,
             atol=1.2e-3,
         )
+
+        sys.path.insert(0, str(VAE_DIR))
+        from ae_model import ChunkedStreamingTAEHV, _apply_parallel
+
+        vae = ChunkedStreamingTAEHV.from_config(str(VAE_DIR / "config.json"))
+        vae.load_state_dict(load_file(str(VAE_WEIGHTS_PATH), device="cpu"), strict=True)
+        vae.eval().to(device=device, dtype=torch.float32)
+        with torch.inference_mode():
+            z4 = latent_final[None, None].repeat(1, 4, 1, 1, 1)
+            decoded = _apply_parallel(vae.decoder, z4)
+            n, tt, cc, hh, ww = decoded.shape
+            decoded = vae._postprocess_output_frames(decoded.reshape(n * tt, cc, hh, ww))
+            decoded = decoded.view(n, tt, 3, hh * 2, ww * 2)
+            ref_rgb = (
+                decoded[:, -4:]
+                .squeeze(0)
+                .permute(0, 2, 3, 1)[..., :3]
+                .clamp(0, 1)
+                .mul(255)
+                .round()
+                .to(torch.uint8)
+                .cpu()
+                .numpy()
+            )
+        actual_rgb = _read_ppm(out_path)
+        diff = np.abs(actual_rgb.astype(np.int16) - ref_rgb[0].astype(np.int16))
+        if diff.max() > 3 or diff.mean() > 0.2:
+            raise AssertionError(f"vae_decode_ppm max_diff={diff.max()} mean_diff={diff.mean():.6f}")
+        print(f"vae_decode_ppm: ok max_abs={diff.max()} mean_abs={diff.mean():.6g}")
 
 
 if __name__ == "__main__":

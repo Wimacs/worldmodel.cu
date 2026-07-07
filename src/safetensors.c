@@ -246,6 +246,40 @@ size_t safetensors_dtype_size(const char *dtype) {
     return 0;
 }
 
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1fu) {
+        bits = sign | 0x7f800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static float bf16_to_f32(uint16_t h) {
+    uint32_t bits = (uint32_t)h << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
 int safetensors_read_tensor(const SafeTensors *st, const SafeTensorEntry *entry, void **data_out, size_t *bytes_out) {
     *data_out = NULL;
     *bytes_out = 0;
@@ -276,6 +310,47 @@ int safetensors_read_tensor(const SafeTensors *st, const SafeTensorEntry *entry,
     }
     *data_out = data;
     *bytes_out = bytes;
+    return 0;
+}
+
+int safetensors_read_tensor_f32(const SafeTensors *st, const SafeTensorEntry *entry, float **data_out, size_t *elems_out) {
+    *data_out = NULL;
+    *elems_out = 0;
+    if (!entry) return 1;
+
+    void *raw = NULL;
+    size_t bytes = 0;
+    if (safetensors_read_tensor(st, entry, &raw, &bytes)) return 1;
+
+    size_t dtype_size = safetensors_dtype_size(entry->dtype);
+    if (dtype_size == 0 || bytes % dtype_size != 0) {
+        free(raw);
+        return 1;
+    }
+    size_t elems = bytes / dtype_size;
+    float *out = (float *)malloc(elems ? elems * sizeof(float) : sizeof(float));
+    if (!out) {
+        free(raw);
+        return 1;
+    }
+
+    if (strcmp(entry->dtype, "F32") == 0) {
+        memcpy(out, raw, elems * sizeof(float));
+    } else if (strcmp(entry->dtype, "F16") == 0) {
+        const uint16_t *src = (const uint16_t *)raw;
+        for (size_t i = 0; i < elems; ++i) out[i] = f16_to_f32(src[i]);
+    } else if (strcmp(entry->dtype, "BF16") == 0) {
+        const uint16_t *src = (const uint16_t *)raw;
+        for (size_t i = 0; i < elems; ++i) out[i] = bf16_to_f32(src[i]);
+    } else {
+        free(out);
+        free(raw);
+        return 1;
+    }
+
+    free(raw);
+    *data_out = out;
+    *elems_out = elems;
     return 0;
 }
 

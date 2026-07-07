@@ -39,19 +39,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Run the current standalone transformer probe:
+Run the current standalone image probe:
 
 ```sh
-./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --dump-prefix /tmp/world_sched4
+./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
-loads the real transformer weights, and runs the latent-only scheduler through
-the WorldDiT path. The default is one scheduler step for quick parity checks;
-`--steps 4` follows the current config schedule `1 -> 0.9 -> 0.75 -> 0.3 -> 0`.
+loads the real transformer weights, and runs the scheduler through the WorldDiT
+path. If `--out` is provided, it also reads
+`vae/diffusion_pytorch_model.safetensors`, decodes the final latent with the
+TAEHV decoder, and writes the first decoded RGB frame as a PPM image. The
+default is one scheduler step for quick parity checks; `--steps 4` follows the
+current config schedule `1 -> 0.9 -> 0.75 -> 0.3 -> 0`.
 Each step runs all requested WorldDiT layers, converts the final tokens back to
-a latent velocity tensor, and updates the latent on GPU:
+a latent velocity tensor, and updates the latent on GPU. The decode path then
+expands the final latent to a `1024x512` RGB frame:
 
 ```text
 sigma embedding -> denoise MLP
@@ -61,6 +65,7 @@ random latent -> patchify
      -> MLP AdaRMSNorm -> DiT MLP -> gated residual add)
 out_norm modulation -> token RMS+SiLU -> unpatchify -> latent_out [32,32,64]
 latent += (next_sigma - sigma) * latent_out
+TAEHV decode -> pixel shuffle -> RGB uint8 PPM [1024,512,3]
 ```
 
 Use `--layers 1` to run only the fully instrumented layer-0 parity path. Pass
@@ -95,10 +100,12 @@ Notes:
   patchify, arrayized layer weight loading, 24-layer transformer token forward,
   value residual, current-frame GQA attention, optional zero-control ctrl
   fusion, DiT MLP, final out_norm modulation, unpatchify back to latent velocity,
-  and scheduler latent updates through the config sigma schedule.
+  scheduler latent updates through the config sigma schedule, F16 VAE weight
+  conversion, TAEHV direct conv/MemBlock/TGrow/upsample decode, pixel shuffle,
+  and PPM output.
   `test_standalone_probe.py` checks both the fully dumped layer-0 path and a
-  two-layer transformer + latent output + one-step scheduler update path against
-  PyTorch reference math.
+  two-layer transformer + latent output + one-step scheduler update + VAE PPM
+  decode path against PyTorch reference math.
 - `generate_smoke.py` is intentionally hybrid for now: World-specific CUDA
   kernels are used for patch/token layout, QKV+RoPE, KV cache, and attention;
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
@@ -108,3 +115,6 @@ Notes:
 - `kv_cache_upsert` mirrors the Python ring-cache/tail-frame update semantics.
 - `patchify` and `unpatchify` fuse the WorldModel layout transforms with their
   Conv2d/Linear math.
+- `taehv_conv2d`, `taehv_concat_past`, `taehv_upsample2`, and
+  `taehv_tgrow_reshape` have focused CUDA extension parity tests. The standalone
+  VAE decoder uses the same formulas in plain C+CUDA.

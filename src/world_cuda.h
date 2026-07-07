@@ -7,6 +7,59 @@
 extern "C" {
 #endif
 
+#define WORLD_VAE_DECODER_CONV_COUNT 35
+
+enum {
+    WORLD_VAE_DEC_CONV_IN = 0,
+    WORLD_VAE_DEC_MB3_0,
+    WORLD_VAE_DEC_MB3_2,
+    WORLD_VAE_DEC_MB3_4,
+    WORLD_VAE_DEC_MB4_0,
+    WORLD_VAE_DEC_MB4_2,
+    WORLD_VAE_DEC_MB4_4,
+    WORLD_VAE_DEC_MB5_0,
+    WORLD_VAE_DEC_MB5_2,
+    WORLD_VAE_DEC_MB5_4,
+    WORLD_VAE_DEC_TGROW7,
+    WORLD_VAE_DEC_CONV8,
+    WORLD_VAE_DEC_MB9_0,
+    WORLD_VAE_DEC_MB9_2,
+    WORLD_VAE_DEC_MB9_4,
+    WORLD_VAE_DEC_MB10_0,
+    WORLD_VAE_DEC_MB10_2,
+    WORLD_VAE_DEC_MB10_4,
+    WORLD_VAE_DEC_MB11_0,
+    WORLD_VAE_DEC_MB11_2,
+    WORLD_VAE_DEC_MB11_4,
+    WORLD_VAE_DEC_TGROW13,
+    WORLD_VAE_DEC_CONV14,
+    WORLD_VAE_DEC_MB15_0,
+    WORLD_VAE_DEC_MB15_2,
+    WORLD_VAE_DEC_MB15_4,
+    WORLD_VAE_DEC_MB16_0,
+    WORLD_VAE_DEC_MB16_2,
+    WORLD_VAE_DEC_MB16_4,
+    WORLD_VAE_DEC_MB17_0,
+    WORLD_VAE_DEC_MB17_2,
+    WORLD_VAE_DEC_MB17_4,
+    WORLD_VAE_DEC_TGROW19,
+    WORLD_VAE_DEC_CONV20,
+    WORLD_VAE_DEC_CONV_OUT,
+};
+
+typedef struct {
+    const float *weight;
+    const float *bias;
+    int out_c;
+    int in_c;
+    int kernel;
+    int has_bias;
+} WorldVaeConvWeight;
+
+typedef struct {
+    WorldVaeConvWeight convs[WORLD_VAE_DECODER_CONV_COUNT];
+} WorldVaeDecoderWeights;
+
 typedef struct {
     const float *patchify_weight;
     const float *denoise_fc1_weight;
@@ -79,7 +132,9 @@ int world_cuda_transformer_probe(
         int steps_to_run,
         float sigma,
         unsigned int seed,
-        const char *dump_prefix);
+        const char *dump_prefix,
+        const WorldVaeDecoderWeights *vae,
+        const char *out_path);
 
 #ifdef __cplusplus
 }

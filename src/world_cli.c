@@ -12,10 +12,10 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
-            "then runs the WorldDiT latent path.\n",
+            "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
             argv0);
 }
 
@@ -66,6 +66,29 @@ static int load_optional_f32(const SafeTensors *st, const char *name, const int6
     return load_required_f32(st, name, shape, ndim, out);
 }
 
+static int load_required_as_f32(const SafeTensors *st, const char *name, const int64_t *shape, int ndim, float **out) {
+    const SafeTensorEntry *e = safetensors_find(st, name);
+    if (!e) {
+        fprintf(stderr, "missing tensor: %s\n", name);
+        return 1;
+    }
+    safetensors_print_entry(e);
+    if (strcmp(e->dtype, "F32") != 0 && strcmp(e->dtype, "F16") != 0 && strcmp(e->dtype, "BF16") != 0) {
+        fprintf(stderr, "expected floating tensor for %s, got %s\n", name, e->dtype);
+        return 1;
+    }
+    if (expect_shape(e, shape, ndim)) {
+        fprintf(stderr, "shape mismatch for %s\n", name);
+        return 1;
+    }
+    size_t elems = 0;
+    if (safetensors_read_tensor_f32(st, e, out, &elems)) {
+        fprintf(stderr, "failed to read tensor as f32: %s\n", name);
+        return 1;
+    }
+    return 0;
+}
+
 static int load_layer_f32(const SafeTensors *st, int layer, const char *suffix, const int64_t *shape, int ndim, float **out) {
     char name[256];
     int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
@@ -103,10 +126,102 @@ static void free_layer_weights(WorldLayerWeights *layers, int n_layers) {
     free(layers);
 }
 
+typedef struct {
+    int index;
+    const char *base;
+    int out_c;
+    int in_c;
+    int kernel;
+    int has_bias;
+} VaeConvSpec;
+
+static const VaeConvSpec k_vae_decoder_specs[WORLD_VAE_DECODER_CONV_COUNT] = {
+    {WORLD_VAE_DEC_CONV_IN, "decoder.1", 256, 32, 3, 1},
+    {WORLD_VAE_DEC_MB3_0, "decoder.3.conv.0", 256, 512, 3, 1},
+    {WORLD_VAE_DEC_MB3_2, "decoder.3.conv.2", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_MB3_4, "decoder.3.conv.4", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_MB4_0, "decoder.4.conv.0", 256, 512, 3, 1},
+    {WORLD_VAE_DEC_MB4_2, "decoder.4.conv.2", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_MB4_4, "decoder.4.conv.4", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_MB5_0, "decoder.5.conv.0", 256, 512, 3, 1},
+    {WORLD_VAE_DEC_MB5_2, "decoder.5.conv.2", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_MB5_4, "decoder.5.conv.4", 256, 256, 3, 1},
+    {WORLD_VAE_DEC_TGROW7, "decoder.7.conv", 256, 256, 1, 0},
+    {WORLD_VAE_DEC_CONV8, "decoder.8", 128, 256, 3, 0},
+    {WORLD_VAE_DEC_MB9_0, "decoder.9.conv.0", 128, 256, 3, 1},
+    {WORLD_VAE_DEC_MB9_2, "decoder.9.conv.2", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_MB9_4, "decoder.9.conv.4", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_MB10_0, "decoder.10.conv.0", 128, 256, 3, 1},
+    {WORLD_VAE_DEC_MB10_2, "decoder.10.conv.2", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_MB10_4, "decoder.10.conv.4", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_MB11_0, "decoder.11.conv.0", 128, 256, 3, 1},
+    {WORLD_VAE_DEC_MB11_2, "decoder.11.conv.2", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_MB11_4, "decoder.11.conv.4", 128, 128, 3, 1},
+    {WORLD_VAE_DEC_TGROW13, "decoder.13.conv", 256, 128, 1, 0},
+    {WORLD_VAE_DEC_CONV14, "decoder.14", 64, 128, 3, 0},
+    {WORLD_VAE_DEC_MB15_0, "decoder.15.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_DEC_MB15_2, "decoder.15.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_MB15_4, "decoder.15.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_MB16_0, "decoder.16.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_DEC_MB16_2, "decoder.16.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_MB16_4, "decoder.16.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_MB17_0, "decoder.17.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_DEC_MB17_2, "decoder.17.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_MB17_4, "decoder.17.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_DEC_TGROW19, "decoder.19.conv", 128, 64, 1, 0},
+    {WORLD_VAE_DEC_CONV20, "decoder.20", 64, 64, 3, 0},
+    {WORLD_VAE_DEC_CONV_OUT, "decoder.22", 12, 64, 3, 1},
+};
+
+static int load_vae_decoder_weights(const char *path, WorldVaeDecoderWeights *vae) {
+    memset(vae, 0, sizeof(*vae));
+    SafeTensors st;
+    fprintf(stderr, "loading VAE safetensors index: %s\n", path);
+    if (safetensors_open(&st, path)) return 1;
+    fprintf(stderr, "VAE safetensors tensors: %d\n", st.count);
+
+    int rc = 1;
+    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+        const VaeConvSpec *spec = &k_vae_decoder_specs[i];
+        WorldVaeConvWeight *cw = &vae->convs[spec->index];
+        char name[256];
+        int64_t w_shape[4] = {spec->out_c, spec->in_c, spec->kernel, spec->kernel};
+        int n = snprintf(name, sizeof(name), "%s.weight", spec->base);
+        if (n < 0 || (size_t)n >= sizeof(name)) goto cleanup;
+        if (load_required_as_f32(&st, name, w_shape, 4, (float **)&cw->weight)) goto cleanup;
+        if (spec->has_bias) {
+            int64_t b_shape[1] = {spec->out_c};
+            n = snprintf(name, sizeof(name), "%s.bias", spec->base);
+            if (n < 0 || (size_t)n >= sizeof(name)) goto cleanup;
+            if (load_required_as_f32(&st, name, b_shape, 1, (float **)&cw->bias)) goto cleanup;
+        }
+        cw->out_c = spec->out_c;
+        cw->in_c = spec->in_c;
+        cw->kernel = spec->kernel;
+        cw->has_bias = spec->has_bias;
+    }
+    rc = 0;
+
+cleanup:
+    safetensors_close(&st);
+    return rc;
+}
+
+static void free_vae_decoder_weights(WorldVaeDecoderWeights *vae) {
+    if (!vae) return;
+    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+        free((void *)vae->convs[i].weight);
+        free((void *)vae->convs[i].bias);
+    }
+    memset(vae, 0, sizeof(*vae));
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = "../Waypoint-1.5-1B";
     const char *weights = NULL;
+    const char *vae_weights = NULL;
     const char *dump_prefix = NULL;
+    const char *out_path = NULL;
     unsigned int seed = 1234;
     float sigma = 1.0f;
     int layers_to_run = -1;
@@ -117,6 +232,8 @@ int main(int argc, char **argv) {
             model_dir = argv[++i];
         } else if (strcmp(argv[i], "--weights") == 0 && i + 1 < argc) {
             weights = argv[++i];
+        } else if (strcmp(argv[i], "--vae-weights") == 0 && i + 1 < argc) {
+            vae_weights = argv[++i];
         } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             seed = (unsigned int)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--sigma") == 0 && i + 1 < argc) {
@@ -127,6 +244,8 @@ int main(int argc, char **argv) {
             steps_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
             dump_prefix = argv[++i];
+        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            out_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -149,6 +268,15 @@ int main(int argc, char **argv) {
             return 1;
         }
         weights = default_weights;
+    }
+
+    char default_vae_weights[PATH_BUF];
+    if (!vae_weights && out_path) {
+        if (join_path(default_vae_weights, sizeof(default_vae_weights), model_dir, "vae/diffusion_pytorch_model.safetensors")) {
+            fprintf(stderr, "VAE weights path too long\n");
+            return 1;
+        }
+        vae_weights = default_vae_weights;
     }
 
     WorldConfig cfg;
@@ -203,7 +331,13 @@ int main(int argc, char **argv) {
     float *layer0_dit_mlp_fc1_weight = NULL;
     float *layer0_dit_mlp_fc2_weight = NULL;
     WorldLayerWeights *layers = NULL;
+    WorldVaeDecoderWeights vae;
+    memset(&vae, 0, sizeof(vae));
     int rc = 1;
+
+    if (out_path && load_vae_decoder_weights(vae_weights, &vae)) {
+        goto cleanup;
+    }
 
     if (load_required_f32(&st, "patchify.weight", patch_shape, 4, &patchify_weight)) {
         goto cleanup;
@@ -260,7 +394,7 @@ int main(int argc, char **argv) {
             unpatchify_weight,
             unpatchify_bias,
         };
-        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, sigma, seed, dump_prefix);
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
         goto cleanup;
     }
 
@@ -355,6 +489,7 @@ cleanup:
     free(layer0_dit_mlp_fc1_weight);
     free(layer0_dit_mlp_fc2_weight);
     free_layer_weights(layers, layers_to_run);
+    free_vae_decoder_weights(&vae);
     safetensors_close(&st);
     return rc;
 }

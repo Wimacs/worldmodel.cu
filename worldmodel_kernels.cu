@@ -557,6 +557,99 @@ __global__ void unpatchify_f32_kernel(
     }
 }
 
+__global__ void taehv_conv2d_nchw_f32_kernel(
+        const float *in,
+        const float *weight,
+        const float *bias,
+        float *out,
+        int N,
+        int C_in,
+        int C_out,
+        int H,
+        int W,
+        int K) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * C_out * H * W;
+    if (i >= total) return;
+
+    int x = (int)(i % W);
+    int64_t q = i / W;
+    int y = (int)(q % H);
+    q /= H;
+    int co = (int)(q % C_out);
+    int n = (int)(q / C_out);
+    int pad = K / 2;
+
+    float sum = bias ? bias[co] : 0.0f;
+    for (int ci = 0; ci < C_in; ++ci) {
+        for (int ky = 0; ky < K; ++ky) {
+            int iy = y + ky - pad;
+            if (iy < 0 || iy >= H) continue;
+            for (int kx = 0; kx < K; ++kx) {
+                int ix = x + kx - pad;
+                if (ix < 0 || ix >= W) continue;
+                float xv = in[((int64_t)n * C_in * H + ci * H + iy) * W + ix];
+                float wv = weight[(((int64_t)co * C_in + ci) * K + ky) * K + kx];
+                sum += xv * wv;
+            }
+        }
+    }
+    out[i] = sum;
+}
+
+__global__ void taehv_concat_past_nchw_f32_kernel(const float *x, float *out, int N, int C, int H, int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * 2 * C * H * W;
+    if (i >= total) return;
+
+    int w = (int)(i % W);
+    int64_t q = i / W;
+    int h = (int)(q % H);
+    q /= H;
+    int c2 = (int)(q % (2 * C));
+    int n = (int)(q / (2 * C));
+    if (c2 < C) {
+        out[i] = x[((int64_t)n * C * H + c2 * H + h) * W + w];
+    } else if (n == 0) {
+        out[i] = 0.0f;
+    } else {
+        int c = c2 - C;
+        out[i] = x[(((int64_t)n - 1) * C * H + c * H + h) * W + w];
+    }
+}
+
+__global__ void taehv_upsample2_nchw_f32_kernel(const float *in, float *out, int N, int C, int H, int W) {
+    int H2 = H * 2;
+    int W2 = W * 2;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * C * H2 * W2;
+    if (i >= total) return;
+
+    int ox = (int)(i % W2);
+    int64_t q = i / W2;
+    int oy = (int)(q % H2);
+    q /= H2;
+    int c = (int)(q % C);
+    int n = (int)(q / C);
+    out[i] = in[((int64_t)n * C * H + c * H + oy / 2) * W + ox / 2];
+}
+
+__global__ void taehv_tgrow_reshape_f32_kernel(const float *in, float *out, int N, int C, int H, int W, int stride) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * stride * C * H * W;
+    if (i >= total) return;
+
+    int x = (int)(i % W);
+    int64_t q = i / W;
+    int y = (int)(q % H);
+    q /= H;
+    int c = (int)(q % C);
+    q /= C;
+    int s = (int)(q % stride);
+    int n = (int)(q / stride);
+    out[i] = in[((int64_t)n * (C * stride) * H + (s * C + c) * H + y) * W + x];
+}
+
 torch::Tensor silu_cuda(torch::Tensor x) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CONTIGUOUS(x);
@@ -1045,6 +1138,90 @@ torch::Tensor unpatchify_cuda(
     return x;
 }
 
+torch::Tensor taehv_conv2d_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CUDA(bias);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_CONTIGUOUS(bias);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(weight);
+    WM_CHECK_F32(bias);
+    TORCH_CHECK(x.dim() == 4, "x must be [N,C,H,W]");
+    TORCH_CHECK(weight.dim() == 4, "weight must be [Cout,Cin,K,K]");
+    TORCH_CHECK(weight.size(1) == x.size(1), "input channel mismatch");
+    TORCH_CHECK(weight.size(2) == weight.size(3), "kernel must be square");
+    TORCH_CHECK(weight.size(2) == 1 || weight.size(2) == 3, "only 1x1 and 3x3 are supported");
+    TORCH_CHECK(bias.numel() == weight.size(0), "bias length must equal Cout");
+
+    int N = (int)x.size(0);
+    int C_in = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int C_out = (int)weight.size(0);
+    int K = (int)weight.size(2);
+    auto out = torch::empty({N, C_out, H, W}, x.options());
+    int64_t total = (int64_t)N * C_out * H * W;
+    taehv_conv2d_nchw_f32_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), out.data_ptr<float>(), N, C_in, C_out, H, W, K);
+    check_last_cuda_error("taehv_conv2d_nchw_f32");
+    return out;
+}
+
+torch::Tensor taehv_concat_past_cuda(torch::Tensor x) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_F32(x);
+    TORCH_CHECK(x.dim() == 4, "x must be [N,C,H,W]");
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    auto out = torch::empty({N, C * 2, H, W}, x.options());
+    int64_t total = (int64_t)N * C * 2 * H * W;
+    taehv_concat_past_nchw_f32_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), out.data_ptr<float>(), N, C, H, W);
+    check_last_cuda_error("taehv_concat_past_nchw_f32");
+    return out;
+}
+
+torch::Tensor taehv_upsample2_cuda(torch::Tensor x) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_F32(x);
+    TORCH_CHECK(x.dim() == 4, "x must be [N,C,H,W]");
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    auto out = torch::empty({N, C, H * 2, W * 2}, x.options());
+    int64_t total = (int64_t)N * C * H * 2 * W * 2;
+    taehv_upsample2_nchw_f32_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), out.data_ptr<float>(), N, C, H, W);
+    check_last_cuda_error("taehv_upsample2_nchw_f32");
+    return out;
+}
+
+torch::Tensor taehv_tgrow_reshape_cuda(torch::Tensor x, int64_t stride) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_F32(x);
+    TORCH_CHECK(x.dim() == 4, "x must be [N,C*stride,H,W]");
+    TORCH_CHECK(stride == 1 || stride == 2, "only stride 1/2 are supported");
+    TORCH_CHECK(x.size(1) % stride == 0, "channel count must be divisible by stride");
+    int N = (int)x.size(0);
+    int C = (int)(x.size(1) / stride);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    auto out = torch::empty({N * stride, C, H, W}, x.options());
+    int64_t total = (int64_t)N * stride * C * H * W;
+    taehv_tgrow_reshape_f32_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), out.data_ptr<float>(), N, C, H, W, (int)stride);
+    check_last_cuda_error("taehv_tgrow_reshape_f32");
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu", &silu_cuda, "WorldModel SiLU (CUDA, f32)");
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
@@ -1056,4 +1233,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
     m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
+    m.def("taehv_conv2d", &taehv_conv2d_cuda, "TAEHV direct same-padding Conv2d (CUDA, f32)");
+    m.def("taehv_concat_past", &taehv_concat_past_cuda, "TAEHV MemBlock current+past concat (CUDA, f32)");
+    m.def("taehv_upsample2", &taehv_upsample2_cuda, "TAEHV nearest upsample x2 (CUDA, f32)");
+    m.def("taehv_tgrow_reshape", &taehv_tgrow_reshape_cuda, "TAEHV TGrow channel-to-time reshape (CUDA, f32)");
 }

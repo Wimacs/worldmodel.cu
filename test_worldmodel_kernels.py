@@ -296,6 +296,44 @@ def test_unpatchify_matches_torch_linear_layout(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
 
 
+def test_taehv_conv2d_matches_torch_same_padding(wm_cuda):
+    torch.manual_seed(12)
+    n, cin, cout, h, w = 3, 5, 7, 9, 11
+    x = torch.randn(n, cin, h, w, device="cuda", dtype=torch.float32)
+    weight = torch.randn(cout, cin, 3, 3, device="cuda", dtype=torch.float32) * 0.2
+    bias = torch.randn(cout, device="cuda", dtype=torch.float32) * 0.1
+
+    y = wm_cuda.taehv_conv2d(x, weight, bias)
+    ref = F.conv2d(x, weight, bias=bias, padding=1)
+    torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
+def test_taehv_concat_past_matches_reference(wm_cuda):
+    torch.manual_seed(13)
+    x = torch.randn(5, 4, 6, 7, device="cuda", dtype=torch.float32)
+    y = wm_cuda.taehv_concat_past(x)
+    past = torch.cat((torch.zeros_like(x[:1]), x[:-1]), dim=0)
+    ref = torch.cat((x, past), dim=1).contiguous()
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+def test_taehv_upsample2_matches_nearest(wm_cuda):
+    torch.manual_seed(14)
+    x = torch.randn(3, 5, 4, 7, device="cuda", dtype=torch.float32)
+    y = wm_cuda.taehv_upsample2(x)
+    ref = F.interpolate(x, scale_factor=2, mode="nearest")
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+def test_taehv_tgrow_reshape_matches_torch_view(wm_cuda):
+    torch.manual_seed(15)
+    n, c, h, w, stride = 4, 6, 5, 7, 2
+    x = torch.randn(n, c * stride, h, w, device="cuda", dtype=torch.float32)
+    y = wm_cuda.taehv_tgrow_reshape(x, stride)
+    ref = x.reshape(-1, c, h, w).contiguous()
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     ext = load_wm_cuda()
     for test in (
@@ -310,6 +348,10 @@ if __name__ == "__main__":
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_patchify_matches_torch_conv2d_layout,
         test_unpatchify_matches_torch_linear_layout,
+        test_taehv_conv2d_matches_torch_same_padding,
+        test_taehv_concat_past_matches_reference,
+        test_taehv_upsample2_matches_nearest,
+        test_taehv_tgrow_reshape_matches_torch_view,
     ):
         test(ext)
         print(f"{test.__name__}: ok")
