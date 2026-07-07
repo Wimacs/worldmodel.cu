@@ -604,6 +604,267 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             )
 
 
+def test_standalone_two_frame_cache_rollout_matches_pytorch():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not WEIGHTS_PATH.exists():
+        pytest.skip(f"missing Waypoint weights: {WEIGHTS_PATH}")
+
+    cfg = _load_config()
+    exe = _build_executable()
+    seed = 4321
+    sigma = 1.0
+    layers = 2
+    start_frame_idx = 3
+    frames = 2
+    device = torch.device("cuda")
+
+    with tempfile.TemporaryDirectory(prefix="world_rollout2_probe_") as td:
+        prefix = str(Path(td) / "dump")
+        control_np = _control_vector(cfg)
+        control_path = Path(td) / "control.f32"
+        control_np.tofile(control_path)
+        subprocess.run(
+            [
+                str(exe),
+                "--model-dir",
+                str(MODEL_DIR),
+                "--seed",
+                str(seed),
+                "--sigma",
+                str(sigma),
+                "--layers",
+                str(layers),
+                "--steps",
+                "1",
+                "--frames",
+                str(frames),
+                "--frame-idx",
+                str(start_frame_idx),
+                "--cache-pass",
+                "--control",
+                str(control_path),
+                "--dump-prefix",
+                prefix,
+            ],
+            check=True,
+            cwd=str(ROOT),
+        )
+
+        c = cfg["channels"]
+        d_model = cfg["d_model"]
+        n_heads = cfg["n_heads"]
+        n_kv_heads = cfg["n_kv_heads"]
+        ph, pw = int(cfg["patch"][0]), int(cfg["patch"][1])
+        height, width = cfg["height"], cfg["width"]
+        h, w = height * ph, width * pw
+        tpf = height * width
+        d_head = d_model // n_heads
+
+        names = [
+            "patchify.weight",
+            "denoise_step_emb.mlp.fc1.weight",
+            "denoise_step_emb.mlp.fc2.weight",
+            "ctrl_emb.mlp.fc1.weight",
+            "ctrl_emb.mlp.fc2.weight",
+            "out_norm.fc.weight",
+            "unpatchify.weight",
+            "unpatchify.bias",
+        ]
+        for layer in range(layers):
+            p = f"transformer.blocks.{layer}"
+            names.extend(
+                [
+                    f"{p}.mlp_cond_head.bias_in",
+                    f"{p}.attn_cond_head.cond_proj.0.weight",
+                    f"{p}.attn_cond_head.cond_proj.1.weight",
+                    f"{p}.attn_cond_head.cond_proj.2.weight",
+                    f"{p}.attn.q_proj.weight",
+                    f"{p}.attn.k_proj.weight",
+                    f"{p}.attn.v_proj.weight",
+                    f"{p}.attn.out_proj.weight",
+                    f"{p}.attn.v_lamb",
+                    f"{p}.mlp_cond_head.cond_proj.0.weight",
+                    f"{p}.mlp_cond_head.cond_proj.1.weight",
+                    f"{p}.mlp_cond_head.cond_proj.2.weight",
+                    f"{p}.dit_mlp.fc1.weight",
+                    f"{p}.dit_mlp.fc2.weight",
+                ]
+            )
+            if layer % int(cfg["ctrl_conditioning_period"]) == 0:
+                names.extend(
+                    [
+                        f"{p}.ctrl_mlpfusion.fc1_x.weight",
+                        f"{p}.ctrl_mlpfusion.fc1_c.weight",
+                        f"{p}.ctrl_mlpfusion.fc2.weight",
+                    ]
+                )
+        state = _load_required_tensors(names, device)
+
+        control = torch.from_numpy(control_np).to(device).view(1, 1, -1)
+        ctrl_emb = F.linear(
+            F.silu(F.linear(control, state["ctrl_emb.mlp.fc1.weight"])),
+            state["ctrl_emb.mlp.fc2.weight"],
+        ).reshape(d_model)
+        ctrl_norm = F.rms_norm(ctrl_emb, (d_model,), eps=1.0e-6)
+
+        idx = torch.arange(tpf, device=device, dtype=torch.long)
+        y_pos = idx.div(width, rounding_mode="floor").contiguous()
+        x_pos = idx.remainder(width).contiguous()
+        xy, inv_t = _world_rope_tables(d_head, height, width, device)
+        fps_div = int(cfg["inference_fps"]) // int(cfg["temporal_compression"])
+        frame_stride = int(cfg["base_fps"]) // fps_div
+
+        period = int(cfg["global_attn_period"])
+        offset = int(cfg["global_attn_offset"]) % period
+        caches = []
+        for layer in range(layers):
+            is_global = ((layer - offset) % period) == 0
+            window = int(cfg["global_window"] if is_global else cfg["local_window"])
+            ring_length = window * tpf
+            capacity = ring_length + tpf
+            cache_k = torch.zeros((n_kv_heads, capacity, d_head), device=device, dtype=torch.float32)
+            cache_v = torch.zeros_like(cache_k)
+            written = torch.zeros((capacity,), device=device, dtype=torch.bool)
+            written[ring_length:] = True
+            pinned = int(cfg["global_pinned_dilation"] if is_global else 1)
+            caches.append((cache_k, cache_v, written, ring_length, pinned))
+
+        def run_reference(latent, step_sigma, current_frame_idx, frozen, emit_velocity):
+            cond = F.linear(
+                F.silu(F.linear(_noise_embedding(step_sigma, device), state["denoise_step_emb.mlp.fc1.weight"])),
+                state["denoise_step_emb.mlp.fc2.weight"],
+            )
+            tokens = F.conv2d(latent, state["patchify.weight"], bias=None, stride=(ph, pw))
+            tokens = tokens.permute(0, 2, 3, 1).reshape(tpf, d_model).contiguous()
+            t_pos = torch.full_like(idx, current_frame_idx * frame_stride)
+            v_first = None
+
+            for layer in range(layers):
+                p = f"transformer.blocks.{layer}"
+                cond_act = F.silu(cond.reshape(d_model) + state[f"{p}.mlp_cond_head.bias_in"])
+                s0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.0.weight"])
+                b0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.1.weight"])
+                g0 = F.linear(cond_act, state[f"{p}.attn_cond_head.cond_proj.2.weight"])
+                s1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.0.weight"])
+                b1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.1.weight"])
+                g1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.2.weight"])
+
+                norm = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s0) + b0
+                q_raw = F.linear(norm, state[f"{p}.attn.q_proj.weight"])
+                k_raw = F.linear(norm, state[f"{p}.attn.k_proj.weight"])
+                v_raw = F.linear(norm, state[f"{p}.attn.v_proj.weight"])
+                q = q_raw.view(1, tpf, n_heads, d_head).permute(0, 2, 1, 3).contiguous()
+                k = k_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
+                v = v_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
+                q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+                k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+                v = v[0]
+                if v_first is None:
+                    v_first = v
+                else:
+                    v = torch.lerp(v, v_first, state[f"{p}.attn.v_lamb"].float())
+
+                cache_k, cache_v, written, ring_length, pinned = caches[layer]
+                bucket = (current_frame_idx + (pinned - 1)) // pinned
+                num_buckets = (ring_length // tpf) // pinned
+                base = (bucket % num_buckets) * tpf
+                ring_idx = torch.arange(base, base + tpf, device=device)
+                tail_idx = torch.arange(ring_length, ring_length + tpf, device=device)
+                write_step = current_frame_idx % pinned == 0
+                mask_written = written.clone()
+                if write_step:
+                    mask_written[ring_idx] = False
+                cache_k[:, tail_idx, :] = k
+                cache_v[:, tail_idx, :] = v
+                if write_step and not frozen:
+                    cache_k[:, ring_idx, :] = k
+                    cache_v[:, ring_idx, :] = v
+                    written[ring_idx] = True
+                indices = torch.nonzero(mask_written, as_tuple=False).flatten()
+
+                group = n_heads // n_kv_heads
+                k_indexed = cache_k[:, indices, :].repeat_interleave(group, dim=0)
+                v_indexed = cache_v[:, indices, :].repeat_interleave(group, dim=0)
+                scores = torch.einsum("htd,hnd->htn", q, k_indexed) * (d_head ** -0.5)
+                probs = torch.softmax(scores, dim=-1)
+                attn_heads = torch.einsum("htn,hnd->htd", probs, v_indexed)
+                attn = attn_heads.permute(1, 0, 2).reshape(tpf, d_model).contiguous()
+                tokens = tokens + F.linear(attn, state[f"{p}.attn.out_proj.weight"]) * g0
+
+                if f"{p}.ctrl_mlpfusion.fc1_x.weight" in state:
+                    ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=1.0e-6), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
+                    ctrl_hidden = ctrl_hidden + F.linear(ctrl_norm, state[f"{p}.ctrl_mlpfusion.fc1_c.weight"])
+                    tokens = tokens + F.linear(F.silu(ctrl_hidden), state[f"{p}.ctrl_mlpfusion.fc2.weight"])
+
+                mlp_in = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+                mlp_out = F.linear(
+                    F.silu(F.linear(mlp_in, state[f"{p}.dit_mlp.fc1.weight"])),
+                    state[f"{p}.dit_mlp.fc2.weight"],
+                )
+                tokens = tokens + mlp_out * g1
+
+            if not emit_velocity:
+                return tokens, None, None
+
+            mod = F.linear(F.silu(cond), state["out_norm.fc.weight"]).reshape(2, d_model)
+            final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + mod[0]) + mod[1])
+            unpatch_w = state["unpatchify.weight"].permute(1, 2, 3, 0).reshape(c * ph * pw, d_model).contiguous()
+            unpatch_b = state["unpatchify.bias"][:, None, None].expand(c, ph, pw).reshape(c * ph * pw).contiguous()
+            latent_out = F.linear(final_tokens, unpatch_w, unpatch_b)
+            latent_out = latent_out.view(height, width, c, ph, pw).permute(2, 0, 3, 1, 4).reshape(c, h, w).contiguous()
+            latent_final = (latent[0] + latent_out * (float(cfg["scheduler_sigmas"][1]) - step_sigma)).contiguous()
+            return tokens, latent_out, latent_final
+
+        final_tokens = None
+        final_latent_out = None
+        final_latent = None
+        for frame_ordinal in range(frames):
+            current_frame_idx = start_frame_idx + frame_ordinal
+            latent = torch.from_numpy(_lcg_latent((1, c, h, w), seed + frame_ordinal)).to(device)
+            final_tokens, final_latent_out, final_latent = run_reference(latent, sigma, current_frame_idx, True, True)
+            run_reference(final_latent[None], 0.0, current_frame_idx, False, False)
+
+        _assert_close(
+            "rollout_transformer_tokens",
+            _read_dump(prefix, "transformer_tokens", (tpf, d_model)),
+            final_tokens,
+            rtol=1.5e-3,
+            atol=1.5e-3,
+        )
+        _assert_close(
+            "rollout_latent_out",
+            _read_dump(prefix, "latent_out", (c, h, w)),
+            final_latent_out,
+            rtol=1.5e-3,
+            atol=1.5e-3,
+        )
+        _assert_close(
+            "rollout_latent_final",
+            _read_dump(prefix, "latent_final", (c, h, w)),
+            final_latent,
+            rtol=1.5e-3,
+            atol=1.5e-3,
+        )
+
+        cache_counts = _read_dump(prefix, "cache_written_counts", (layers,))
+        expected_counts = []
+        for layer in range(layers):
+            is_global = ((layer - offset) % period) == 0
+            window = int(cfg["global_window"] if is_global else cfg["local_window"])
+            pinned = int(cfg["global_pinned_dilation"] if is_global else 1)
+            num_buckets = window // pinned
+            written_bases = set()
+            for current_frame_idx in range(start_frame_idx, start_frame_idx + frames):
+                if current_frame_idx % pinned == 0:
+                    bucket = (current_frame_idx + (pinned - 1)) // pinned
+                    written_bases.add(bucket % num_buckets)
+            expected_counts.append(float(tpf * (1 + len(written_bases))))
+        torch.testing.assert_close(cache_counts, torch.tensor(expected_counts), rtol=0, atol=0)
+        print(f"rollout_cache_written_counts: ok {cache_counts.tolist()}")
+
+
 if __name__ == "__main__":
     test_standalone_layer0_probe_matches_pytorch()
     test_standalone_two_layer_transformer_matches_pytorch()
+    test_standalone_two_frame_cache_rollout_matches_pytorch()

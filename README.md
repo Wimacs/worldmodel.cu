@@ -42,17 +42,20 @@ cmake --build build -j
 Run the current standalone image probe:
 
 ```sh
-./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frame-idx 3 --cache-pass --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
+./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frames 2 --frame-idx 3 --cache-pass --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
 Pass `--control controls.f32` to provide one little-endian float32 controller
 vector of length `n_buttons + 3`; if omitted, the executable uses zeros.
 Pass `--frame-idx N` to set the temporal RoPE position and per-layer cache
-bucket for the generated frame. Pass `--cache-pass` to run one final sigma=0
-unfrozen transformer pass after the scheduler; this writes the final latent's
-K/V entries into the local/global ring caches. With `--dump-prefix`, the
-standalone executable also writes `/tmp/world_full.cache_written_counts.f32`
-with one float count per layer so cache writes can be parity-checked.
+bucket for the first generated latent frame. Pass `--frames N` to generate N
+latent frames in one process while keeping the per-layer KV caches alive between
+frames; `--frames > 1` automatically enables `--cache-pass`. Pass `--cache-pass`
+to run one final sigma=0 unfrozen transformer pass after each frame's scheduler;
+this writes the final latent's K/V entries into the local/global ring caches.
+With `--dump-prefix`, the standalone executable also writes
+`/tmp/world_full.cache_written_counts.f32` with one float count per layer so
+cache writes can be parity-checked.
 
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
@@ -63,9 +66,12 @@ is provided, it also reads
 `vae/diffusion_pytorch_model.safetensors`, decodes the final latent with the
 TAEHV decoder, writes the first decoded RGB frame to the requested PPM path,
 and writes the full decoded 4-frame chunk as sibling files such as
-`/tmp/world_full.0.ppm` through `/tmp/world_full.3.ppm`. The default is one
-scheduler step for quick parity checks; `--steps 4` follows the current config
-schedule `1 -> 0.9 -> 0.75 -> 0.3 -> 0`.
+`/tmp/world_full.0.ppm` through `/tmp/world_full.3.ppm` for the first latent
+frame. Multi-frame rollouts continue the decoded frame numbering, e.g.
+`--frames 2` also writes `/tmp/world_full.4.ppm` through
+`/tmp/world_full.7.ppm`. The default is one scheduler step for quick parity
+checks; `--steps 4` follows the current config schedule
+`1 -> 0.9 -> 0.75 -> 0.3 -> 0`.
 Each step runs all requested WorldDiT layers, converts the final tokens back to
 a latent velocity tensor, and updates the latent on GPU. The decode path then
 expands the final latent to a `1024x512` RGB frame:
@@ -127,8 +133,10 @@ Notes:
 - `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
   the standalone transformer path. It supports a final unfrozen cache write pass
-  for the current frame; a true multi-frame generation loop with cache history
-  persisting across frames is the next runtime step.
+  and a simple multi-frame rollout loop with cache history persisting across
+  generated latent frames. The current Waypoint-1.5-1B config has
+  `prompt_conditioning: null`, so this checkpoint does not have prompt
+  cross-attention weights to load in the standalone path.
 - `masked_attention` is an online-softmax GQA written-mask kernel kept for
   focused extension parity coverage.
 - `kv_cache_upsert` mirrors the Python ring-cache/tail-frame update semantics.

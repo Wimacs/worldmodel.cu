@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frames N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -254,6 +254,7 @@ int main(int argc, char **argv) {
     float sigma = 1.0f;
     int layers_to_run = -1;
     int steps_to_run = 1;
+    int frames_to_run = 1;
     int frame_idx = 0;
     int cache_pass = 0;
 
@@ -274,6 +275,8 @@ int main(int argc, char **argv) {
             layers_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             steps_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            frames_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frame-idx") == 0 && i + 1 < argc) {
             frame_idx = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--cache-pass") == 0) {
@@ -326,9 +329,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid --steps %d, expected 1..%d\n", steps_to_run, cfg.scheduler_sigmas_count - 1);
         return 1;
     }
+    if (frames_to_run <= 0) {
+        fprintf(stderr, "invalid --frames %d, expected >= 1\n", frames_to_run);
+        return 1;
+    }
     if (frame_idx < 0) {
         fprintf(stderr, "invalid --frame-idx %d, expected >= 0\n", frame_idx);
         return 1;
+    }
+    if (frames_to_run > 1 && !cache_pass) {
+        fprintf(stderr, "--frames %d: enabling --cache-pass so generated frame history persists in KV cache\n", frames_to_run);
+        cache_pass = 1;
     }
     world_config_print(&cfg);
 
@@ -461,7 +472,7 @@ int main(int argc, char **argv) {
             unpatchify_weight,
             unpatchify_bias,
         };
-        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, frame_idx, cache_pass, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, frames_to_run, frame_idx, cache_pass, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
         goto cleanup;
     }
 

@@ -138,6 +138,7 @@ int world_cuda_transformer_probe(
         const WorldModelProbeWeights *weights,
         int layers_to_run,
         int steps_to_run,
+        int frames_to_run,
         int frame_idx,
         int cache_pass,
         float sigma,

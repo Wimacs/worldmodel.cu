@@ -1210,18 +1210,21 @@ static int taehv_make_frame_path(char *out, size_t out_size, const char *path, i
     return n < 0 || (size_t)n >= out_size;
 }
 
-static int taehv_write_ppm_frames(const char *path, const unsigned char *rgb, int frame_count, int width, int height) {
+static int taehv_write_ppm_frames(const char *path, const unsigned char *rgb, int frame_count, int width, int height, int frame_offset) {
     size_t frame_bytes = (size_t)width * height * 3;
-    if (taehv_write_ppm(path, rgb, width, height)) return 1;
-    fprintf(stderr, "wrote RGB image: %s\n", path);
+    if (frame_offset == 0) {
+        if (taehv_write_ppm(path, rgb, width, height)) return 1;
+        fprintf(stderr, "wrote RGB image: %s\n", path);
+    }
     for (int i = 0; i < frame_count; ++i) {
         char frame_path[4096];
-        if (taehv_make_frame_path(frame_path, sizeof(frame_path), path, i)) {
-            fprintf(stderr, "output frame path too long for %s frame %d\n", path, i);
+        int global_frame = frame_offset + i;
+        if (taehv_make_frame_path(frame_path, sizeof(frame_path), path, global_frame)) {
+            fprintf(stderr, "output frame path too long for %s frame %d\n", path, global_frame);
             return 1;
         }
         if (taehv_write_ppm(frame_path, rgb + (size_t)i * frame_bytes, width, height)) return 1;
-        fprintf(stderr, "wrote RGB frame %d: %s\n", i, frame_path);
+        fprintf(stderr, "wrote RGB frame %d: %s\n", global_frame, frame_path);
     }
     return 0;
 }
@@ -1230,7 +1233,8 @@ static int world_cuda_decode_vae_to_ppm(
         const WorldConfig *cfg,
         const WorldVaeDecoderWeights *host_vae,
         const float *d_latent,
-        const char *out_path) {
+        const char *out_path,
+        int frame_offset) {
     if (!host_vae || !out_path || !out_path[0]) return 0;
 
     int C_latent = cfg->channels;
@@ -1341,7 +1345,7 @@ static int world_cuda_decode_vae_to_ppm(
     CUDA_OK(cudaGetLastError());
     CUDA_OK(cudaMemcpy(h_rgb, d_rgb, rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
-    if (taehv_write_ppm_frames(out_path, h_rgb, 4, out_w, out_h)) goto cleanup;
+    if (taehv_write_ppm_frames(out_path, h_rgb, 4, out_w, out_h, frame_offset)) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -1951,6 +1955,7 @@ extern "C" int world_cuda_transformer_probe(
         const WorldModelProbeWeights *weights,
         int layers_to_run,
         int steps_to_run,
+        int frames_to_run,
         int frame_idx,
         int cache_pass,
         float sigma,
@@ -1981,6 +1986,10 @@ extern "C" int world_cuda_transformer_probe(
         fprintf(stderr, "invalid steps_to_run=%d scheduler_count=%d\n", steps_to_run, cfg->scheduler_sigmas_count);
         return 1;
     }
+    if (frames_to_run <= 0) {
+        fprintf(stderr, "invalid frames_to_run=%d\n", frames_to_run);
+        return 1;
+    }
     if (frame_idx < 0) {
         fprintf(stderr, "invalid frame_idx=%d\n", frame_idx);
         return 1;
@@ -1988,7 +1997,6 @@ extern "C" int world_cuda_transformer_probe(
 
     int fps_div = cfg->temporal_compression > 0 ? cfg->inference_fps / cfg->temporal_compression : 0;
     int frame_stride = fps_div > 0 ? cfg->base_fps / fps_div : 1;
-    int frame_timestamp = frame_idx * frame_stride;
 
     size_t latent_elems = (size_t)C * H * W;
     size_t patch_weight_elems = (size_t)D * C * ph * pw;
@@ -2000,6 +2008,7 @@ extern "C" int world_cuda_transformer_probe(
     size_t unpatch_weight_elems = (size_t)D * C * ph * pw;
     int out_dim = C * ph * pw;
     int total_passes = steps_to_run + (cache_pass ? 1 : 0);
+    int decoded_frames_per_latent = 4;
 
     float *h_latent = (float *)malloc(latent_elems * sizeof(float));
     float *h_noise = (float *)malloc(512 * sizeof(float));
@@ -2023,8 +2032,6 @@ extern "C" int world_cuda_transformer_probe(
         free(h_t_pos);
         return 1;
     }
-    fill_latent(h_latent, (int)latent_elems, seed);
-    fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
     fill_rope_tables(h_xy, h_inv_t, d_head, cfg->height, cfg->width);
 
     float *d_latent = NULL;
@@ -2157,13 +2164,9 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_world_layers_to_device(&d_layers, weights->layers, layers_to_run, D, kv_dim, mlp_hidden)) goto cleanup_device;
     if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head)) goto cleanup_device;
 
-    TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_control_input, weights->control_input, (size_t)ctrl_dim * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_xy_table, h_xy, (size_t)d_xy * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_inv_t, h_inv_t, (size_t)d_t * sizeof(float), cudaMemcpyHostToDevice));
-    TRY_CUDA2(cudaMemcpy(d_x_pos, h_x_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
-    TRY_CUDA2(cudaMemcpy(d_y_pos, h_y_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
-    TRY_CUDA2(cudaMemcpy(d_t_pos, h_t_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
     TRY_CUBLAS2(cublasCreate(&handle));
 
     TRY_LINEAR2(d_control_input, d_ctrl_emb_fc1_w, d_ctrl_emb_hidden, 1, ctrl_dim, mlp_hidden);
@@ -2173,6 +2176,19 @@ extern "C" int world_cuda_transformer_probe(
     rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
     TRY_CUDA2(cudaGetLastError());
 
+    for (int frame_ordinal = 0; frame_ordinal < frames_to_run; ++frame_ordinal) {
+        int current_frame_idx = frame_idx + frame_ordinal;
+        int frame_timestamp = current_frame_idx * frame_stride;
+        fill_latent(h_latent, (int)latent_elems, seed + (unsigned int)frame_ordinal);
+        fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
+        TRY_CUDA2(cudaMemcpy(d_latent, h_latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice));
+        TRY_CUDA2(cudaMemcpy(d_x_pos, h_x_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
+        TRY_CUDA2(cudaMemcpy(d_y_pos, h_y_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
+        TRY_CUDA2(cudaMemcpy(d_t_pos, h_t_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
+        fprintf(stderr,
+                "frame %02d/%02d: frame_idx=%d frame_timestamp=%d\n",
+                frame_ordinal + 1, frames_to_run, current_frame_idx, frame_timestamp);
+
     for (int pass_idx = 0; pass_idx < total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= steps_to_run;
         int frozen_pass = !is_cache_pass;
@@ -2181,11 +2197,11 @@ extern "C" int world_cuda_transformer_probe(
         float dsigma = next_sigma - sigma_step;
         int is_last_step = !is_cache_pass && pass_idx == steps_to_run - 1;
         if (is_cache_pass) {
-            fprintf(stderr, "cache pass: sigma=0 frame_idx=%d frozen=false\n", frame_idx);
+            fprintf(stderr, "cache pass: sigma=0 frame_idx=%d frozen=false\n", current_frame_idx);
         } else {
             fprintf(stderr,
                     "scheduler step %02d/%02d: sigma=%.6g next=%.6g dsigma=%.6g frame_idx=%d frozen=true\n",
-                    pass_idx + 1, steps_to_run, sigma_step, next_sigma, dsigma, frame_idx);
+                    pass_idx + 1, steps_to_run, sigma_step, next_sigma, dsigma, current_frame_idx);
         }
 
         fill_noise_embedding(h_noise, sigma_step);
@@ -2240,10 +2256,10 @@ extern "C" int world_cuda_transformer_probe(
             }
 
             {
-                int bucket = (frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
+                int bucket = (current_frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
                 int num_buckets = (cache->ring_length / T) / cache->pinned_dilation;
                 int base = (bucket % num_buckets) * T;
-                bool write_step = (frame_idx % cache->pinned_dilation) == 0;
+                bool write_step = (current_frame_idx % cache->pinned_dilation) == 0;
                 kv_cache_mask_kernel<<<div_up_i64(cache->capacity, 256), 256>>>(
                     cache->written, cache->mask_written, cache->capacity, T, base, write_step);
                 TRY_CUDA2(cudaGetLastError());
@@ -2320,9 +2336,17 @@ extern "C" int world_cuda_transformer_probe(
         TRY_CUDA2(cudaGetLastError());
     }
 
+        if (vae && out_path &&
+            world_cuda_decode_vae_to_ppm(cfg, vae, d_latent, out_path, frame_ordinal * decoded_frames_per_latent)) {
+            goto cleanup_device;
+        }
+    }
+
     TRY_CUDA2(cudaMemcpy(h_latent, d_latent, latent_elems * sizeof(float), cudaMemcpyDeviceToHost));
     TRY_CUDA2(cudaDeviceSynchronize());
-    fprintf(stderr, "transformer probe: completed %d scheduler steps x %d layers\n", steps_to_run, layers_to_run);
+    fprintf(stderr,
+            "transformer probe: completed %d frame(s) x %d scheduler steps x %d layers\n",
+            frames_to_run, steps_to_run, layers_to_run);
     print_stats("transformer_tokens", h_tokens, (int)token_elems);
     print_stats("latent_out", h_latent_out, (int)latent_elems);
     print_stats("latent_final", h_latent, (int)latent_elems);
@@ -2330,7 +2354,6 @@ extern "C" int world_cuda_transformer_probe(
     if (dump_f32(dump_prefix, "transformer_tokens", h_tokens, token_elems) ||
         dump_f32(dump_prefix, "latent_out", h_latent_out, latent_elems) ||
         dump_f32(dump_prefix, "latent_final", h_latent, latent_elems)) goto cleanup_device;
-    if (vae && out_path && world_cuda_decode_vae_to_ppm(cfg, vae, d_latent, out_path)) goto cleanup_device;
     rc = 0;
 
 cleanup_device:
