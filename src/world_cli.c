@@ -12,7 +12,7 @@
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--dump-prefix PATH] [--out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--control FILE] [--seed N] [--sigma X] [--layers N] [--steps N] [--frame-idx N] [--cache-pass] [--dump-prefix PATH] [--out PATH]\n"
             "\n"
             "Standalone C+CUDA probe. Loads Waypoint config and safetensors without PyTorch,\n"
             "then runs the WorldDiT latent path and optionally decodes an RGB PPM.\n",
@@ -254,6 +254,8 @@ int main(int argc, char **argv) {
     float sigma = 1.0f;
     int layers_to_run = -1;
     int steps_to_run = 1;
+    int frame_idx = 0;
+    int cache_pass = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -272,6 +274,10 @@ int main(int argc, char **argv) {
             layers_to_run = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             steps_to_run = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--frame-idx") == 0 && i + 1 < argc) {
+            frame_idx = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--cache-pass") == 0) {
+            cache_pass = 1;
         } else if (strcmp(argv[i], "--dump-prefix") == 0 && i + 1 < argc) {
             dump_prefix = argv[++i];
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
@@ -318,6 +324,10 @@ int main(int argc, char **argv) {
     }
     if (steps_to_run <= 0 || steps_to_run >= cfg.scheduler_sigmas_count) {
         fprintf(stderr, "invalid --steps %d, expected 1..%d\n", steps_to_run, cfg.scheduler_sigmas_count - 1);
+        return 1;
+    }
+    if (frame_idx < 0) {
+        fprintf(stderr, "invalid --frame-idx %d, expected >= 0\n", frame_idx);
         return 1;
     }
     world_config_print(&cfg);
@@ -451,7 +461,7 @@ int main(int argc, char **argv) {
             unpatchify_weight,
             unpatchify_bias,
         };
-        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
+        rc = world_cuda_transformer_probe(&cfg, &model, layers_to_run, steps_to_run, frame_idx, cache_pass, sigma, seed, dump_prefix, out_path ? &vae : NULL, out_path);
         goto cleanup;
     }
 

@@ -18,6 +18,9 @@ typedef struct {
     int global_pinned_dilation;
     int global_attn_period;
     int global_attn_offset;
+    int base_fps;
+    int inference_fps;
+    int temporal_compression;
     int value_residual;
     int prompt_conditioning;
     float scheduler_sigmas[32];

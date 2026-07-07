@@ -338,6 +338,7 @@ def test_standalone_two_layer_transformer_matches_pytorch():
     seed = 1234
     sigma = 1.0
     layers = 2
+    frame_idx = 3
     device = torch.device("cuda")
 
     with tempfile.TemporaryDirectory(prefix="world_transformer2_probe_") as td:
@@ -359,6 +360,9 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 str(layers),
                 "--steps",
                 "1",
+                "--frame-idx",
+                str(frame_idx),
+                "--cache-pass",
                 "--control",
                 str(control_path),
                 "--dump-prefix",
@@ -438,7 +442,9 @@ def test_standalone_two_layer_transformer_matches_pytorch():
         idx = torch.arange(tpf, device=device, dtype=torch.long)
         y_pos = idx.div(width, rounding_mode="floor").contiguous()
         x_pos = idx.remainder(width).contiguous()
-        t_pos = torch.zeros_like(idx)
+        fps_div = int(cfg["inference_fps"]) // int(cfg["temporal_compression"])
+        frame_timestamp = frame_idx * (int(cfg["base_fps"]) // fps_div)
+        t_pos = torch.full_like(idx, frame_timestamp)
         xy, inv_t = _world_rope_tables(d_head, height, width, device)
         v_first = None
         caches = []
@@ -482,7 +488,6 @@ def test_standalone_two_layer_transformer_matches_pytorch():
                 v = torch.lerp(v, v_first, state[f"{p}.attn.v_lamb"].float())
 
             cache_k, cache_v, written, ring_length, pinned = caches[layer]
-            frame_idx = 0
             bucket = (frame_idx + (pinned - 1)) // pinned
             num_buckets = (ring_length // tpf) // pinned
             base = (bucket % num_buckets) * tpf
@@ -547,6 +552,14 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             rtol=1.2e-3,
             atol=1.2e-3,
         )
+        cache_counts = _read_dump(prefix, "cache_written_counts", (layers,))
+        expected_counts = []
+        for layer in range(layers):
+            is_global = ((layer - offset) % period) == 0
+            pinned = int(cfg["global_pinned_dilation"] if is_global else 1)
+            expected_counts.append(float(tpf * (2 if frame_idx % pinned == 0 else 1)))
+        torch.testing.assert_close(cache_counts, torch.tensor(expected_counts), rtol=0, atol=0)
+        print(f"cache_written_counts: ok {cache_counts.tolist()}")
 
         sys.path.insert(0, str(VAE_DIR))
         from ae_model import ChunkedStreamingTAEHV, _apply_parallel

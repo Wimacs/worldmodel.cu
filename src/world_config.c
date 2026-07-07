@@ -30,6 +30,9 @@ void world_config_defaults(WorldConfig *cfg) {
     cfg->global_pinned_dilation = 8;
     cfg->global_attn_period = 4;
     cfg->global_attn_offset = -1;
+    cfg->base_fps = 15;
+    cfg->inference_fps = 60;
+    cfg->temporal_compression = 4;
     cfg->value_residual = 1;
     cfg->prompt_conditioning = 0;
     cfg->scheduler_sigmas[0] = 1.0f;
@@ -120,6 +123,9 @@ int world_config_load(WorldConfig *cfg, const char *path) {
         parse_scalar_int(line, "global_pinned_dilation", &cfg->global_pinned_dilation);
         parse_scalar_int(line, "global_attn_period", &cfg->global_attn_period);
         parse_scalar_int(line, "global_attn_offset", &cfg->global_attn_offset);
+        parse_scalar_int(line, "base_fps", &cfg->base_fps);
+        parse_scalar_int(line, "inference_fps", &cfg->inference_fps);
+        parse_scalar_int(line, "temporal_compression", &cfg->temporal_compression);
         parse_scalar_bool_null(line, "value_residual", &cfg->value_residual);
         parse_scalar_bool_null(line, "prompt_conditioning", &cfg->prompt_conditioning);
     }

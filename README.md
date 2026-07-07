@@ -42,11 +42,17 @@ cmake --build build -j
 Run the current standalone image probe:
 
 ```sh
-./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
+./build/worldmodel_cuda --model-dir ../Waypoint-1.5-1B --steps 4 --frame-idx 3 --cache-pass --out /tmp/world_full.ppm --dump-prefix /tmp/world_full
 ```
 
 Pass `--control controls.f32` to provide one little-endian float32 controller
 vector of length `n_buttons + 3`; if omitted, the executable uses zeros.
+Pass `--frame-idx N` to set the temporal RoPE position and per-layer cache
+bucket for the generated frame. Pass `--cache-pass` to run one final sigma=0
+unfrozen transformer pass after the scheduler; this writes the final latent's
+K/V entries into the local/global ring caches. With `--dump-prefix`, the
+standalone executable also writes `/tmp/world_full.cache_written_counts.f32`
+with one float count per layer so cache writes can be parity-checked.
 
 This executable is plain C+CUDA and currently links only CUDA runtime and
 cuBLAS. It parses `config.yaml`, reads `transformer/diffusion_pytorch_model.safetensors`,
@@ -120,8 +126,9 @@ Notes:
   linear layers still use PyTorch/cuBLAS while the dedicated GEMM path is built.
 - `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
 - `worldmodel_cuda` now uses per-layer ring caches and indexed GQA attention in
-  the standalone transformer path. The current executable still runs a single
-  frozen frame; unfrozen multi-frame cache persistence is the next runtime step.
+  the standalone transformer path. It supports a final unfrozen cache write pass
+  for the current frame; a true multi-frame generation loop with cache history
+  persisting across frames is the next runtime step.
 - `masked_attention` is an online-softmax GQA written-mask kernel kept for
   focused extension parity coverage.
 - `kv_cache_upsert` mirrors the Python ring-cache/tail-frame update semantics.

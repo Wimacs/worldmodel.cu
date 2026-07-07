@@ -1053,6 +1053,43 @@ static int dump_f32(const char *prefix, const char *name, const float *x, size_t
     return 0;
 }
 
+static int dump_cache_written_counts(const char *prefix, const DeviceWorldLayerCache *caches, int n_layers) {
+    if (!prefix || !prefix[0] || !caches) return 0;
+    float *counts = (float *)calloc((size_t)n_layers, sizeof(float));
+    if (!counts) {
+        fprintf(stderr, "failed to allocate cache count dump buffer\n");
+        return 1;
+    }
+
+    int rc = 1;
+    for (int layer = 0; layer < n_layers; ++layer) {
+        const DeviceWorldLayerCache *cache = &caches[layer];
+        bool *written = (bool *)malloc((size_t)cache->capacity * sizeof(bool));
+        if (!written) {
+            fprintf(stderr, "failed to allocate cache written host buffer\n");
+            goto cleanup;
+        }
+        cudaError_t err = cudaMemcpy(written, cache->written, (size_t)cache->capacity * sizeof(bool), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA error while dumping cache counts: %s\n", cudaGetErrorString(err));
+            free(written);
+            goto cleanup;
+        }
+        int count = 0;
+        for (int i = 0; i < cache->capacity; ++i) {
+            if (written[i]) count++;
+        }
+        counts[layer] = (float)count;
+        free(written);
+    }
+
+    rc = dump_f32(prefix, "cache_written_counts", counts, (size_t)n_layers);
+
+cleanup:
+    free(counts);
+    return rc;
+}
+
 typedef struct {
     float *weight;
     float *bias;
@@ -1914,6 +1951,8 @@ extern "C" int world_cuda_transformer_probe(
         const WorldModelProbeWeights *weights,
         int layers_to_run,
         int steps_to_run,
+        int frame_idx,
+        int cache_pass,
         float sigma,
         unsigned int seed,
         const char *dump_prefix,
@@ -1942,6 +1981,14 @@ extern "C" int world_cuda_transformer_probe(
         fprintf(stderr, "invalid steps_to_run=%d scheduler_count=%d\n", steps_to_run, cfg->scheduler_sigmas_count);
         return 1;
     }
+    if (frame_idx < 0) {
+        fprintf(stderr, "invalid frame_idx=%d\n", frame_idx);
+        return 1;
+    }
+
+    int fps_div = cfg->temporal_compression > 0 ? cfg->inference_fps / cfg->temporal_compression : 0;
+    int frame_stride = fps_div > 0 ? cfg->base_fps / fps_div : 1;
+    int frame_timestamp = frame_idx * frame_stride;
 
     size_t latent_elems = (size_t)C * H * W;
     size_t patch_weight_elems = (size_t)D * C * ph * pw;
@@ -1952,6 +1999,7 @@ extern "C" int world_cuda_transformer_probe(
     size_t out_norm_weight_elems = (size_t)2 * D * D;
     size_t unpatch_weight_elems = (size_t)D * C * ph * pw;
     int out_dim = C * ph * pw;
+    int total_passes = steps_to_run + (cache_pass ? 1 : 0);
 
     float *h_latent = (float *)malloc(latent_elems * sizeof(float));
     float *h_noise = (float *)malloc(512 * sizeof(float));
@@ -1976,7 +2024,7 @@ extern "C" int world_cuda_transformer_probe(
         return 1;
     }
     fill_latent(h_latent, (int)latent_elems, seed);
-    fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, 0);
+    fill_positions(h_x_pos, h_y_pos, h_t_pos, T, cfg->width, frame_timestamp);
     fill_rope_tables(h_xy, h_inv_t, d_head, cfg->height, cfg->width);
 
     float *d_latent = NULL;
@@ -2125,14 +2173,20 @@ extern "C" int world_cuda_transformer_probe(
     rms_norm_rows_f32_kernel<<<1, 256>>>(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f);
     TRY_CUDA2(cudaGetLastError());
 
-    for (int step_idx = 0; step_idx < steps_to_run; ++step_idx) {
-        float sigma_step = steps_to_run == 1 ? sigma : cfg->scheduler_sigmas[step_idx];
-        float next_sigma = steps_to_run == 1 ? cfg->scheduler_sigmas[1] : cfg->scheduler_sigmas[step_idx + 1];
+    for (int pass_idx = 0; pass_idx < total_passes; ++pass_idx) {
+        int is_cache_pass = pass_idx >= steps_to_run;
+        int frozen_pass = !is_cache_pass;
+        float sigma_step = is_cache_pass ? 0.0f : (steps_to_run == 1 ? sigma : cfg->scheduler_sigmas[pass_idx]);
+        float next_sigma = is_cache_pass ? 0.0f : (steps_to_run == 1 ? cfg->scheduler_sigmas[1] : cfg->scheduler_sigmas[pass_idx + 1]);
         float dsigma = next_sigma - sigma_step;
-        int is_last_step = step_idx == steps_to_run - 1;
-        fprintf(stderr,
-                "scheduler step %02d/%02d: sigma=%.6g next=%.6g dsigma=%.6g\n",
-                step_idx + 1, steps_to_run, sigma_step, next_sigma, dsigma);
+        int is_last_step = !is_cache_pass && pass_idx == steps_to_run - 1;
+        if (is_cache_pass) {
+            fprintf(stderr, "cache pass: sigma=0 frame_idx=%d frozen=false\n", frame_idx);
+        } else {
+            fprintf(stderr,
+                    "scheduler step %02d/%02d: sigma=%.6g next=%.6g dsigma=%.6g frame_idx=%d frozen=true\n",
+                    pass_idx + 1, steps_to_run, sigma_step, next_sigma, dsigma, frame_idx);
+        }
 
         fill_noise_embedding(h_noise, sigma_step);
         TRY_CUDA2(cudaMemcpy(d_noise, h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
@@ -2186,18 +2240,16 @@ extern "C" int world_cuda_transformer_probe(
             }
 
             {
-                int frame_idx = 0;
                 int bucket = (frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
                 int num_buckets = (cache->ring_length / T) / cache->pinned_dilation;
                 int base = (bucket % num_buckets) * T;
                 bool write_step = (frame_idx % cache->pinned_dilation) == 0;
-                bool frozen = true;
                 kv_cache_mask_kernel<<<div_up_i64(cache->capacity, 256), 256>>>(
                     cache->written, cache->mask_written, cache->capacity, T, base, write_step);
                 TRY_CUDA2(cudaGetLastError());
                 kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * T * d_head, 256), 256>>>(
                     cache->k, cache->v, d_k, d_v, cache->written,
-                    cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, frozen);
+                    cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
                 TRY_CUDA2(cudaGetLastError());
                 collect_cache_indices_kernel<<<1, 1>>>(
                     cache->mask_written, cache->indices, cache->index_count, cache->capacity);
@@ -2244,6 +2296,10 @@ extern "C" int world_cuda_transformer_probe(
             TRY_CUDA2(cudaMemcpy(d_tokens, d_tokens_after_mlp, token_elems * sizeof(float), cudaMemcpyDeviceToDevice));
         }
 
+        if (is_cache_pass) {
+            continue;
+        }
+
         silu_f32_kernel<<<div_up_i64(D, 256), 256>>>(d_cond, d_cond_act, D);
         TRY_CUDA2(cudaGetLastError());
         TRY_LINEAR2(d_cond_act, d_out_norm_w, d_out_mod, 1, D, 2 * D);
@@ -2270,6 +2326,7 @@ extern "C" int world_cuda_transformer_probe(
     print_stats("transformer_tokens", h_tokens, (int)token_elems);
     print_stats("latent_out", h_latent_out, (int)latent_elems);
     print_stats("latent_final", h_latent, (int)latent_elems);
+    if (cache_pass && dump_cache_written_counts(dump_prefix, d_caches, layers_to_run)) goto cleanup_device;
     if (dump_f32(dump_prefix, "transformer_tokens", h_tokens, token_elems) ||
         dump_f32(dump_prefix, "latent_out", h_latent_out, latent_elems) ||
         dump_f32(dump_prefix, "latent_final", h_latent, latent_elems)) goto cleanup_device;
