@@ -13,6 +13,9 @@ Implemented CUDA ops:
 - `ortho_rope`
 - `qkv_rms_rope`
 - `masked_attention`
+- `kv_cache_upsert`
+- `patchify`
+- `unpatchify`
 
 Run parity tests:
 
@@ -32,3 +35,6 @@ Notes:
 - `qkv_rms_rope` fuses QKV split, Q/K RMSNorm, World OrthoRoPE, and V layout.
 - `masked_attention` is an online-softmax GQA written-mask kernel. It is a
   correctness-oriented bridge toward the real ring-cache/block-mask attention.
+- `kv_cache_upsert` mirrors the Python ring-cache/tail-frame update semantics.
+- `patchify` and `unpatchify` fuse the WorldModel layout transforms with their
+  Conv2d/Linear math.

@@ -171,6 +171,110 @@ def test_masked_attention_matches_torch_gqa_written_mask(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=3e-5, atol=3e-5)
 
 
+def _ref_kv_cache_upsert(cache_k, cache_v, written, k, v, frame_idx, ring_length, pinned_dilation, frozen):
+    t = k.shape[2]
+    bucket = (frame_idx + (pinned_dilation - 1)) // pinned_dilation
+    num_buckets = (ring_length // t) // pinned_dilation
+    base = (bucket % num_buckets) * t
+    ring_idx = torch.arange(base, base + t, device=k.device)
+    tail_idx = torch.arange(ring_length, ring_length + t, device=k.device)
+    write_step = frame_idx % pinned_dilation == 0
+
+    mask_written = written.clone()
+    if write_step:
+        mask_written[ring_idx] = False
+
+    cache_k[:, :, tail_idx, :] = k
+    cache_v[:, :, tail_idx, :] = v
+    if not frozen:
+        dst = ring_idx if write_step else tail_idx
+        cache_k[:, :, dst, :] = k
+        cache_v[:, :, dst, :] = v
+        written[dst] = True
+
+    return mask_written
+
+
+def test_kv_cache_upsert_matches_frozen_write_step(wm_cuda):
+    torch.manual_seed(7)
+    b, h, t, d = 1, 2, 4, 8
+    ring_length = 16
+    capacity = ring_length + t
+    cache_k = torch.randn(b, h, capacity, d, device="cuda", dtype=torch.float32)
+    cache_v = torch.randn(b, h, capacity, d, device="cuda", dtype=torch.float32)
+    written = torch.zeros(capacity, device="cuda", dtype=torch.bool)
+    written[0:4] = True
+    written[ring_length:] = True
+    k = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+
+    ref_k = cache_k.clone()
+    ref_v = cache_v.clone()
+    ref_written = written.clone()
+    ref_mask = _ref_kv_cache_upsert(ref_k, ref_v, ref_written, k, v, frame_idx=4, ring_length=ring_length, pinned_dilation=1, frozen=True)
+
+    mask = wm_cuda.kv_cache_upsert(cache_k, cache_v, written, k, v, 4, ring_length, 1, True)
+    torch.testing.assert_close(cache_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(cache_v, ref_v, rtol=0, atol=0)
+    torch.testing.assert_close(written, ref_written, rtol=0, atol=0)
+    torch.testing.assert_close(mask, ref_mask, rtol=0, atol=0)
+
+
+def test_kv_cache_upsert_matches_unfrozen_pinned_dilation(wm_cuda):
+    torch.manual_seed(8)
+    b, h, t, d = 1, 3, 4, 16
+    ring_length = 32
+    capacity = ring_length + t
+    cache_k = torch.zeros(b, h, capacity, d, device="cuda", dtype=torch.float32)
+    cache_v = torch.zeros(b, h, capacity, d, device="cuda", dtype=torch.float32)
+    written = torch.zeros(capacity, device="cuda", dtype=torch.bool)
+    written[0:8] = True
+    written[ring_length:] = True
+    k = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+
+    ref_k = cache_k.clone()
+    ref_v = cache_v.clone()
+    ref_written = written.clone()
+    ref_mask = _ref_kv_cache_upsert(ref_k, ref_v, ref_written, k, v, frame_idx=5, ring_length=ring_length, pinned_dilation=2, frozen=False)
+
+    mask = wm_cuda.kv_cache_upsert(cache_k, cache_v, written, k, v, 5, ring_length, 2, False)
+    torch.testing.assert_close(cache_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(cache_v, ref_v, rtol=0, atol=0)
+    torch.testing.assert_close(written, ref_written, rtol=0, atol=0)
+    torch.testing.assert_close(mask, ref_mask, rtol=0, atol=0)
+
+
+def test_patchify_matches_torch_conv2d_layout(wm_cuda):
+    torch.manual_seed(9)
+    b, c, h, w = 2, 5, 8, 10
+    d, ph, pw = 7, 2, 2
+    x = torch.randn(b, c, h, w, device="cuda", dtype=torch.float32)
+    weight = torch.randn(d, c, ph, pw, device="cuda", dtype=torch.float32)
+
+    y = wm_cuda.patchify(x, weight)
+    ref = F.conv2d(x, weight, bias=None, stride=(ph, pw))
+    ref = ref.permute(0, 2, 3, 1).reshape(b, (h // ph) * (w // pw), d).contiguous()
+    torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
+def test_unpatchify_matches_torch_linear_layout(wm_cuda):
+    torch.manual_seed(10)
+    b, c, h, w = 2, 4, 6, 8
+    ph, pw = 2, 2
+    hp, wp = h // ph, w // pw
+    d = 9
+    out_dim = c * ph * pw
+    tokens = torch.randn(b, hp * wp, d, device="cuda", dtype=torch.float32)
+    weight = torch.randn(out_dim, d, device="cuda", dtype=torch.float32)
+    bias = torch.randn(out_dim, device="cuda", dtype=torch.float32)
+
+    y = wm_cuda.unpatchify(tokens, weight, bias, c, h, w, ph, pw)
+    ref = F.linear(tokens, weight, bias)
+    ref = ref.view(b, hp, wp, c, ph, pw).permute(0, 3, 1, 4, 2, 5).reshape(b, c, h, w).contiguous()
+    torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
 if __name__ == "__main__":
     ext = load_wm_cuda()
     for test in (
@@ -180,6 +284,10 @@ if __name__ == "__main__":
         test_ortho_rope_matches_world_formula,
         test_qkv_rms_rope_matches_split_reference,
         test_masked_attention_matches_torch_gqa_written_mask,
+        test_kv_cache_upsert_matches_frozen_write_step,
+        test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
+        test_patchify_matches_torch_conv2d_layout,
+        test_unpatchify_matches_torch_linear_layout,
     ):
         test(ext)
         print(f"{test.__name__}: ok")

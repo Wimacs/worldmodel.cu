@@ -315,6 +315,179 @@ __global__ void masked_attention_f32_kernel(
     }
 }
 
+__global__ void kv_cache_upsert_copy_f32_kernel(
+        float *cache_k,
+        float *cache_v,
+        const float *k,
+        const float *v,
+        bool *written,
+        int B,
+        int H,
+        int T,
+        int D,
+        int L,
+        int base,
+        bool write_step,
+        bool frozen) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * T * D;
+    if (i >= total) return;
+
+    int d = i % D;
+    int64_t q = i / D;
+    int t = q % T;
+    q /= T;
+    int h = q % H;
+    int b = q / H;
+
+    int tail_idx = L + t;
+    int ring_idx = base + t;
+    int dst_idx = (!frozen && write_step) ? ring_idx : tail_idx;
+
+    int64_t src = (((int64_t)b * H + h) * T + t) * D + d;
+    int64_t tail = (((int64_t)b * H + h) * (L + T) + tail_idx) * D + d;
+    int64_t dst = (((int64_t)b * H + h) * (L + T) + dst_idx) * D + d;
+
+    float kv = k[src];
+    float vv = v[src];
+    cache_k[tail] = kv;
+    cache_v[tail] = vv;
+    if (!frozen) {
+        cache_k[dst] = kv;
+        cache_v[dst] = vv;
+    }
+
+    if (b == 0 && h == 0 && d == 0) {
+        written[tail_idx] = true;
+        if (!frozen) {
+            written[dst_idx] = true;
+        }
+    }
+}
+
+__global__ void kv_cache_mask_kernel(
+        const bool *written,
+        bool *mask_written,
+        int capacity,
+        int T,
+        int base,
+        bool write_step) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= capacity) return;
+    bool value = written[i];
+    if (write_step && i >= base && i < base + T) {
+        value = false;
+    }
+    mask_written[i] = value;
+}
+
+__global__ void patchify_f32_kernel(
+        const float *x,
+        const float *weight,
+        float *tokens,
+        int B,
+        int C,
+        int H,
+        int W,
+        int D,
+        int ph,
+        int pw,
+        int Hp,
+        int Wp) {
+    __shared__ float red[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int d = row % D;
+    int token = (row / D) % (Hp * Wp);
+    int b = row / (D * Hp * Wp);
+    int oy = token / Wp;
+    int ox = token - oy * Wp;
+    int patch_elems = C * ph * pw;
+
+    float sum = 0.0f;
+    for (int i = tid; i < patch_elems; i += blockDim.x) {
+        int p = i;
+        int dx = p % pw;
+        p /= pw;
+        int dy = p % ph;
+        int c = p / ph;
+        int iy = oy * ph + dy;
+        int ix = ox * pw + dx;
+        float xv = x[((int64_t)b * C * H + c * H + iy) * W + ix];
+        float wv = weight[(((int64_t)d * C + c) * ph + dy) * pw + dx];
+        sum += xv * wv;
+    }
+
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        tokens[((int64_t)b * Hp * Wp + token) * D + d] = red[0];
+    }
+}
+
+__global__ void unpatchify_f32_kernel(
+        const float *tokens,
+        const float *weight,
+        const float *bias,
+        float *x,
+        int B,
+        int T,
+        int D,
+        int C,
+        int H,
+        int W,
+        int ph,
+        int pw,
+        int Hp,
+        int Wp,
+        int out_dim) {
+    __shared__ float red[256];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int o = row % out_dim;
+    int token = (row / out_dim) % T;
+    int b = row / (out_dim * T);
+
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        sum += tokens[((int64_t)b * T + token) * D + d] * weight[(int64_t)o * D + d];
+    }
+
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int p = o;
+        int dx = p % pw;
+        p /= pw;
+        int dy = p % ph;
+        p /= ph;
+        int c = p;
+        int oy = token / Wp;
+        int ox = token - oy * Wp;
+        int iy = oy * ph + dy;
+        int ix = ox * pw + dx;
+        x[((int64_t)b * C * H + c * H + iy) * W + ix] = red[0] + bias[o];
+    }
+}
+
 torch::Tensor silu_cuda(torch::Tensor x) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CONTIGUOUS(x);
@@ -568,6 +741,189 @@ torch::Tensor masked_attention_cuda(
     return out;
 }
 
+torch::Tensor kv_cache_upsert_cuda(
+        torch::Tensor cache_k,
+        torch::Tensor cache_v,
+        torch::Tensor written,
+        torch::Tensor k,
+        torch::Tensor v,
+        int64_t frame_idx,
+        int64_t ring_length,
+        int64_t pinned_dilation,
+        bool frozen) {
+    WM_CHECK_CUDA(cache_k);
+    WM_CHECK_CUDA(cache_v);
+    WM_CHECK_CUDA(written);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CONTIGUOUS(cache_k);
+    WM_CHECK_CONTIGUOUS(cache_v);
+    WM_CHECK_CONTIGUOUS(written);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_F32(cache_k);
+    WM_CHECK_F32(cache_v);
+    WM_CHECK_F32(k);
+    WM_CHECK_F32(v);
+    TORCH_CHECK(written.scalar_type() == at::ScalarType::Bool, "written must be bool");
+    TORCH_CHECK(cache_k.sizes() == cache_v.sizes(), "cache_k/cache_v shape mismatch");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k/v shape mismatch");
+    TORCH_CHECK(cache_k.dim() == 4 && k.dim() == 4, "cache and k/v must be [B,H,T,D]");
+    TORCH_CHECK(cache_k.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(cache_k.size(1) == k.size(1), "H mismatch");
+    TORCH_CHECK(cache_k.size(3) == k.size(3), "D mismatch");
+    TORCH_CHECK(frame_idx >= 0, "frame_idx must be non-negative");
+    TORCH_CHECK(ring_length > 0, "ring_length must be positive");
+    TORCH_CHECK(pinned_dilation > 0, "pinned_dilation must be positive");
+
+    int B = (int)k.size(0);
+    int H = (int)k.size(1);
+    int T = (int)k.size(2);
+    int D = (int)k.size(3);
+    int L = (int)ring_length;
+    int capacity = (int)cache_k.size(2);
+    TORCH_CHECK(capacity == L + T, "cache capacity must equal ring_length + T");
+    TORCH_CHECK(written.numel() == capacity, "written length must equal cache capacity");
+    TORCH_CHECK(L % T == 0, "ring_length must be divisible by T");
+    TORCH_CHECK((L / T) % pinned_dilation == 0, "ring frames must be divisible by pinned_dilation");
+
+    int64_t bucket = (frame_idx + (pinned_dilation - 1)) / pinned_dilation;
+    int64_t num_buckets = (L / T) / pinned_dilation;
+    int base = (int)((bucket % num_buckets) * T);
+    bool write_step = (frame_idx % pinned_dilation) == 0;
+
+    auto mask_written = torch::empty_like(written);
+    kv_cache_mask_kernel<<<div_up_i64(capacity, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        written.data_ptr<bool>(),
+        mask_written.data_ptr<bool>(),
+        capacity,
+        T,
+        base,
+        write_step);
+    check_last_cuda_error("kv_cache_mask");
+
+    int64_t total = (int64_t)B * H * T * D;
+    kv_cache_upsert_copy_f32_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        cache_k.data_ptr<float>(),
+        cache_v.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        written.data_ptr<bool>(),
+        B,
+        H,
+        T,
+        D,
+        L,
+        base,
+        write_step,
+        frozen);
+    check_last_cuda_error("kv_cache_upsert_copy");
+
+    return mask_written;
+}
+
+torch::Tensor patchify_cuda(torch::Tensor x, torch::Tensor weight) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(weight);
+    TORCH_CHECK(x.dim() == 4, "x must be [B,C,H,W]");
+    TORCH_CHECK(weight.dim() == 4, "weight must be [D,C,ph,pw]");
+    TORCH_CHECK(x.size(1) == weight.size(1), "channel mismatch");
+
+    int B = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int D = (int)weight.size(0);
+    int ph = (int)weight.size(2);
+    int pw = (int)weight.size(3);
+    TORCH_CHECK(H % ph == 0 && W % pw == 0, "H/W must be divisible by patch");
+    int Hp = H / ph;
+    int Wp = W / pw;
+
+    auto tokens = torch::empty({B, Hp * Wp, D}, x.options());
+    int64_t rows = (int64_t)B * Hp * Wp * D;
+    patchify_f32_kernel<<<div_up_i64(rows, 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        tokens.data_ptr<float>(),
+        B,
+        C,
+        H,
+        W,
+        D,
+        ph,
+        pw,
+        Hp,
+        Wp);
+    check_last_cuda_error("patchify_f32");
+    return tokens;
+}
+
+torch::Tensor unpatchify_cuda(
+        torch::Tensor tokens,
+        torch::Tensor weight,
+        torch::Tensor bias,
+        int64_t channels,
+        int64_t height,
+        int64_t width,
+        int64_t patch_h,
+        int64_t patch_w) {
+    WM_CHECK_CUDA(tokens);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CUDA(bias);
+    WM_CHECK_CONTIGUOUS(tokens);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_CONTIGUOUS(bias);
+    WM_CHECK_F32(tokens);
+    WM_CHECK_F32(weight);
+    WM_CHECK_F32(bias);
+    TORCH_CHECK(tokens.dim() == 3, "tokens must be [B,T,D]");
+    TORCH_CHECK(weight.dim() == 2, "weight must be [C*ph*pw,D]");
+    TORCH_CHECK(bias.dim() == 1, "bias must be [C*ph*pw]");
+    TORCH_CHECK(channels > 0 && height > 0 && width > 0 && patch_h > 0 && patch_w > 0, "invalid shape");
+    TORCH_CHECK(height % patch_h == 0 && width % patch_w == 0, "height/width must be divisible by patch");
+
+    int B = (int)tokens.size(0);
+    int T = (int)tokens.size(1);
+    int D = (int)tokens.size(2);
+    int C = (int)channels;
+    int H = (int)height;
+    int W = (int)width;
+    int ph = (int)patch_h;
+    int pw = (int)patch_w;
+    int Hp = H / ph;
+    int Wp = W / pw;
+    int out_dim = C * ph * pw;
+    TORCH_CHECK(T == Hp * Wp, "T must equal patched spatial token count");
+    TORCH_CHECK(weight.size(0) == out_dim && weight.size(1) == D, "weight shape mismatch");
+    TORCH_CHECK(bias.numel() == out_dim, "bias shape mismatch");
+
+    auto x = torch::empty({B, C, H, W}, tokens.options());
+    int64_t rows = (int64_t)B * T * out_dim;
+    unpatchify_f32_kernel<<<div_up_i64(rows, 1), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        tokens.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        x.data_ptr<float>(),
+        B,
+        T,
+        D,
+        C,
+        H,
+        W,
+        ph,
+        pw,
+        Hp,
+        Wp,
+        out_dim);
+    check_last_cuda_error("unpatchify_f32");
+    return x;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu", &silu_cuda, "WorldModel SiLU (CUDA, f32)");
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
@@ -575,4 +931,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");
     m.def("qkv_rms_rope", &qkv_rms_rope_cuda, "WorldModel fused QKV split + RMSNorm + OrthoRoPE (CUDA, f32)", py::arg("qkv"), py::arg("x_pos"), py::arg("y_pos"), py::arg("t_pos"), py::arg("xy"), py::arg("inv_t"), py::arg("n_heads"), py::arg("n_kv_heads"), py::arg("width"), py::arg("height"), py::arg("eps") = 1.0e-6);
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
+    m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
+    m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
+    m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
 }
