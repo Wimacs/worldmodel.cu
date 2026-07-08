@@ -39,6 +39,14 @@ typedef struct {
     float eps;
 } WorldVulkanRmsNormPush;
 
+typedef struct {
+    uint32_t B;
+    uint32_t T;
+    uint32_t N;
+    uint32_t D;
+    float eps;
+} WorldVulkanAdaRmsNormPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -1101,6 +1109,115 @@ cleanup:
     if (rt) {
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
         destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_ada_rms_norm_f32_probe(void) {
+    enum { B = 2, N = 3, M = 5, T = N * M, D = 257 };
+    const float eps = 1.0e-6f;
+    const int rows = B * T;
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer scale_buffer = VK_NULL_HANDLE;
+    VkBuffer bias_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory scale_memory = VK_NULL_HANDLE;
+    VkDeviceMemory bias_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *scale_mapped = NULL;
+    void *bias_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)rows * D * sizeof(float);
+    size_t sb_bytes = (size_t)B * N * D * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, sb_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &scale_buffer, &scale_memory, &scale_mapped)) goto cleanup;
+    if (create_host_buffer(rt, sb_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &bias_buffer, &bias_memory, &bias_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+    float *x = (float *)x_mapped;
+    float *scale = (float *)scale_mapped;
+    float *bias = (float *)bias_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < rows * D; ++i) x[i] = probe_value(i + 211, 0.046875f);
+    for (int i = 0; i < B * N * D; ++i) {
+        scale[i] = probe_value(i + 307, 0.0078125f);
+        bias[i] = probe_value(i + 409, 0.01171875f);
+    }
+    memset(y, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "ada_rms_norm_f32.comp", 4, sizeof(WorldVulkanAdaRmsNormPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[4] = {x_buffer, scale_buffer, bias_buffer, y_buffer};
+    VkDeviceSize sizes[4] = {x_bytes, sb_bytes, sb_bytes, x_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 4, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanAdaRmsNormPush push;
+    push.B = B;
+    push.T = T;
+    push.N = N;
+    push.D = D;
+    push.eps = eps;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                rows, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int t = 0; t < T; ++t) {
+            int row = b * T + t;
+            int n = t / M;
+            float sum = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                float v = x[row * D + d];
+                sum += v * v;
+            }
+            float inv = 1.0f / sqrtf(sum / (float)D + eps);
+            for (int d = 0; d < D; ++d) {
+                int idx = row * D + d;
+                int sb = (b * N + n) * D + d;
+                float ref = x[idx] * inv * (1.0f + scale[sb]) + bias[sb];
+                float diff = fabsf(y[idx] - ref);
+                if (diff > max_abs) max_abs = diff;
+                mean_abs += diff;
+            }
+        }
+    }
+    mean_abs /= (float)(rows * D);
+    fprintf(stderr, "vulkan ada_rms_norm_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 4.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, scale_buffer, scale_memory, scale_mapped);
+        destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
         destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
     }
     world_vulkan_runtime_destroy(rt);
