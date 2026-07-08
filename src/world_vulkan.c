@@ -263,6 +263,19 @@ typedef struct {
     VkDescriptorSet descriptor_set;
 } WorldVulkanVaeOp;
 
+typedef struct {
+    const char *label;
+    uint32_t begin_query;
+    uint32_t end_query;
+} WorldVulkanProfileEvent;
+
+typedef struct {
+    const char *label;
+    double total_ms;
+    double max_ms;
+    uint32_t count;
+} WorldVulkanProfileAgg;
+
 static int vae_conv_uses_1x1_c4(const WorldVulkanVaeOp *op) {
     return op && op->kind == WORLD_VULKAN_VAE_CONV && op->stride == 1 && (op->C_out % 4) == 0;
 }
@@ -283,6 +296,16 @@ struct WorldVulkanRuntime {
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
     VkFence fence;
+    VkQueryPool profile_query_pool;
+    uint64_t *profile_query_values;
+    WorldVulkanProfileEvent *profile_events;
+    uint32_t profile_max_events;
+    uint32_t profile_event_count;
+    uint32_t profile_timestamp_valid_bits;
+    float profile_timestamp_period_ns;
+    int profile_enabled;
+    int profile_overflow_warned;
+    int profile_top_n;
     VkBuffer output_buffer;
     VkDeviceMemory output_memory;
     VkBuffer output_readback_buffer;
@@ -348,6 +371,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
     VkPipeline runtime_linear_pipeline;
+    VkShaderModule runtime_linear_tile64_shader;
+    VkPipelineLayout runtime_linear_tile64_pipeline_layout;
+    VkPipeline runtime_linear_tile64_pipeline;
+    int runtime_linear_tile64_enabled;
     VkShaderModule runtime_silu_shader;
     VkDescriptorSetLayout runtime_silu_set_layout;
     VkPipelineLayout runtime_silu_pipeline_layout;
@@ -1543,6 +1570,196 @@ static void cmd_shader_barrier(VkCommandBuffer cmd) {
             0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
+static int profile_agg_desc_cmp(const void *a, const void *b) {
+    const WorldVulkanProfileAgg *aa = (const WorldVulkanProfileAgg *)a;
+    const WorldVulkanProfileAgg *bb = (const WorldVulkanProfileAgg *)b;
+    if (aa->total_ms < bb->total_ms) return 1;
+    if (aa->total_ms > bb->total_ms) return -1;
+    return 0;
+}
+
+static int create_profile_queries(WorldVulkanRuntime *rt) {
+    const char *profile_env = getenv("WORLD_VULKAN_PROFILE");
+    if (!profile_env || !profile_env[0] || profile_env[0] == '0') return 0;
+
+    uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(rt->physical_device, &family_count, NULL);
+    VkQueueFamilyProperties *families =
+        (VkQueueFamilyProperties *)calloc(family_count ? family_count : 1, sizeof(*families));
+    if (!families) return 1;
+    vkGetPhysicalDeviceQueueFamilyProperties(rt->physical_device, &family_count, families);
+    uint32_t valid_bits = rt->queue_family < family_count ?
+        families[rt->queue_family].timestampValidBits : 0;
+    free(families);
+    if (valid_bits == 0) {
+        fprintf(stderr, "Vulkan timestamp profiling requested, but queue family has timestampValidBits=0\n");
+        return 0;
+    }
+
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(rt->physical_device, &props);
+    rt->profile_timestamp_period_ns = props.limits.timestampPeriod;
+    rt->profile_timestamp_valid_bits = valid_bits;
+    rt->profile_max_events = 8192;
+    rt->profile_top_n = 40;
+    {
+        const char *events_env = getenv("WORLD_VULKAN_PROFILE_EVENTS");
+        if (events_env && events_env[0]) {
+            int v = atoi(events_env);
+            if (v >= 128 && v <= 65536) rt->profile_max_events = (uint32_t)v;
+        }
+        const char *top_env = getenv("WORLD_VULKAN_PROFILE_TOP");
+        if (top_env && top_env[0]) {
+            int v = atoi(top_env);
+            if (v >= 0 && v <= 1024) rt->profile_top_n = v;
+        }
+    }
+
+    rt->profile_events = (WorldVulkanProfileEvent *)calloc(rt->profile_max_events, sizeof(*rt->profile_events));
+    rt->profile_query_values = (uint64_t *)calloc((size_t)rt->profile_max_events * 2, sizeof(*rt->profile_query_values));
+    if (!rt->profile_events || !rt->profile_query_values) return 1;
+
+    VkQueryPoolCreateInfo query_info;
+    memset(&query_info, 0, sizeof(query_info));
+    query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    query_info.queryCount = rt->profile_max_events * 2;
+    VK_CALL_RET(vkCreateQueryPool(rt->device, &query_info, NULL, &rt->profile_query_pool));
+    rt->profile_enabled = 1;
+    fprintf(stderr,
+            "Vulkan timestamp profile enabled: max_events=%u timestamp_period=%.3fns valid_bits=%u\n",
+            rt->profile_max_events, rt->profile_timestamp_period_ns, rt->profile_timestamp_valid_bits);
+    return 0;
+}
+
+static void profile_begin_frame(WorldVulkanRuntime *rt) {
+    if (!rt->profile_enabled || !rt->profile_query_pool) return;
+    rt->profile_event_count = 0;
+    rt->profile_overflow_warned = 0;
+    vkCmdResetQueryPool(rt->command_buffer, rt->profile_query_pool, 0, rt->profile_max_events * 2);
+}
+
+static uint32_t profile_begin_dispatch(WorldVulkanRuntime *rt, const char *label) {
+    if (!rt->profile_enabled || !rt->profile_query_pool) return UINT32_MAX;
+    if (rt->profile_event_count >= rt->profile_max_events) {
+        if (!rt->profile_overflow_warned) {
+            fprintf(stderr, "Vulkan timestamp profile overflow at %u events; increase WORLD_VULKAN_PROFILE_EVENTS\n",
+                    rt->profile_max_events);
+            rt->profile_overflow_warned = 1;
+        }
+        return UINT32_MAX;
+    }
+    uint32_t event_idx = rt->profile_event_count++;
+    WorldVulkanProfileEvent *ev = &rt->profile_events[event_idx];
+    ev->label = label;
+    ev->begin_query = event_idx * 2;
+    ev->end_query = event_idx * 2 + 1;
+    vkCmdWriteTimestamp(rt->command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            rt->profile_query_pool, ev->begin_query);
+    return event_idx;
+}
+
+static void profile_end_dispatch(WorldVulkanRuntime *rt, uint32_t event_idx) {
+    if (event_idx == UINT32_MAX || !rt->profile_enabled || !rt->profile_query_pool) return;
+    vkCmdWriteTimestamp(rt->command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            rt->profile_query_pool, rt->profile_events[event_idx].end_query);
+}
+
+static void profile_report_frame(WorldVulkanRuntime *rt) {
+    if (!rt->profile_enabled || !rt->profile_query_pool || rt->profile_event_count == 0) return;
+    uint32_t query_count = rt->profile_event_count * 2;
+    VkResult res = vkGetQueryPoolResults(rt->device, rt->profile_query_pool,
+            0, query_count,
+            (size_t)query_count * sizeof(uint64_t), rt->profile_query_values,
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "Vulkan timestamp profile read failed: %d\n", (int)res);
+        return;
+    }
+
+    WorldVulkanProfileAgg *aggs =
+        (WorldVulkanProfileAgg *)calloc(rt->profile_event_count, sizeof(*aggs));
+    if (!aggs) return;
+    uint32_t agg_count = 0;
+    double total_ms = 0.0;
+    uint64_t mask = UINT64_MAX;
+    if (rt->profile_timestamp_valid_bits < 64) {
+        mask = (1ull << rt->profile_timestamp_valid_bits) - 1ull;
+    }
+
+    for (uint32_t i = 0; i < rt->profile_event_count; ++i) {
+        const WorldVulkanProfileEvent *ev = &rt->profile_events[i];
+        uint64_t begin = rt->profile_query_values[ev->begin_query] & mask;
+        uint64_t end = rt->profile_query_values[ev->end_query] & mask;
+        uint64_t delta = (end - begin) & mask;
+        double ms = (double)delta * (double)rt->profile_timestamp_period_ns * 1.0e-6;
+        total_ms += ms;
+
+        uint32_t j = 0;
+        for (; j < agg_count; ++j) {
+            if (strcmp(aggs[j].label, ev->label) == 0) break;
+        }
+        if (j == agg_count) {
+            aggs[j].label = ev->label;
+            agg_count++;
+        }
+        aggs[j].total_ms += ms;
+        if (ms > aggs[j].max_ms) aggs[j].max_ms = ms;
+        aggs[j].count++;
+    }
+
+    qsort(aggs, agg_count, sizeof(*aggs), profile_agg_desc_cmp);
+    fprintf(stderr, "Vulkan profile frame %d: dispatch_total=%.3fms events=%u labels=%u\n",
+            rt->frame_ordinal, total_ms, rt->profile_event_count, agg_count);
+    uint32_t limit = (rt->profile_top_n <= 0 || rt->profile_top_n > (int)agg_count) ?
+        agg_count : (uint32_t)rt->profile_top_n;
+    for (uint32_t i = 0; i < limit; ++i) {
+        double avg = aggs[i].count ? aggs[i].total_ms / (double)aggs[i].count : 0.0;
+        fprintf(stderr, "  %-28s total=%9.3fms count=%4u avg=%8.4fms max=%8.4fms\n",
+                aggs[i].label, aggs[i].total_ms, aggs[i].count, avg, aggs[i].max_ms);
+    }
+    free(aggs);
+}
+
+static int use_runtime_linear_tile64(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner) {
+    return rt->runtime_linear_tile64_enabled &&
+        rt->runtime_linear_tile64_pipeline &&
+        rows >= 64u &&
+        cols >= 1024u &&
+        inner >= 1024u;
+}
+
+static VkPipeline runtime_linear_pipeline_for(
+        WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner) {
+    return use_runtime_linear_tile64(rt, rows, cols, inner) ?
+        rt->runtime_linear_tile64_pipeline : rt->runtime_linear_pipeline;
+}
+
+static VkPipelineLayout runtime_linear_layout_for(
+        WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner) {
+    return use_runtime_linear_tile64(rt, rows, cols, inner) ?
+        rt->runtime_linear_tile64_pipeline_layout : rt->runtime_linear_pipeline_layout;
+}
+
+static uint32_t runtime_linear_tile_for(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner) {
+    return use_runtime_linear_tile64(rt, rows, cols, inner) ? 64u : 16u;
+}
+
 static void record_output_readback(WorldVulkanRuntime *rt) {
     VkDeviceSize bytes = (VkDeviceSize)(rt->pixel_count * sizeof(uint32_t));
     VkBufferCopy copy_region;
@@ -2081,6 +2298,12 @@ static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeigh
 }
 
 static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
+#define PROFILE_DISPATCH(label, gx, gy, gz) do { \
+    uint32_t _profile_event = profile_begin_dispatch(rt, (label)); \
+    vkCmdDispatch(rt->command_buffer, (gx), (gy), (gz)); \
+    profile_end_dispatch(rt, _profile_event); \
+} while (0)
+
     for (int i = 0; i < rt->vae_op_count; ++i) {
         WorldVulkanVaeOp *op = &rt->vae_ops[i];
         switch (op->kind) {
@@ -2091,7 +2314,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_repeat_clamp_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_repeat_clamp_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.repeat_clamp",
                         ((uint32_t)vae_elems(op->N, op->C, op->H, op->W) + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2122,7 +2345,9 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                 uint32_t conv_work = (op->C_out % 4) == 0 ?
                     (uint32_t)vae_elems(op->N, op->C_out / 4, op->H, op->W) :
                     (uint32_t)vae_elems(op->N, op->C_out, op->H, op->W);
-                vkCmdDispatch(rt->command_buffer, (conv_work + 255u) / 256u, 1, 1);
+                PROFILE_DISPATCH(vae_conv_uses_1x1_c4(op) ? "vae.conv_1x1_c4" :
+                        ((op->C_out % 4) == 0 ? "vae.conv_c4" : "vae.conv"),
+                        (conv_work + 255u) / 256u, 1, 1);
                 break;
             }
             case WORLD_VULKAN_VAE_RELU: {
@@ -2132,7 +2357,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_relu_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_relu_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer, (push.n + 255u) / 256u, 1, 1);
+                PROFILE_DISPATCH("vae.relu", (push.n + 255u) / 256u, 1, 1);
                 break;
             }
             case WORLD_VULKAN_VAE_CONCAT_PAST: {
@@ -2142,7 +2367,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_concat_past_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_concat_past_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.concat_past",
                         ((uint32_t)vae_elems(op->N, op->C * 2, op->H, op->W) + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2153,7 +2378,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_add_relu_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_add_relu_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer, (push.n + 255u) / 256u, 1, 1);
+                PROFILE_DISPATCH("vae.add_relu", (push.n + 255u) / 256u, 1, 1);
                 break;
             }
             case WORLD_VULKAN_VAE_UPSAMPLE2: {
@@ -2163,7 +2388,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_upsample2_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_upsample2_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.upsample2",
                         ((uint32_t)vae_elems(op->N, op->C, op->H * 2, op->W * 2) + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2176,7 +2401,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_tgrow_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_tgrow_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.tgrow",
                         ((uint32_t)vae_elems(op->N * op->stride, op->C, op->H, op->W) + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2187,7 +2412,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_pixel_shuffle_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_pixel_shuffle_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.pixel_shuffle",
                         ((uint32_t)rt->pixel_count + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2206,13 +2431,14 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_conv_out_rgba_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_conv_out_rgba_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("vae.conv_out_rgba",
                         ((uint32_t)rt->pixel_count + 127u) / 128u, 1, 1);
                 break;
             }
         }
         cmd_shader_barrier(rt->command_buffer);
     }
+#undef PROFILE_DISPATCH
 }
 
 static int create_runtime_model_slice(
@@ -2833,6 +3059,18 @@ static int create_runtime_model_slice(
     if (create_storage_pipeline(rt, "linear_f32.comp", 4, sizeof(WorldVulkanLinearPush),
                 &rt->runtime_linear_shader, &rt->runtime_linear_set_layout,
                 &rt->runtime_linear_pipeline_layout, &rt->runtime_linear_pipeline)) return 1;
+    {
+        const char *tile64_env = getenv("WORLD_VULKAN_LINEAR_TILE64");
+        if (tile64_env && tile64_env[0] == '1') {
+            if (create_storage_pipeline_with_set_layout(rt, "linear_f32_tile64.comp",
+                        rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
+                        &rt->runtime_linear_tile64_shader,
+                        &rt->runtime_linear_tile64_pipeline_layout,
+                        &rt->runtime_linear_tile64_pipeline)) return 1;
+            rt->runtime_linear_tile64_enabled = 1;
+            fprintf(stderr, "Vulkan linear tile64 enabled for large GEMMs (WORLD_VULKAN_LINEAR_TILE64=1)\n");
+        }
+    }
     if (create_storage_pipeline(rt, "silu_f32.comp", 2, sizeof(WorldVulkanSiluPush),
                 &rt->runtime_silu_shader, &rt->runtime_silu_set_layout,
                 &rt->runtime_silu_pipeline_layout, &rt->runtime_silu_pipeline)) return 1;
@@ -3345,6 +3583,19 @@ static int create_runtime_model_slice(
 static int record_runtime_model_slice(
         WorldVulkanRuntime *rt,
         const float *control_input) {
+#define PROFILE_DISPATCH(label, gx, gy, gz) do { \
+    uint32_t _profile_event = profile_begin_dispatch(rt, (label)); \
+    vkCmdDispatch(rt->command_buffer, (gx), (gy), (gz)); \
+    profile_end_dispatch(rt, _profile_event); \
+} while (0)
+#define LINEAR_PIPELINE(push) runtime_linear_pipeline_for(rt, (push).rows, (push).cols, (push).inner)
+#define LINEAR_LAYOUT(push) runtime_linear_layout_for(rt, (push).rows, (push).cols, (push).inner)
+#define LINEAR_DISPATCH(label, push) do { \
+    uint32_t _linear_tile = runtime_linear_tile_for(rt, (push).rows, (push).cols, (push).inner); \
+    PROFILE_DISPATCH((label), ((push).cols + _linear_tile - 1u) / _linear_tile, \
+            ((push).rows + _linear_tile - 1u) / _linear_tile, 1); \
+} while (0)
+
     if (rt->ctrl_embedding_enabled) {
         WorldVulkanLinearPush fc1_push;
         memset(&fc1_push, 0, sizeof(fc1_push));
@@ -3370,12 +3621,12 @@ static int record_runtime_model_slice(
         rms_push.cols = (uint32_t)rt->D;
         rms_push.eps = rt->rms_eps;
 
-        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(fc1_push));
         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                rt->runtime_linear_pipeline_layout, 0, 1, &rt->ctrl_fc1_descriptor_set, 0, NULL);
-        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                LINEAR_LAYOUT(fc1_push), 0, 1, &rt->ctrl_fc1_descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(fc1_push), VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(fc1_push), &fc1_push);
-        vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->mlp_hidden + 15u) / 16u, 1, 1);
+        LINEAR_DISPATCH("linear.ctrl_emb_fc1", fc1_push);
         cmd_shader_barrier(rt->command_buffer);
 
         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_silu_pipeline);
@@ -3383,15 +3634,15 @@ static int record_runtime_model_slice(
                 rt->runtime_silu_pipeline_layout, 0, 1, &rt->ctrl_silu_descriptor_set, 0, NULL);
         vkCmdPushConstants(rt->command_buffer, rt->runtime_silu_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(silu_push), &silu_push);
-        vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->mlp_hidden + 255u) / 256u, 1, 1);
+        PROFILE_DISPATCH("silu.ctrl_emb", ((uint32_t)rt->mlp_hidden + 255u) / 256u, 1, 1);
         cmd_shader_barrier(rt->command_buffer);
 
-        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(fc2_push));
         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                rt->runtime_linear_pipeline_layout, 0, 1, &rt->ctrl_fc2_descriptor_set, 0, NULL);
-        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                LINEAR_LAYOUT(fc2_push), 0, 1, &rt->ctrl_fc2_descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(fc2_push), VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(fc2_push), &fc2_push);
-        vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->D + 15u) / 16u, 1, 1);
+        LINEAR_DISPATCH("linear.ctrl_emb_fc2", fc2_push);
         cmd_shader_barrier(rt->command_buffer);
 
         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_rms_pipeline);
@@ -3399,7 +3650,7 @@ static int record_runtime_model_slice(
                 rt->runtime_rms_pipeline_layout, 0, 1, &rt->ctrl_rms_descriptor_set, 0, NULL);
         vkCmdPushConstants(rt->command_buffer, rt->runtime_rms_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(rms_push), &rms_push);
-        vkCmdDispatch(rt->command_buffer, 1, 1, 1);
+        PROFILE_DISPATCH("rms.ctrl_emb", 1, 1, 1);
         cmd_shader_barrier(rt->command_buffer);
 
         if (rt->layer_ctrl_enabled) {
@@ -3412,13 +3663,13 @@ static int record_runtime_model_slice(
 
             for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
                 if (!rt->layer_has_ctrl[layer_idx]) continue;
-                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(ctrl_cond_push));
                 vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        rt->runtime_linear_pipeline_layout, 0, 1,
+                        LINEAR_LAYOUT(ctrl_cond_push), 0, 1,
                         &rt->ctrl_cond_descriptor_sets[layer_idx], 0, NULL);
-                vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(ctrl_cond_push),
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_cond_push), &ctrl_cond_push);
-                vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->D + 15u) / 16u, 1, 1);
+                LINEAR_DISPATCH("linear.ctrl_cond", ctrl_cond_push);
                 cmd_shader_barrier(rt->command_buffer);
             }
         }
@@ -3486,7 +3737,7 @@ static int record_runtime_model_slice(
                 rt->patchify_pipeline_layout, 0, 1, &rt->patchify_descriptor_set, 0, NULL);
         vkCmdPushConstants(rt->command_buffer, rt->patchify_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(patch_push), &patch_push);
-        vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->D), 1, 1);
+        PROFILE_DISPATCH("patchify", (uint32_t)(rt->T * rt->D), 1, 1);
         cmd_shader_barrier(rt->command_buffer);
 
         if (rt->layer_qkv_enabled) {
@@ -3525,19 +3776,16 @@ static int record_runtime_model_slice(
                     &rt->attn_ada_descriptor_sets[table_idx], 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ada_push), &ada_push);
-            vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+            PROFILE_DISPATCH("ada_rms.attn", (uint32_t)rt->T, 1, 1);
             cmd_shader_barrier(rt->command_buffer);
 
-            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(qkv_push));
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    rt->runtime_linear_pipeline_layout, 0, 1,
+                    LINEAR_LAYOUT(qkv_push), 0, 1,
                     &rt->qkv_proj_descriptor_sets[layer_idx], 0, NULL);
-            vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+            vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(qkv_push),
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
-            vkCmdDispatch(rt->command_buffer,
-                    ((uint32_t)rt->qkv_dim + 15u) / 16u,
-                    ((uint32_t)rt->T + 15u) / 16u,
-                    1);
+            LINEAR_DISPATCH("linear.qkv", qkv_push);
             cmd_shader_barrier(rt->command_buffer);
 
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_qkv_rms_rope_pipeline);
@@ -3549,7 +3797,7 @@ static int record_runtime_model_slice(
                     &qkv_rope_set, 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->runtime_qkv_rms_rope_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rope_push), &rope_push);
-            vkCmdDispatch(rt->command_buffer,
+            PROFILE_DISPATCH("qkv_rms_rope",
                     (uint32_t)rt->T,
                     (uint32_t)(rt->cfg.n_heads + 2 * rt->cfg.n_kv_heads),
                     1);
@@ -3566,7 +3814,7 @@ static int record_runtime_model_slice(
                         &rt->value_residual_descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->runtime_lerp_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lerp_push), &lerp_push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("lerp.value_residual",
                         ((uint32_t)(rt->T * rt->kv_dim) + 255u) / 256u,
                         1, 1);
                 cmd_shader_barrier(rt->command_buffer);
@@ -3617,7 +3865,7 @@ static int record_runtime_model_slice(
                         &rt->kv_upsert_descriptor_sets[layer_idx], 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->runtime_kv_upsert_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH("kv_upsert",
                         ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
                         1, 1);
                 cmd_shader_barrier(rt->command_buffer);
@@ -3628,7 +3876,7 @@ static int record_runtime_model_slice(
                         &rt->cache_indices_descriptor_sets[layer_idx], 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->runtime_cache_indices_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(indices_push), &indices_push);
-                vkCmdDispatch(rt->command_buffer, (uint32_t)(cache_capacity / rt->T), 1, 1);
+                PROFILE_DISPATCH("cache_indices", (uint32_t)(cache_capacity / rt->T), 1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
                 VkPipeline attn_pipeline = rt->runtime_indexed_attention_pipeline;
@@ -3645,7 +3893,8 @@ static int record_runtime_model_slice(
                         &rt->indexed_attention_descriptor_sets[layer_idx], 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, attn_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(attn_push), &attn_push);
-                vkCmdDispatch(rt->command_buffer,
+                PROFILE_DISPATCH(attn_pipeline == rt->runtime_indexed_attention_d64_pipeline ?
+                        "attention.d64" : "attention.generic",
                         (uint32_t)(rt->cfg.n_heads * rt->T),
                         1, 1);
                 cmd_shader_barrier(rt->command_buffer);
@@ -3663,16 +3912,13 @@ static int record_runtime_model_slice(
                     residual_push.T = (uint32_t)rt->T;
                     residual_push.D = (uint32_t)rt->D;
 
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(out_proj_push));
                     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_linear_pipeline_layout, 0, 1,
+                            LINEAR_LAYOUT(out_proj_push), 0, 1,
                             &rt->attn_out_proj_descriptor_sets[layer_idx], 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                    vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(out_proj_push),
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)rt->D + 15u) / 16u,
-                            ((uint32_t)rt->T + 15u) / 16u,
-                            1);
+                    LINEAR_DISPATCH("linear.attn_out", out_proj_push);
                     cmd_shader_barrier(rt->command_buffer);
 
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
@@ -3681,7 +3927,7 @@ static int record_runtime_model_slice(
                             &rt->attn_residual_descriptor_sets[table_idx], 0, NULL);
                     vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
-                    vkCmdDispatch(rt->command_buffer,
+                    PROFILE_DISPATCH("gated.attn_residual",
                             ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                             1, 1);
                     cmd_shader_barrier(rt->command_buffer);
@@ -3715,19 +3961,16 @@ static int record_runtime_model_slice(
                                 &rt->ctrl_norm_descriptor_set, 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_rms_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_norm_push), &ctrl_norm_push);
-                        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                        PROFILE_DISPATCH("rms.ctrl_fusion", (uint32_t)rt->T, 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(ctrl_fc_push));
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                LINEAR_LAYOUT(ctrl_fc_push), 0, 1,
                                 &rt->ctrl_fc1_x_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(ctrl_fc_push),
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                        vkCmdDispatch(rt->command_buffer,
-                                ((uint32_t)rt->D + 15u) / 16u,
-                                ((uint32_t)rt->T + 15u) / 16u,
-                                1);
+                        LINEAR_DISPATCH("linear.ctrl_fc1_x", ctrl_fc_push);
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_channel_silu_pipeline);
@@ -3736,21 +3979,18 @@ static int record_runtime_model_slice(
                                 &rt->ctrl_add_silu_descriptor_sets[layer_idx], 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_add_channel_silu_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_silu_push), &add_silu_push);
-                        vkCmdDispatch(rt->command_buffer,
+                        PROFILE_DISPATCH("add_channel_silu.ctrl",
                                 ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(ctrl_fc_push));
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                LINEAR_LAYOUT(ctrl_fc_push), 0, 1,
                                 &rt->ctrl_fc2_descriptor_sets_layer[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(ctrl_fc_push),
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                        vkCmdDispatch(rt->command_buffer,
-                                ((uint32_t)rt->D + 15u) / 16u,
-                                ((uint32_t)rt->T + 15u) / 16u,
-                                1);
+                        LINEAR_DISPATCH("linear.ctrl_fc2", ctrl_fc_push);
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_pipeline);
@@ -3759,7 +3999,7 @@ static int record_runtime_model_slice(
                                 &rt->ctrl_add_descriptor_set, 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_add_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_push), &add_push);
-                        vkCmdDispatch(rt->command_buffer,
+                        PROFILE_DISPATCH("add.ctrl_residual",
                                 ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
@@ -3798,19 +4038,16 @@ static int record_runtime_model_slice(
                                 &rt->mlp_ada_descriptor_sets[table_idx], 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_ada_push), &mlp_ada_push);
-                        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                        PROFILE_DISPATCH("ada_rms.mlp", (uint32_t)rt->T, 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(mlp_fc1_push));
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                LINEAR_LAYOUT(mlp_fc1_push), 0, 1,
                                 &rt->mlp_fc1_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(mlp_fc1_push),
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc1_push), &mlp_fc1_push);
-                        vkCmdDispatch(rt->command_buffer,
-                                ((uint32_t)rt->mlp_hidden + 15u) / 16u,
-                                ((uint32_t)rt->T + 15u) / 16u,
-                                1);
+                        LINEAR_DISPATCH("linear.mlp_fc1", mlp_fc1_push);
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_silu_pipeline);
@@ -3819,21 +4056,18 @@ static int record_runtime_model_slice(
                                 &rt->mlp_silu_descriptor_set, 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_silu_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_silu_push), &mlp_silu_push);
-                        vkCmdDispatch(rt->command_buffer,
+                        PROFILE_DISPATCH("silu.mlp",
                                 ((uint32_t)(rt->T * rt->mlp_hidden) + 255u) / 256u,
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(mlp_fc2_push));
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                LINEAR_LAYOUT(mlp_fc2_push), 0, 1,
                                 &rt->mlp_fc2_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(mlp_fc2_push),
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc2_push), &mlp_fc2_push);
-                        vkCmdDispatch(rt->command_buffer,
-                                ((uint32_t)rt->D + 15u) / 16u,
-                                ((uint32_t)rt->T + 15u) / 16u,
-                                1);
+                        LINEAR_DISPATCH("linear.mlp_fc2", mlp_fc2_push);
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
@@ -3842,7 +4076,7 @@ static int record_runtime_model_slice(
                                 &rt->mlp_residual_descriptor_sets[table_idx], 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
-                        vkCmdDispatch(rt->command_buffer,
+                        PROFILE_DISPATCH("gated.mlp_residual",
                                 ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
@@ -3872,7 +4106,7 @@ static int record_runtime_model_slice(
                     &rt->out_norm_silu_descriptor_set[table_pass_idx], 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->runtime_out_norm_silu_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_norm_push), &out_norm_push);
-            vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+            PROFILE_DISPATCH("out_norm_silu", (uint32_t)rt->T, 1, 1);
             cmd_shader_barrier(rt->command_buffer);
 
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->unpatch_orig_pipeline);
@@ -3880,7 +4114,7 @@ static int record_runtime_model_slice(
                     rt->unpatch_orig_pipeline_layout, 0, 1, &rt->unpatch_orig_descriptor_set, 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->unpatch_orig_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                     0, sizeof(unpatch_push), &unpatch_push);
-            vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->out_dim), 1, 1);
+            PROFILE_DISPATCH("unpatchify", (uint32_t)(rt->T * rt->out_dim), 1, 1);
             cmd_shader_barrier(rt->command_buffer);
 
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_latent_update_pipeline);
@@ -3889,7 +4123,7 @@ static int record_runtime_model_slice(
                     &rt->latent_update_descriptor_set, 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->runtime_latent_update_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(update_push), &update_push);
-            vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->latent_elems + 255u) / 256u, 1, 1);
+            PROFILE_DISPATCH("latent_update", ((uint32_t)rt->latent_elems + 255u) / 256u, 1, 1);
             cmd_shader_barrier(rt->command_buffer);
         }
     }
@@ -3902,11 +4136,15 @@ static int record_runtime_model_slice(
                 rt->latent_rgba_pipeline_layout, 0, 1, &rt->latent_rgba_descriptor_set, 0, NULL);
         vkCmdPushConstants(rt->command_buffer, rt->latent_rgba_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(rgba_push), &rgba_push);
-        vkCmdDispatch(rt->command_buffer,
+        PROFILE_DISPATCH("latent_to_rgba",
                 ((uint32_t)rt->width + 15u) / 16u,
                 ((uint32_t)rt->height + 15u) / 16u,
                 (uint32_t)rt->frames);
     }
+#undef LINEAR_DISPATCH
+#undef LINEAR_LAYOUT
+#undef LINEAR_PIPELINE
+#undef PROFILE_DISPATCH
     return 0;
 }
 
@@ -4001,6 +4239,7 @@ int world_vulkan_runtime_create(
     if (create_fill_pipeline(rt)) goto fail;
     if (create_descriptors(rt)) goto fail;
     if (create_commands(rt)) goto fail;
+    if (create_profile_queries(rt)) goto fail;
     if (create_runtime_model_slice(rt, weights)) goto fail;
     if (create_runtime_vae(rt, vae)) goto fail;
 
@@ -4065,6 +4304,7 @@ static int world_vulkan_runtime_step_pixels(
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CALL_RET(vkBeginCommandBuffer(rt->command_buffer, &begin_info));
+    profile_begin_frame(rt);
     if (rt->model_slice_enabled) {
         if (record_runtime_model_slice(rt, control_input)) return 1;
     } else {
@@ -4088,6 +4328,7 @@ static int world_vulkan_runtime_step_pixels(
     submit_info.pCommandBuffers = &rt->command_buffer;
     VK_CALL_RET(vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence));
     VK_CALL_RET(vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX));
+    profile_report_frame(rt);
 
     const char *dump_latent_path = getenv("WORLD_DUMP_RUNTIME_LATENT");
     if (rt->model_slice_enabled && dump_latent_path && dump_latent_path[0] && rt->latent_mapped) {
@@ -8203,6 +8444,9 @@ cleanup:
 void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (!rt) return;
     if (rt->device) vkDeviceWaitIdle(rt->device);
+    if (rt->profile_query_pool) vkDestroyQueryPool(rt->device, rt->profile_query_pool, NULL);
+    free(rt->profile_query_values);
+    free(rt->profile_events);
     if (rt->patchify_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->patchify_descriptor_pool, NULL);
     if (rt->unpatch_orig_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->unpatch_orig_descriptor_pool, NULL);
     if (rt->latent_rgba_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_rgba_descriptor_pool, NULL);
@@ -8276,6 +8520,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->latent_update_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_update_descriptor_pool, NULL);
     if (rt->value_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->value_residual_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
+    if (rt->runtime_linear_tile64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_tile64_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
     if (rt->runtime_rms_pipeline) vkDestroyPipeline(rt->device, rt->runtime_rms_pipeline, NULL);
@@ -8306,6 +8551,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_tgrow_pipeline) vkDestroyPipeline(rt->device, rt->taehv_tgrow_pipeline, NULL);
     if (rt->taehv_pixel_shuffle_pipeline) vkDestroyPipeline(rt->device, rt->taehv_pixel_shuffle_pipeline, NULL);
     if (rt->runtime_linear_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_pipeline_layout, NULL);
+    if (rt->runtime_linear_tile64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_tile64_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
     if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
     if (rt->runtime_rms_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_rms_pipeline_layout, NULL);
@@ -8365,6 +8611,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_tgrow_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_tgrow_set_layout, NULL);
     if (rt->taehv_pixel_shuffle_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_pixel_shuffle_set_layout, NULL);
     if (rt->runtime_linear_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_shader, NULL);
+    if (rt->runtime_linear_tile64_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_tile64_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
     if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
     if (rt->runtime_rms_shader) vkDestroyShaderModule(rt->device, rt->runtime_rms_shader, NULL);

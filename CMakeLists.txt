@@ -104,6 +104,7 @@ if(WORLD_ENABLE_VULKAN)
     kv_cache_upsert_copy_f32.comp
     lerp_inplace_f32.comp
     linear_f32.comp
+    linear_f32_tile64.comp
     latent_to_rgba.comp
     masked_attention_f32.comp
     ortho_rope_f32.comp
