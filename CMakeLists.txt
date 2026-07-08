@@ -105,10 +105,12 @@ if(WORLD_ENABLE_VULKAN)
     latent_to_rgba.comp
     masked_attention_f32.comp
     ortho_rope_f32.comp
+    out_norm_silu_f32.comp
     patchify_f32.comp
     qkv_rms_rope_f32.comp
     rms_norm_f32.comp
     silu_f32.comp
+    latent_update_f32.comp
     unpatchify_f32.comp
     unpatchify_orig_f32.comp
   )

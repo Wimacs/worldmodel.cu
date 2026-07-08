@@ -54,10 +54,11 @@ The Vulkan target currently builds `worldmodel_raylib_vulkan` and compiles
 the GLSL files in `shaders/vulkan/` to SPIR-V. The runtime creates a Vulkan
 device, resident compute pipelines, and returns RGB frames through the same
 raylib/headless path. When real model weights are supplied, the Vulkan raylib
-path now runs a resident latent visualization slice every frame:
+path now runs a resident latent scheduler slice every frame:
 `control_input -> linear_f32.comp -> silu_f32.comp -> linear_f32.comp ->
 rms_norm_f32.comp`, followed by
-`patchify_f32.comp -> unpatchify_orig_f32.comp -> latent_to_rgba.comp`.
+`patchify_f32.comp -> out_norm_silu_f32.comp -> unpatchify_orig_f32.comp ->
+latent_update_f32.comp -> latent_to_rgba.comp`.
 At initialization it also precomputes the CUDA-style scheduler conditioning path
 `noise_embed -> denoise MLP -> out_norm modulation table`, plus per-layer
 `cond + bias -> silu -> 6x layer modulation table`, for all requested scheduler
@@ -71,17 +72,20 @@ gated_residual_add_f32.comp -> rms_norm_f32.comp(ctrl) ->
 linear_f32.comp(ctrl fc1_x/fc1_c/fc2) -> add_channel_silu_f32.comp ->
 add_f32.comp -> ada_rms_norm_f32.comp(MLP) -> linear_f32.comp(dit_mlp fc1/fc2)
 -> silu_f32.comp -> gated_residual_add_f32.comp`, with intermediate CPU
-parity probes through the MLP-fused token buffer. Full scheduler pass updates
-and VAE decode are still in progress. Without weights, it falls back to the
-simple `fill_rgba.comp`
+parity probes through the MLP-fused token buffer. The current Vulkan runtime
+then applies the precomputed out-norm modulation, unpatches to latent velocity,
+updates the resident latent through the configured sigma schedule, and runs the
+final unfrozen cache pass. Multi-layer block looping and VAE decode are still
+in progress. Without weights, it falls back to the simple `fill_rgba.comp`
 scaffold for lightweight probes.
 
 `worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
 elementwise `silu_f32.comp`, fused `add_bias_silu_f32.comp`,
-`add_channel_silu_f32.comp`, `add_f32.comp`, rowwise `rms_norm_f32.comp`,
-fused control embedding, denoise/out-norm scheduler conditioning and layer
+`add_channel_silu_f32.comp`, `add_f32.comp`, `out_norm_silu_f32.comp`,
+`latent_update_f32.comp`, rowwise `rms_norm_f32.comp`, fused control embedding,
+denoise/out-norm scheduler conditioning and layer
 modulation precompute, `gated_residual_add_f32.comp`, the runtime layer0
-QKV/cache/attention/out-projection/control-fusion/DiT-MLP slice,
+QKV/cache/attention/out-projection/control-fusion/DiT-MLP/scheduler-update slice,
 `ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused `qkv_rms_rope_f32.comp`,
 `masked_attention_f32.comp`, the KV-cache helpers, `indexed_attention_f32.comp`,
 and the patch/unpatch latent-token boundary.

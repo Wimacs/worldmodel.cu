@@ -180,6 +180,17 @@ typedef struct {
     uint32_t D;
 } WorldVulkanAddChannelSiluPush;
 
+typedef struct {
+    uint32_t rows;
+    uint32_t D;
+    float eps;
+} WorldVulkanOutNormSiluPush;
+
+typedef struct {
+    uint32_t n;
+    float dsigma;
+} WorldVulkanLatentUpdatePush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -290,6 +301,14 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_add_set_layout;
     VkPipelineLayout runtime_add_pipeline_layout;
     VkPipeline runtime_add_pipeline;
+    VkShaderModule runtime_out_norm_silu_shader;
+    VkDescriptorSetLayout runtime_out_norm_silu_set_layout;
+    VkPipelineLayout runtime_out_norm_silu_pipeline_layout;
+    VkPipeline runtime_out_norm_silu_pipeline;
+    VkShaderModule runtime_latent_update_shader;
+    VkDescriptorSetLayout runtime_latent_update_set_layout;
+    VkPipelineLayout runtime_latent_update_pipeline_layout;
+    VkPipeline runtime_latent_update_pipeline;
     VkDescriptorPool ctrl_fc1_descriptor_pool;
     VkDescriptorSet ctrl_fc1_descriptor_set;
     VkDescriptorPool ctrl_silu_descriptor_pool;
@@ -326,8 +345,8 @@ struct WorldVulkanRuntime {
     VkDescriptorSet indexed_attention_descriptor_set;
     VkDescriptorPool attn_out_proj_descriptor_pool;
     VkDescriptorSet attn_out_proj_descriptor_set;
-    VkDescriptorPool attn_residual_descriptor_pool;
-    VkDescriptorSet attn_residual_descriptor_set;
+    VkDescriptorPool attn_residual_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorSet attn_residual_descriptor_set[WORLD_VULKAN_MAX_PASSES];
     VkDescriptorPool ctrl_cond_descriptor_pool;
     VkDescriptorSet ctrl_cond_descriptor_set;
     VkDescriptorPool ctrl_norm_descriptor_pool;
@@ -340,16 +359,20 @@ struct WorldVulkanRuntime {
     VkDescriptorSet ctrl_fc2_descriptor_set_layer;
     VkDescriptorPool ctrl_add_descriptor_pool;
     VkDescriptorSet ctrl_add_descriptor_set;
-    VkDescriptorPool mlp_ada_descriptor_pool;
-    VkDescriptorSet mlp_ada_descriptor_set;
+    VkDescriptorPool mlp_ada_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorSet mlp_ada_descriptor_set[WORLD_VULKAN_MAX_PASSES];
     VkDescriptorPool mlp_fc1_descriptor_pool;
     VkDescriptorSet mlp_fc1_descriptor_set;
     VkDescriptorPool mlp_silu_descriptor_pool;
     VkDescriptorSet mlp_silu_descriptor_set;
     VkDescriptorPool mlp_fc2_descriptor_pool;
     VkDescriptorSet mlp_fc2_descriptor_set;
-    VkDescriptorPool mlp_residual_descriptor_pool;
-    VkDescriptorSet mlp_residual_descriptor_set;
+    VkDescriptorPool mlp_residual_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorSet mlp_residual_descriptor_set[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorPool out_norm_silu_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorSet out_norm_silu_descriptor_set[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorPool latent_update_descriptor_pool;
+    VkDescriptorSet latent_update_descriptor_set;
     VkShaderModule patchify_shader;
     VkDescriptorSetLayout patchify_set_layout;
     VkPipelineLayout patchify_pipeline_layout;
@@ -536,6 +559,9 @@ struct WorldVulkanRuntime {
     VkBuffer tokens_after_mlp_buffer;
     VkDeviceMemory tokens_after_mlp_memory;
     void *tokens_after_mlp_mapped;
+    VkBuffer final_tokens_buffer;
+    VkDeviceMemory final_tokens_memory;
+    void *final_tokens_mapped;
     VkBuffer unpatch_weight_buffer;
     VkDeviceMemory unpatch_weight_memory;
     void *unpatch_weight_mapped;
@@ -1549,6 +1575,8 @@ static int create_runtime_model_slice(
                 &rt->unpatch_weight_buffer, &rt->unpatch_weight_memory, &rt->unpatch_weight_mapped)) return 1;
     if (create_host_buffer(rt, unpatch_bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->unpatch_bias_buffer, &rt->unpatch_bias_memory, &rt->unpatch_bias_mapped)) return 1;
+    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->final_tokens_buffer, &rt->final_tokens_memory, &rt->final_tokens_mapped)) return 1;
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_out_buffer, &rt->latent_out_memory, &rt->latent_out_mapped)) return 1;
 
@@ -1649,6 +1677,7 @@ static int create_runtime_model_slice(
             }
         }
     }
+    memset(rt->final_tokens_mapped, 0, token_bytes);
     memset(rt->latent_out_mapped, 0, latent_bytes);
 
     if (create_storage_pipeline(rt, "linear_f32.comp", 4, sizeof(WorldVulkanLinearPush),
@@ -1697,6 +1726,12 @@ static int create_runtime_model_slice(
             }
         }
     }
+    if (create_storage_pipeline(rt, "out_norm_silu_f32.comp", 3, sizeof(WorldVulkanOutNormSiluPush),
+                &rt->runtime_out_norm_silu_shader, &rt->runtime_out_norm_silu_set_layout,
+                &rt->runtime_out_norm_silu_pipeline_layout, &rt->runtime_out_norm_silu_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "latent_update_f32.comp", 2, sizeof(WorldVulkanLatentUpdatePush),
+                &rt->runtime_latent_update_shader, &rt->runtime_latent_update_set_layout,
+                &rt->runtime_latent_update_pipeline_layout, &rt->runtime_latent_update_pipeline)) return 1;
     if (create_storage_pipeline(rt, "patchify_f32.comp", 3, sizeof(WorldVulkanPatchifyPush),
                 &rt->patchify_shader, &rt->patchify_set_layout,
                 &rt->patchify_pipeline_layout, &rt->patchify_pipeline)) return 1;
@@ -1888,15 +1923,17 @@ static int create_runtime_model_slice(
                                 &rt->attn_out_proj_descriptor_pool,
                                 &rt->attn_out_proj_descriptor_set)) return 1;
                 }
-                {
+                for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+                    int table_idx = pass_idx * rt->layers_to_run;
+                    VkDeviceSize base = (VkDeviceSize)((size_t)table_idx * layer_mod_pass_layer_bytes);
                     VkBuffer buffers[4] = {
                         rt->tokens_buffer, rt->attn_proj_buffer, rt->layer_mod_table_buffer, rt->tokens_after_attn_buffer
                     };
                     VkDeviceSize sizes[4] = {token_bytes, token_bytes, ctrl_emb_bytes, token_bytes};
-                    VkDeviceSize offsets[4] = {0, 0, (VkDeviceSize)(2 * ctrl_emb_bytes), 0};
+                    VkDeviceSize offsets[4] = {0, 0, base + (VkDeviceSize)(2 * ctrl_emb_bytes), 0};
                     if (create_storage_descriptor_set(rt, rt->runtime_gated_residual_set_layout, 4, buffers, sizes, offsets,
-                                &rt->attn_residual_descriptor_pool,
-                                &rt->attn_residual_descriptor_set)) return 1;
+                                &rt->attn_residual_descriptor_pool[pass_idx],
+                                &rt->attn_residual_descriptor_set[pass_idx])) return 1;
                 }
                 if (rt->layer_ctrl_enabled) {
                     {
@@ -1950,20 +1987,22 @@ static int create_runtime_model_slice(
                 }
                 if (rt->layer_mlp_enabled) {
                     VkBuffer mlp_input_buffer = rt->layer_ctrl_enabled ? rt->tokens_after_ctrl_buffer : rt->tokens_after_attn_buffer;
-                    {
+                    for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+                        int table_idx = pass_idx * rt->layers_to_run;
+                        VkDeviceSize base = (VkDeviceSize)((size_t)table_idx * layer_mod_pass_layer_bytes);
                         VkBuffer buffers[4] = {
                             mlp_input_buffer, rt->layer_mod_table_buffer, rt->layer_mod_table_buffer, rt->mlp_in_buffer
                         };
                         VkDeviceSize sizes[4] = {token_bytes, ctrl_emb_bytes, ctrl_emb_bytes, token_bytes};
                         VkDeviceSize offsets[4] = {
                             0,
-                            (VkDeviceSize)(3 * ctrl_emb_bytes),
-                            (VkDeviceSize)(4 * ctrl_emb_bytes),
+                            base + (VkDeviceSize)(3 * ctrl_emb_bytes),
+                            base + (VkDeviceSize)(4 * ctrl_emb_bytes),
                             0
                         };
                         if (create_storage_descriptor_set(rt, rt->runtime_ada_rms_set_layout, 4, buffers, sizes, offsets,
-                                    &rt->mlp_ada_descriptor_pool,
-                                    &rt->mlp_ada_descriptor_set)) return 1;
+                                    &rt->mlp_ada_descriptor_pool[pass_idx],
+                                    &rt->mlp_ada_descriptor_set[pass_idx])) return 1;
                     }
                     {
                         VkBuffer buffers[4] = {
@@ -1990,18 +2029,34 @@ static int create_runtime_model_slice(
                                     &rt->mlp_fc2_descriptor_pool,
                                     &rt->mlp_fc2_descriptor_set)) return 1;
                     }
-                    {
+                    for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+                        int table_idx = pass_idx * rt->layers_to_run;
+                        VkDeviceSize base = (VkDeviceSize)((size_t)table_idx * layer_mod_pass_layer_bytes);
                         VkBuffer buffers[4] = {
                             mlp_input_buffer, rt->mlp_out_buffer, rt->layer_mod_table_buffer, rt->tokens_after_mlp_buffer
                         };
                         VkDeviceSize sizes[4] = {token_bytes, token_bytes, ctrl_emb_bytes, token_bytes};
-                        VkDeviceSize offsets[4] = {0, 0, (VkDeviceSize)(5 * ctrl_emb_bytes), 0};
+                        VkDeviceSize offsets[4] = {0, 0, base + (VkDeviceSize)(5 * ctrl_emb_bytes), 0};
                         if (create_storage_descriptor_set(rt, rt->runtime_gated_residual_set_layout, 4, buffers, sizes, offsets,
-                                    &rt->mlp_residual_descriptor_pool,
-                                    &rt->mlp_residual_descriptor_set)) return 1;
+                                    &rt->mlp_residual_descriptor_pool[pass_idx],
+                                    &rt->mlp_residual_descriptor_set[pass_idx])) return 1;
                     }
                 }
             }
+        }
+    }
+    {
+        VkBuffer final_input_buffer =
+            rt->layer_mlp_enabled ? rt->tokens_after_mlp_buffer :
+                (rt->layer_ctrl_enabled ? rt->tokens_after_ctrl_buffer :
+                (rt->layer_attn_out_enabled ? rt->tokens_after_attn_buffer : rt->tokens_buffer));
+        for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+            VkBuffer buffers[3] = {final_input_buffer, rt->out_mod_table_buffer, rt->final_tokens_buffer};
+            VkDeviceSize sizes[3] = {token_bytes, out_mod_pass_bytes, token_bytes};
+            VkDeviceSize offsets[3] = {0, (VkDeviceSize)((size_t)pass_idx * out_mod_pass_bytes), 0};
+            if (create_storage_descriptor_set(rt, rt->runtime_out_norm_silu_set_layout, 3, buffers, sizes, offsets,
+                        &rt->out_norm_silu_descriptor_pool[pass_idx],
+                        &rt->out_norm_silu_descriptor_set[pass_idx])) return 1;
         }
     }
     {
@@ -2012,9 +2067,7 @@ static int create_runtime_model_slice(
     }
     {
         VkBuffer buffers[4] = {
-            rt->layer_mlp_enabled ? rt->tokens_after_mlp_buffer :
-                (rt->layer_ctrl_enabled ? rt->tokens_after_ctrl_buffer :
-                (rt->layer_attn_out_enabled ? rt->tokens_after_attn_buffer : rt->tokens_buffer)),
+            rt->final_tokens_buffer,
             rt->unpatch_weight_buffer, rt->unpatch_bias_buffer, rt->latent_out_buffer
         };
         VkDeviceSize sizes[4] = {token_bytes, patch_weight_bytes, unpatch_bias_bytes, latent_bytes};
@@ -2022,7 +2075,13 @@ static int create_runtime_model_slice(
                     &rt->unpatch_orig_descriptor_pool, &rt->unpatch_orig_descriptor_set)) return 1;
     }
     {
-        VkBuffer buffers[3] = {rt->latent_out_buffer, rt->output_buffer, rt->ctrl_emb_norm_buffer};
+        VkBuffer buffers[2] = {rt->latent_buffer, rt->latent_out_buffer};
+        VkDeviceSize sizes[2] = {latent_bytes, latent_bytes};
+        if (create_storage_descriptor_set(rt, rt->runtime_latent_update_set_layout, 2, buffers, sizes, NULL,
+                    &rt->latent_update_descriptor_pool, &rt->latent_update_descriptor_set)) return 1;
+    }
+    {
+        VkBuffer buffers[3] = {rt->latent_buffer, rt->output_buffer, rt->ctrl_emb_norm_buffer};
         VkDeviceSize sizes[3] = {latent_bytes, rt->pixel_count * sizeof(uint32_t), ctrl_emb_bytes};
         if (create_storage_descriptor_set(rt, rt->latent_rgba_set_layout, 3, buffers, sizes, NULL,
                     &rt->latent_rgba_descriptor_pool, &rt->latent_rgba_descriptor_set)) return 1;
@@ -2160,324 +2219,165 @@ static int record_runtime_model_slice(
         rgba_push.control_y = control_input[1];
     }
 
-    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->patchify_pipeline);
-    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rt->patchify_pipeline_layout, 0, 1, &rt->patchify_descriptor_set, 0, NULL);
-    vkCmdPushConstants(rt->command_buffer, rt->patchify_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(patch_push), &patch_push);
-    vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->D), 1, 1);
-    cmd_shader_barrier(rt->command_buffer);
-
-    if (rt->layer_qkv_enabled) {
+    for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+        int is_cache_pass = pass_idx >= rt->steps_to_run;
         int layer_idx = 0;
-        int table_idx = 0;
+        int table_idx = rt->layers_to_run > 0 ? pass_idx * rt->layers_to_run + layer_idx : 0;
 
-        WorldVulkanAdaRmsNormPush ada_push;
-        memset(&ada_push, 0, sizeof(ada_push));
-        ada_push.B = 1;
-        ada_push.T = (uint32_t)rt->T;
-        ada_push.N = 1;
-        ada_push.D = (uint32_t)rt->D;
-        ada_push.eps = rt->rms_eps;
-
-        WorldVulkanLinearPush qkv_push;
-        memset(&qkv_push, 0, sizeof(qkv_push));
-        qkv_push.rows = (uint32_t)rt->T;
-        qkv_push.cols = (uint32_t)rt->qkv_dim;
-        qkv_push.inner = (uint32_t)rt->D;
-        qkv_push.has_bias = 0;
-
-        WorldVulkanQkvRmsRopePush rope_push;
-        memset(&rope_push, 0, sizeof(rope_push));
-        rope_push.B = 1;
-        rope_push.T = (uint32_t)rt->T;
-        rope_push.n_heads = (uint32_t)rt->cfg.n_heads;
-        rope_push.n_kv_heads = (uint32_t)rt->cfg.n_kv_heads;
-        rope_push.D = (uint32_t)rt->d_head;
-        rope_push.width = (uint32_t)rt->cfg.width;
-        rope_push.height = (uint32_t)rt->cfg.height;
-        rope_push.eps = rt->rms_eps;
-
-        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->patchify_pipeline);
         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                rt->runtime_ada_rms_pipeline_layout, 0, 1,
-                &rt->attn_ada_descriptor_sets[table_idx], 0, NULL);
-        vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ada_push), &ada_push);
-        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                rt->patchify_pipeline_layout, 0, 1, &rt->patchify_descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->patchify_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(patch_push), &patch_push);
+        vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->D), 1, 1);
         cmd_shader_barrier(rt->command_buffer);
 
-        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
-        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                rt->runtime_linear_pipeline_layout, 0, 1,
-                &rt->qkv_proj_descriptor_sets[layer_idx], 0, NULL);
-        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
-        vkCmdDispatch(rt->command_buffer,
-                ((uint32_t)rt->qkv_dim + 7u) / 8u,
-                ((uint32_t)rt->T + 7u) / 8u,
-                1);
-        cmd_shader_barrier(rt->command_buffer);
+        if (rt->layer_qkv_enabled) {
+            WorldVulkanAdaRmsNormPush ada_push;
+            memset(&ada_push, 0, sizeof(ada_push));
+            ada_push.B = 1;
+            ada_push.T = (uint32_t)rt->T;
+            ada_push.N = 1;
+            ada_push.D = (uint32_t)rt->D;
+            ada_push.eps = rt->rms_eps;
 
-        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_qkv_rms_rope_pipeline);
-        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                rt->runtime_qkv_rms_rope_pipeline_layout, 0, 1,
-                &rt->qkv_rms_rope_descriptor_set, 0, NULL);
-        vkCmdPushConstants(rt->command_buffer, rt->runtime_qkv_rms_rope_pipeline_layout,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rope_push), &rope_push);
-        vkCmdDispatch(rt->command_buffer,
-                (uint32_t)rt->T,
-                (uint32_t)(rt->cfg.n_heads + 2 * rt->cfg.n_kv_heads),
-                1);
-        cmd_shader_barrier(rt->command_buffer);
+            WorldVulkanLinearPush qkv_push;
+            memset(&qkv_push, 0, sizeof(qkv_push));
+            qkv_push.rows = (uint32_t)rt->T;
+            qkv_push.cols = (uint32_t)rt->qkv_dim;
+            qkv_push.inner = (uint32_t)rt->D;
+            qkv_push.has_bias = 0;
 
-        if (rt->layer_attention_enabled) {
-            uint32_t pinned = (uint32_t)rt->cache_pinned_dilation;
-            uint32_t bucket = ((uint32_t)rt->frame_ordinal + pinned - 1u) / pinned;
-            uint32_t num_buckets = (uint32_t)((rt->cache_ring_length / rt->T) / rt->cache_pinned_dilation);
-            uint32_t base = num_buckets > 0u ? (bucket % num_buckets) * (uint32_t)rt->T : 0u;
-            uint32_t write_step = ((uint32_t)rt->frame_ordinal % pinned) == 0u ? 1u : 0u;
+            WorldVulkanQkvRmsRopePush rope_push;
+            memset(&rope_push, 0, sizeof(rope_push));
+            rope_push.B = 1;
+            rope_push.T = (uint32_t)rt->T;
+            rope_push.n_heads = (uint32_t)rt->cfg.n_heads;
+            rope_push.n_kv_heads = (uint32_t)rt->cfg.n_kv_heads;
+            rope_push.D = (uint32_t)rt->d_head;
+            rope_push.width = (uint32_t)rt->cfg.width;
+            rope_push.height = (uint32_t)rt->cfg.height;
+            rope_push.eps = rt->rms_eps;
 
-            WorldVulkanKvCacheUpsertPush upsert_push;
-            memset(&upsert_push, 0, sizeof(upsert_push));
-            upsert_push.B = 1;
-            upsert_push.H = (uint32_t)rt->cfg.n_kv_heads;
-            upsert_push.T = (uint32_t)rt->T;
-            upsert_push.D = (uint32_t)rt->d_head;
-            upsert_push.L = (uint32_t)rt->cache_ring_length;
-            upsert_push.base = base;
-            upsert_push.write_step = write_step;
-            upsert_push.frozen = 1;
-
-            WorldVulkanCacheFrameIndicesPush indices_push;
-            memset(&indices_push, 0, sizeof(indices_push));
-            indices_push.capacity = (uint32_t)rt->cache_capacity;
-            indices_push.T = (uint32_t)rt->T;
-            indices_push.base = base;
-            indices_push.write_step = write_step;
-
-            WorldVulkanIndexedAttentionPush attn_push;
-            memset(&attn_push, 0, sizeof(attn_push));
-            attn_push.B = 1;
-            attn_push.Hq = (uint32_t)rt->cfg.n_heads;
-            attn_push.Hkv = (uint32_t)rt->cfg.n_kv_heads;
-            attn_push.Tq = (uint32_t)rt->T;
-            attn_push.Nkv = (uint32_t)rt->T;
-            attn_push.Tk = (uint32_t)rt->cache_capacity;
-            attn_push.D = (uint32_t)rt->d_head;
-            attn_push.scale = 1.0f / sqrtf((float)rt->d_head);
-
-            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_kv_upsert_pipeline);
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    rt->runtime_kv_upsert_pipeline_layout, 0, 1,
-                    &rt->kv_upsert_descriptor_set, 0, NULL);
-            vkCmdPushConstants(rt->command_buffer, rt->runtime_kv_upsert_pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
+                    rt->runtime_ada_rms_pipeline_layout, 0, 1,
+                    &rt->attn_ada_descriptor_sets[table_idx], 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ada_push), &ada_push);
+            vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+            cmd_shader_barrier(rt->command_buffer);
+
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    rt->runtime_linear_pipeline_layout, 0, 1,
+                    &rt->qkv_proj_descriptor_sets[layer_idx], 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
             vkCmdDispatch(rt->command_buffer,
-                    ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
-                    1, 1);
+                    ((uint32_t)rt->qkv_dim + 7u) / 8u,
+                    ((uint32_t)rt->T + 7u) / 8u,
+                    1);
             cmd_shader_barrier(rt->command_buffer);
 
-            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_cache_indices_pipeline);
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_qkv_rms_rope_pipeline);
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    rt->runtime_cache_indices_pipeline_layout, 0, 1,
-                    &rt->cache_indices_descriptor_set, 0, NULL);
-            vkCmdPushConstants(rt->command_buffer, rt->runtime_cache_indices_pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(indices_push), &indices_push);
-            vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->cache_capacity / rt->T), 1, 1);
-            cmd_shader_barrier(rt->command_buffer);
-
-            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_indexed_attention_pipeline);
-            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    rt->runtime_indexed_attention_pipeline_layout, 0, 1,
-                    &rt->indexed_attention_descriptor_set, 0, NULL);
-            vkCmdPushConstants(rt->command_buffer, rt->runtime_indexed_attention_pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(attn_push), &attn_push);
+                    rt->runtime_qkv_rms_rope_pipeline_layout, 0, 1,
+                    &rt->qkv_rms_rope_descriptor_set, 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_qkv_rms_rope_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rope_push), &rope_push);
             vkCmdDispatch(rt->command_buffer,
-                    (uint32_t)(rt->cfg.n_heads * rt->T),
-                    1, 1);
+                    (uint32_t)rt->T,
+                    (uint32_t)(rt->cfg.n_heads + 2 * rt->cfg.n_kv_heads),
+                    1);
             cmd_shader_barrier(rt->command_buffer);
 
-            if (rt->layer_attn_out_enabled) {
-                WorldVulkanLinearPush out_proj_push;
-                memset(&out_proj_push, 0, sizeof(out_proj_push));
-                out_proj_push.rows = (uint32_t)rt->T;
-                out_proj_push.cols = (uint32_t)rt->D;
-                out_proj_push.inner = (uint32_t)rt->D;
-                out_proj_push.has_bias = 0;
+            if (rt->layer_attention_enabled) {
+                uint32_t pinned = (uint32_t)rt->cache_pinned_dilation;
+                uint32_t bucket = ((uint32_t)rt->frame_ordinal + pinned - 1u) / pinned;
+                uint32_t num_buckets = (uint32_t)((rt->cache_ring_length / rt->T) / rt->cache_pinned_dilation);
+                uint32_t base = num_buckets > 0u ? (bucket % num_buckets) * (uint32_t)rt->T : 0u;
+                uint32_t write_step = ((uint32_t)rt->frame_ordinal % pinned) == 0u ? 1u : 0u;
 
-                WorldVulkanGatedResidualPush residual_push;
-                memset(&residual_push, 0, sizeof(residual_push));
-                residual_push.T = (uint32_t)rt->T;
-                residual_push.D = (uint32_t)rt->D;
+                WorldVulkanKvCacheUpsertPush upsert_push;
+                memset(&upsert_push, 0, sizeof(upsert_push));
+                upsert_push.B = 1;
+                upsert_push.H = (uint32_t)rt->cfg.n_kv_heads;
+                upsert_push.T = (uint32_t)rt->T;
+                upsert_push.D = (uint32_t)rt->d_head;
+                upsert_push.L = (uint32_t)rt->cache_ring_length;
+                upsert_push.base = base;
+                upsert_push.write_step = write_step;
+                upsert_push.frozen = is_cache_pass ? 0u : 1u;
 
-                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                WorldVulkanCacheFrameIndicesPush indices_push;
+                memset(&indices_push, 0, sizeof(indices_push));
+                indices_push.capacity = (uint32_t)rt->cache_capacity;
+                indices_push.T = (uint32_t)rt->T;
+                indices_push.base = base;
+                indices_push.write_step = write_step;
+
+                WorldVulkanIndexedAttentionPush attn_push;
+                memset(&attn_push, 0, sizeof(attn_push));
+                attn_push.B = 1;
+                attn_push.Hq = (uint32_t)rt->cfg.n_heads;
+                attn_push.Hkv = (uint32_t)rt->cfg.n_kv_heads;
+                attn_push.Tq = (uint32_t)rt->T;
+                attn_push.Nkv = (uint32_t)rt->T;
+                attn_push.Tk = (uint32_t)rt->cache_capacity;
+                attn_push.D = (uint32_t)rt->d_head;
+                attn_push.scale = 1.0f / sqrtf((float)rt->d_head);
+
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_kv_upsert_pipeline);
                 vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        rt->runtime_linear_pipeline_layout, 0, 1,
-                        &rt->attn_out_proj_descriptor_set, 0, NULL);
-                vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
+                        rt->runtime_kv_upsert_pipeline_layout, 0, 1,
+                        &rt->kv_upsert_descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_kv_upsert_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
                 vkCmdDispatch(rt->command_buffer,
-                        ((uint32_t)rt->D + 7u) / 8u,
-                        ((uint32_t)rt->T + 7u) / 8u,
-                        1);
-                cmd_shader_barrier(rt->command_buffer);
-
-                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
-                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        rt->runtime_gated_residual_pipeline_layout, 0, 1,
-                        &rt->attn_residual_descriptor_set, 0, NULL);
-                vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
-                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
-                vkCmdDispatch(rt->command_buffer,
-                        ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                        ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
                         1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
-                if (rt->layer_ctrl_enabled) {
-                    WorldVulkanRmsNormPush ctrl_norm_push;
-                    memset(&ctrl_norm_push, 0, sizeof(ctrl_norm_push));
-                    ctrl_norm_push.rows = (uint32_t)rt->T;
-                    ctrl_norm_push.cols = (uint32_t)rt->D;
-                    ctrl_norm_push.eps = rt->rms_eps;
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_cache_indices_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_cache_indices_pipeline_layout, 0, 1,
+                        &rt->cache_indices_descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_cache_indices_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(indices_push), &indices_push);
+                vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->cache_capacity / rt->T), 1, 1);
+                cmd_shader_barrier(rt->command_buffer);
 
-                    WorldVulkanLinearPush ctrl_fc_push;
-                    memset(&ctrl_fc_push, 0, sizeof(ctrl_fc_push));
-                    ctrl_fc_push.rows = (uint32_t)rt->T;
-                    ctrl_fc_push.cols = (uint32_t)rt->D;
-                    ctrl_fc_push.inner = (uint32_t)rt->D;
-                    ctrl_fc_push.has_bias = 0;
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_indexed_attention_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_indexed_attention_pipeline_layout, 0, 1,
+                        &rt->indexed_attention_descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_indexed_attention_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(attn_push), &attn_push);
+                vkCmdDispatch(rt->command_buffer,
+                        (uint32_t)(rt->cfg.n_heads * rt->T),
+                        1, 1);
+                cmd_shader_barrier(rt->command_buffer);
 
-                    WorldVulkanAddChannelSiluPush add_silu_push;
-                    memset(&add_silu_push, 0, sizeof(add_silu_push));
-                    add_silu_push.rows = (uint32_t)rt->T;
-                    add_silu_push.D = (uint32_t)rt->D;
+                if (rt->layer_attn_out_enabled) {
+                    WorldVulkanLinearPush out_proj_push;
+                    memset(&out_proj_push, 0, sizeof(out_proj_push));
+                    out_proj_push.rows = (uint32_t)rt->T;
+                    out_proj_push.cols = (uint32_t)rt->D;
+                    out_proj_push.inner = (uint32_t)rt->D;
+                    out_proj_push.has_bias = 0;
 
-                    WorldVulkanSiluPush add_push;
-                    memset(&add_push, 0, sizeof(add_push));
-                    add_push.n = (uint32_t)(rt->T * rt->D);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_rms_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_rms_pipeline_layout, 0, 1,
-                            &rt->ctrl_norm_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_rms_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_norm_push), &ctrl_norm_push);
-                    vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_linear_pipeline_layout, 0, 1,
-                            &rt->ctrl_fc1_x_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)rt->D + 7u) / 8u,
-                            ((uint32_t)rt->T + 7u) / 8u,
-                            1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_channel_silu_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_add_channel_silu_pipeline_layout, 0, 1,
-                            &rt->ctrl_add_silu_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_add_channel_silu_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_silu_push), &add_silu_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
-                            1, 1);
-                    cmd_shader_barrier(rt->command_buffer);
+                    WorldVulkanGatedResidualPush residual_push;
+                    memset(&residual_push, 0, sizeof(residual_push));
+                    residual_push.T = (uint32_t)rt->T;
+                    residual_push.D = (uint32_t)rt->D;
 
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
                     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             rt->runtime_linear_pipeline_layout, 0, 1,
-                            &rt->ctrl_fc2_descriptor_set_layer, 0, NULL);
+                            &rt->attn_out_proj_descriptor_set, 0, NULL);
                     vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)rt->D + 7u) / 8u,
-                            ((uint32_t)rt->T + 7u) / 8u,
-                            1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_add_pipeline_layout, 0, 1,
-                            &rt->ctrl_add_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_add_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_push), &add_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
-                            1, 1);
-                    cmd_shader_barrier(rt->command_buffer);
-                }
-
-                if (rt->layer_mlp_enabled) {
-                    WorldVulkanAdaRmsNormPush mlp_ada_push;
-                    memset(&mlp_ada_push, 0, sizeof(mlp_ada_push));
-                    mlp_ada_push.B = 1;
-                    mlp_ada_push.T = (uint32_t)rt->T;
-                    mlp_ada_push.N = 1;
-                    mlp_ada_push.D = (uint32_t)rt->D;
-                    mlp_ada_push.eps = rt->rms_eps;
-
-                    WorldVulkanLinearPush mlp_fc1_push;
-                    memset(&mlp_fc1_push, 0, sizeof(mlp_fc1_push));
-                    mlp_fc1_push.rows = (uint32_t)rt->T;
-                    mlp_fc1_push.cols = (uint32_t)rt->mlp_hidden;
-                    mlp_fc1_push.inner = (uint32_t)rt->D;
-                    mlp_fc1_push.has_bias = 0;
-
-                    WorldVulkanSiluPush mlp_silu_push;
-                    memset(&mlp_silu_push, 0, sizeof(mlp_silu_push));
-                    mlp_silu_push.n = (uint32_t)(rt->T * rt->mlp_hidden);
-
-                    WorldVulkanLinearPush mlp_fc2_push;
-                    memset(&mlp_fc2_push, 0, sizeof(mlp_fc2_push));
-                    mlp_fc2_push.rows = (uint32_t)rt->T;
-                    mlp_fc2_push.cols = (uint32_t)rt->D;
-                    mlp_fc2_push.inner = (uint32_t)rt->mlp_hidden;
-                    mlp_fc2_push.has_bias = 0;
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_ada_rms_pipeline_layout, 0, 1,
-                            &rt->mlp_ada_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_ada_push), &mlp_ada_push);
-                    vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_linear_pipeline_layout, 0, 1,
-                            &rt->mlp_fc1_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc1_push), &mlp_fc1_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)rt->mlp_hidden + 7u) / 8u,
-                            ((uint32_t)rt->T + 7u) / 8u,
-                            1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_silu_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_silu_pipeline_layout, 0, 1,
-                            &rt->mlp_silu_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_silu_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_silu_push), &mlp_silu_push);
-                    vkCmdDispatch(rt->command_buffer,
-                            ((uint32_t)(rt->T * rt->mlp_hidden) + 255u) / 256u,
-                            1, 1);
-                    cmd_shader_barrier(rt->command_buffer);
-
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
-                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            rt->runtime_linear_pipeline_layout, 0, 1,
-                            &rt->mlp_fc2_descriptor_set, 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
-                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc2_push), &mlp_fc2_push);
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
                     vkCmdDispatch(rt->command_buffer,
                             ((uint32_t)rt->D + 7u) / 8u,
                             ((uint32_t)rt->T + 7u) / 8u,
@@ -2487,25 +2387,220 @@ static int record_runtime_model_slice(
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
                     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             rt->runtime_gated_residual_pipeline_layout, 0, 1,
-                            &rt->mlp_residual_descriptor_set, 0, NULL);
+                            &rt->attn_residual_descriptor_set[pass_idx], 0, NULL);
                     vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
                     vkCmdDispatch(rt->command_buffer,
                             ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                             1, 1);
                     cmd_shader_barrier(rt->command_buffer);
+
+                    if (rt->layer_ctrl_enabled) {
+                        WorldVulkanRmsNormPush ctrl_norm_push;
+                        memset(&ctrl_norm_push, 0, sizeof(ctrl_norm_push));
+                        ctrl_norm_push.rows = (uint32_t)rt->T;
+                        ctrl_norm_push.cols = (uint32_t)rt->D;
+                        ctrl_norm_push.eps = rt->rms_eps;
+
+                        WorldVulkanLinearPush ctrl_fc_push;
+                        memset(&ctrl_fc_push, 0, sizeof(ctrl_fc_push));
+                        ctrl_fc_push.rows = (uint32_t)rt->T;
+                        ctrl_fc_push.cols = (uint32_t)rt->D;
+                        ctrl_fc_push.inner = (uint32_t)rt->D;
+                        ctrl_fc_push.has_bias = 0;
+
+                        WorldVulkanAddChannelSiluPush add_silu_push;
+                        memset(&add_silu_push, 0, sizeof(add_silu_push));
+                        add_silu_push.rows = (uint32_t)rt->T;
+                        add_silu_push.D = (uint32_t)rt->D;
+
+                        WorldVulkanSiluPush add_push;
+                        memset(&add_push, 0, sizeof(add_push));
+                        add_push.n = (uint32_t)(rt->T * rt->D);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_rms_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_rms_pipeline_layout, 0, 1,
+                                &rt->ctrl_norm_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_rms_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_norm_push), &ctrl_norm_push);
+                        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                &rt->ctrl_fc1_x_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)rt->D + 7u) / 8u,
+                                ((uint32_t)rt->T + 7u) / 8u,
+                                1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_channel_silu_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_add_channel_silu_pipeline_layout, 0, 1,
+                                &rt->ctrl_add_silu_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_add_channel_silu_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_silu_push), &add_silu_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                                1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                &rt->ctrl_fc2_descriptor_set_layer, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)rt->D + 7u) / 8u,
+                                ((uint32_t)rt->T + 7u) / 8u,
+                                1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_add_pipeline_layout, 0, 1,
+                                &rt->ctrl_add_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_add_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_push), &add_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                                1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+                    }
+
+                    if (rt->layer_mlp_enabled) {
+                        WorldVulkanAdaRmsNormPush mlp_ada_push;
+                        memset(&mlp_ada_push, 0, sizeof(mlp_ada_push));
+                        mlp_ada_push.B = 1;
+                        mlp_ada_push.T = (uint32_t)rt->T;
+                        mlp_ada_push.N = 1;
+                        mlp_ada_push.D = (uint32_t)rt->D;
+                        mlp_ada_push.eps = rt->rms_eps;
+
+                        WorldVulkanLinearPush mlp_fc1_push;
+                        memset(&mlp_fc1_push, 0, sizeof(mlp_fc1_push));
+                        mlp_fc1_push.rows = (uint32_t)rt->T;
+                        mlp_fc1_push.cols = (uint32_t)rt->mlp_hidden;
+                        mlp_fc1_push.inner = (uint32_t)rt->D;
+                        mlp_fc1_push.has_bias = 0;
+
+                        WorldVulkanSiluPush mlp_silu_push;
+                        memset(&mlp_silu_push, 0, sizeof(mlp_silu_push));
+                        mlp_silu_push.n = (uint32_t)(rt->T * rt->mlp_hidden);
+
+                        WorldVulkanLinearPush mlp_fc2_push;
+                        memset(&mlp_fc2_push, 0, sizeof(mlp_fc2_push));
+                        mlp_fc2_push.rows = (uint32_t)rt->T;
+                        mlp_fc2_push.cols = (uint32_t)rt->D;
+                        mlp_fc2_push.inner = (uint32_t)rt->mlp_hidden;
+                        mlp_fc2_push.has_bias = 0;
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_ada_rms_pipeline_layout, 0, 1,
+                                &rt->mlp_ada_descriptor_set[pass_idx], 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_ada_push), &mlp_ada_push);
+                        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                &rt->mlp_fc1_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc1_push), &mlp_fc1_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)rt->mlp_hidden + 7u) / 8u,
+                                ((uint32_t)rt->T + 7u) / 8u,
+                                1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_silu_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_silu_pipeline_layout, 0, 1,
+                                &rt->mlp_silu_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_silu_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_silu_push), &mlp_silu_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)(rt->T * rt->mlp_hidden) + 255u) / 256u,
+                                1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_linear_pipeline_layout, 0, 1,
+                                &rt->mlp_fc2_descriptor_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc2_push), &mlp_fc2_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)rt->D + 7u) / 8u,
+                                ((uint32_t)rt->T + 7u) / 8u,
+                                1);
+                        cmd_shader_barrier(rt->command_buffer);
+
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
+                        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                rt->runtime_gated_residual_pipeline_layout, 0, 1,
+                                &rt->mlp_residual_descriptor_set[pass_idx], 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
+                        vkCmdDispatch(rt->command_buffer,
+                                ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                                1, 1);
+                        cmd_shader_barrier(rt->command_buffer);
+                    }
                 }
             }
         }
-    }
 
-    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->unpatch_orig_pipeline);
-    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rt->unpatch_orig_pipeline_layout, 0, 1, &rt->unpatch_orig_descriptor_set, 0, NULL);
-    vkCmdPushConstants(rt->command_buffer, rt->unpatch_orig_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(unpatch_push), &unpatch_push);
-    vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->out_dim), 1, 1);
-    cmd_shader_barrier(rt->command_buffer);
+        if (!is_cache_pass) {
+            WorldVulkanOutNormSiluPush out_norm_push;
+            memset(&out_norm_push, 0, sizeof(out_norm_push));
+            out_norm_push.rows = (uint32_t)rt->T;
+            out_norm_push.D = (uint32_t)rt->D;
+            out_norm_push.eps = rt->rms_eps;
+
+            float sigma_step = rt->cfg.scheduler_sigmas[pass_idx];
+            float next_sigma = rt->cfg.scheduler_sigmas[pass_idx + 1];
+            WorldVulkanLatentUpdatePush update_push;
+            memset(&update_push, 0, sizeof(update_push));
+            update_push.n = (uint32_t)rt->latent_elems;
+            update_push.dsigma = next_sigma - sigma_step;
+
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_out_norm_silu_pipeline);
+            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    rt->runtime_out_norm_silu_pipeline_layout, 0, 1,
+                    &rt->out_norm_silu_descriptor_set[pass_idx], 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_out_norm_silu_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_norm_push), &out_norm_push);
+            vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+            cmd_shader_barrier(rt->command_buffer);
+
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->unpatch_orig_pipeline);
+            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    rt->unpatch_orig_pipeline_layout, 0, 1, &rt->unpatch_orig_descriptor_set, 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->unpatch_orig_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                    0, sizeof(unpatch_push), &unpatch_push);
+            vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->out_dim), 1, 1);
+            cmd_shader_barrier(rt->command_buffer);
+
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_latent_update_pipeline);
+            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    rt->runtime_latent_update_pipeline_layout, 0, 1,
+                    &rt->latent_update_descriptor_set, 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_latent_update_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(update_push), &update_push);
+            vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->latent_elems + 255u) / 256u, 1, 1);
+            cmd_shader_barrier(rt->command_buffer);
+        }
+    }
 
     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->latent_rgba_pipeline);
     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3291,6 +3386,177 @@ cleanup:
         destroy_host_buffer(rt, a_buffer, a_memory, a_mapped);
         destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
         destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_out_norm_silu_f32_probe(void) {
+    enum { rows = 5, D = 96 };
+    const float eps = 1.0e-6f;
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer mod_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory mod_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *mod_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)rows * D * sizeof(float);
+    size_t mod_bytes = (size_t)2 * D * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, mod_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mod_buffer, &mod_memory, &mod_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+    float *x = (float *)x_mapped;
+    float *mod = (float *)mod_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < rows * D; ++i) x[i] = probe_value(i + 271, 0.09375f);
+    for (int i = 0; i < 2 * D; ++i) mod[i] = probe_value(i + 331, 0.03125f);
+    memset(y, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "out_norm_silu_f32.comp", 3, sizeof(WorldVulkanOutNormSiluPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {x_buffer, mod_buffer, y_buffer};
+    VkDeviceSize sizes[3] = {x_bytes, mod_bytes, x_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanOutNormSiluPush push;
+    memset(&push, 0, sizeof(push));
+    push.rows = rows;
+    push.D = D;
+    push.eps = eps;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                rows, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float v = x[r * D + d];
+            sum += v * v;
+        }
+        float inv = 1.0f / sqrtf(sum / (float)D + eps);
+        for (int d = 0; d < D; ++d) {
+            float v = x[r * D + d] * inv * (1.0f + mod[d]) + mod[D + d];
+            float ref = v / (1.0f + expf(-v));
+            float diff = fabsf(y[r * D + d] - ref);
+            if (diff > max_abs) max_abs = diff;
+            mean_abs += diff;
+        }
+    }
+    mean_abs /= (float)(rows * D);
+    fprintf(stderr, "vulkan out_norm_silu_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 2.0e-6f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, mod_buffer, mod_memory, mod_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_latent_update_f32_probe(void) {
+    enum { n = 1031 };
+    const float dsigma = -0.1875f;
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer latent_buffer = VK_NULL_HANDLE;
+    VkBuffer velocity_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory latent_memory = VK_NULL_HANDLE;
+    VkDeviceMemory velocity_memory = VK_NULL_HANDLE;
+    void *latent_mapped = NULL;
+    void *velocity_mapped = NULL;
+    float ref[n];
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t bytes = (size_t)n * sizeof(float);
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &latent_buffer, &latent_memory, &latent_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &velocity_buffer, &velocity_memory, &velocity_mapped)) goto cleanup;
+    float *latent = (float *)latent_mapped;
+    float *velocity = (float *)velocity_mapped;
+    for (int i = 0; i < n; ++i) {
+        latent[i] = probe_value(i + 419, 0.125f);
+        velocity[i] = probe_value(i + 557, 0.0625f);
+        ref[i] = latent[i] + dsigma * velocity[i];
+    }
+
+    if (create_storage_pipeline(rt, "latent_update_f32.comp", 2, sizeof(WorldVulkanLatentUpdatePush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[2] = {latent_buffer, velocity_buffer};
+    VkDeviceSize sizes[2] = {bytes, bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 2, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanLatentUpdatePush push;
+    memset(&push, 0, sizeof(push));
+    push.n = n;
+    push.dsigma = dsigma;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (uint32_t)((n + 255) / 256), 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float diff = fabsf(latent[i] - ref[i]);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
+    }
+    mean_abs /= (float)n;
+    fprintf(stderr, "vulkan latent_update_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs != 0.0f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, latent_buffer, latent_memory, latent_mapped);
+        destroy_host_buffer(rt, velocity_buffer, velocity_memory, velocity_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
@@ -4325,6 +4591,9 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float *mlp_hidden_ref = NULL;
     float *mlp_out_ref = NULL;
     float *tokens_after_mlp_ref = NULL;
+    float *final_tokens_ref = NULL;
+    float *latent_out_ref = NULL;
+    float *latent_final_ref = NULL;
     WorldVulkanRuntime *rt = NULL;
     WorldLayerWeights layer;
     memset(&layer, 0, sizeof(layer));
@@ -4364,6 +4633,9 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     mlp_hidden_ref = (float *)malloc(mlp_hidden_token_elems * sizeof(float));
     mlp_out_ref = (float *)malloc((size_t)T * D * sizeof(float));
     tokens_after_mlp_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    final_tokens_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    latent_out_ref = (float *)malloc(latent_elems * sizeof(float));
+    latent_final_ref = (float *)malloc(latent_elems * sizeof(float));
     if (!latent || !control || !patch || !ctrl_fc1 || !ctrl_fc2 || !denoise_fc1 ||
             !denoise_fc2 || !out_norm || !unpatch || !unpatch_bias || !cond_bias ||
             !cond_proj || !q_w || !k_w || !v_w || !out_w || !ctrl_fc1_c_w ||
@@ -4371,7 +4643,8 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
             !tokens_ref || !norm_ref || !qkv_ref ||
             !attn_proj_ref || !tokens_after_attn_ref || !ctrl_cond_ref || !ctrl_norm_ref ||
             !ctrl_hidden_ref || !ctrl_out_ref || !tokens_after_ctrl_ref ||
-            !mlp_in_ref || !mlp_hidden_ref || !mlp_out_ref || !tokens_after_mlp_ref) {
+            !mlp_in_ref || !mlp_hidden_ref || !mlp_out_ref || !tokens_after_mlp_ref ||
+            !final_tokens_ref || !latent_out_ref || !latent_final_ref) {
         goto cleanup;
     }
 
@@ -4441,6 +4714,7 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     if (world_vulkan_runtime_create(&rt, &cfg, &weights, 1, 1, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
     if (!rt->layer_qkv_enabled) goto cleanup;
     if (!rt->layer_attention_enabled) goto cleanup;
+    rt->total_passes = 1;
     {
         const unsigned char *rgb = NULL;
         int rgb_w = 0, rgb_h = 0, rgb_frames = 0;
@@ -4567,6 +4841,9 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float mlp_hidden_max = 0.0f;
     float mlp_out_max = 0.0f;
     float tokens_after_mlp_max = 0.0f;
+    float final_tokens_max = 0.0f;
+    float latent_out_max = 0.0f;
+    float latent_final_max = 0.0f;
     float attn_mean = 0.0f;
     float attn_proj_mean = 0.0f;
     float tokens_after_attn_mean = 0.0f;
@@ -4575,6 +4852,9 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float mlp_hidden_mean = 0.0f;
     float mlp_out_mean = 0.0f;
     float tokens_after_mlp_mean = 0.0f;
+    float final_tokens_mean = 0.0f;
+    float latent_out_mean = 0.0f;
+    float latent_final_mean = 0.0f;
     uint32_t cache_mismatches = 0;
     const float *cache_k = (const float *)rt->cache_k_mapped;
     const float *cache_v = (const float *)rt->cache_v_mapped;
@@ -4593,6 +4873,9 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     const float *mlp_hidden = (const float *)rt->mlp_hidden_mapped;
     const float *mlp_out = (const float *)rt->mlp_out_mapped;
     const float *tokens_after_mlp = (const float *)rt->tokens_after_mlp_mapped;
+    const float *final_tokens = (const float *)rt->final_tokens_mapped;
+    const float *latent_out = (const float *)rt->latent_out_mapped;
+    const float *latent_final = (const float *)rt->latent_mapped;
     if (index_count != (uint32_t)T) {
         ++cache_mismatches;
     }
@@ -4786,6 +5069,45 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
         if (diff > tokens_after_mlp_max) tokens_after_mlp_max = diff;
         tokens_after_mlp_mean += diff;
     }
+    const float *out_mod = (const float *)rt->out_mod_table_mapped;
+    for (int t = 0; t < T; ++t) {
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float v = tokens_after_mlp_ref[t * D + d];
+            sum += v * v;
+        }
+        float inv = 1.0f / sqrtf(sum / (float)D + 1.0e-6f);
+        for (int d = 0; d < D; ++d) {
+            float v = tokens_after_mlp_ref[t * D + d] * inv * (1.0f + out_mod[d]) + out_mod[D + d];
+            float ref = v / (1.0f + expf(-v));
+            final_tokens_ref[t * D + d] = ref;
+            float diff = fabsf(final_tokens[t * D + d] - ref);
+            if (diff > final_tokens_max) final_tokens_max = diff;
+            final_tokens_mean += diff;
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        int y = t / width;
+        int x = t - y * width;
+        for (int c = 0; c < C; ++c) {
+            float ref = unpatch_bias[c];
+            for (int d = 0; d < D; ++d) {
+                ref += final_tokens_ref[t * D + d] * unpatch[d * C + c];
+            }
+            size_t idx = (size_t)(c * height + y) * width + x;
+            latent_out_ref[idx] = ref;
+            float diff = fabsf(latent_out[idx] - ref);
+            if (diff > latent_out_max) latent_out_max = diff;
+            latent_out_mean += diff;
+        }
+    }
+    for (size_t i = 0; i < latent_elems; ++i) {
+        float ref = latent[i] + (cfg.scheduler_sigmas[1] - cfg.scheduler_sigmas[0]) * latent_out_ref[i];
+        latent_final_ref[i] = ref;
+        float diff = fabsf(latent_final[i] - ref);
+        if (diff > latent_final_max) latent_final_max = diff;
+        latent_final_mean += diff;
+    }
     norm_mean /= (float)(T * D);
     qkv_mean /= (float)(T * qkv_dim);
     rope_mean /= (float)rope_count;
@@ -4797,14 +5119,19 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     mlp_hidden_mean /= (float)mlp_hidden_token_elems;
     mlp_out_mean /= (float)(T * D);
     tokens_after_mlp_mean /= (float)(T * D);
+    final_tokens_mean /= (float)(T * D);
+    latent_out_mean /= (float)latent_elems;
+    latent_final_mean /= (float)latent_elems;
     fprintf(stderr,
-            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g attn_proj_max=%g tokens_after_attn_max=%g ctrl_cond_max=%g ctrl_norm_max=%g ctrl_hidden_max=%g ctrl_out_max=%g tokens_after_ctrl_max=%g mlp_in_max=%g mlp_hidden_max=%g mlp_out_max=%g tokens_after_mlp_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g attn_proj_mean=%g tokens_after_attn_mean=%g tokens_after_ctrl_mean=%g mlp_in_mean=%g mlp_hidden_mean=%g mlp_out_mean=%g tokens_after_mlp_mean=%g\n",
+            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g attn_proj_max=%g tokens_after_attn_max=%g ctrl_cond_max=%g ctrl_norm_max=%g ctrl_hidden_max=%g ctrl_out_max=%g tokens_after_ctrl_max=%g mlp_in_max=%g mlp_hidden_max=%g mlp_out_max=%g tokens_after_mlp_max=%g final_tokens_max=%g latent_out_max=%g latent_final_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g attn_proj_mean=%g tokens_after_attn_mean=%g tokens_after_ctrl_mean=%g mlp_in_mean=%g mlp_hidden_mean=%g mlp_out_mean=%g tokens_after_mlp_mean=%g final_tokens_mean=%g latent_out_mean=%g latent_final_mean=%g\n",
             norm_max, qkv_max, rope_max, cache_max, attn_max, attn_proj_max, tokens_after_attn_max,
             ctrl_cond_max, ctrl_norm_max, ctrl_hidden_max, ctrl_out_max, tokens_after_ctrl_max,
             mlp_in_max, mlp_hidden_max, mlp_out_max, tokens_after_mlp_max,
+            final_tokens_max, latent_out_max, latent_final_max,
             cache_mismatches, norm_mean, qkv_mean, rope_mean, attn_mean, attn_proj_mean,
             tokens_after_attn_mean, tokens_after_ctrl_mean,
-            mlp_in_mean, mlp_hidden_mean, mlp_out_mean, tokens_after_mlp_mean);
+            mlp_in_mean, mlp_hidden_mean, mlp_out_mean, tokens_after_mlp_mean,
+            final_tokens_mean, latent_out_mean, latent_final_mean);
     if (norm_max > 4.0e-5f || qkv_max > 7.0e-5f || rope_max > 8.0e-5f ||
             cache_max != 0.0f || cache_mismatches != 0 || attn_max > 8.0e-5f ||
             attn_proj_max > 9.0e-5f || tokens_after_attn_max > 9.0e-5f ||
@@ -4812,7 +5139,8 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
             ctrl_hidden_max > 8.0e-5f || ctrl_out_max > 9.0e-5f ||
             tokens_after_ctrl_max > 9.0e-5f || mlp_in_max > 9.0e-5f ||
             mlp_hidden_max > 1.0e-4f || mlp_out_max > 1.2e-4f ||
-            tokens_after_mlp_max > 1.2e-4f) goto cleanup;
+            tokens_after_mlp_max > 1.2e-4f || final_tokens_max > 9.0e-5f ||
+            latent_out_max > 1.2e-4f || latent_final_max > 1.2e-4f) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -4852,6 +5180,9 @@ cleanup:
     free(mlp_hidden_ref);
     free(mlp_out_ref);
     free(tokens_after_mlp_ref);
+    free(final_tokens_ref);
+    free(latent_out_ref);
+    free(latent_final_ref);
     return rc;
 }
 
@@ -5849,18 +6180,26 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->cache_indices_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->cache_indices_descriptor_pool, NULL);
     if (rt->indexed_attention_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_descriptor_pool, NULL);
     if (rt->attn_out_proj_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_descriptor_pool, NULL);
-    if (rt->attn_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_residual_descriptor_pool, NULL);
+    for (int i = 0; i < WORLD_VULKAN_MAX_PASSES; ++i) {
+        if (rt->attn_residual_descriptor_pool[i]) vkDestroyDescriptorPool(rt->device, rt->attn_residual_descriptor_pool[i], NULL);
+    }
     if (rt->ctrl_cond_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_cond_descriptor_pool, NULL);
     if (rt->ctrl_norm_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_norm_descriptor_pool, NULL);
     if (rt->ctrl_fc1_x_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_x_descriptor_pool, NULL);
     if (rt->ctrl_add_silu_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_silu_descriptor_pool, NULL);
     if (rt->ctrl_fc2_descriptor_pool_layer) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_descriptor_pool_layer, NULL);
     if (rt->ctrl_add_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_descriptor_pool, NULL);
-    if (rt->mlp_ada_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->mlp_ada_descriptor_pool, NULL);
+    for (int i = 0; i < WORLD_VULKAN_MAX_PASSES; ++i) {
+        if (rt->mlp_ada_descriptor_pool[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_ada_descriptor_pool[i], NULL);
+    }
     if (rt->mlp_fc1_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->mlp_fc1_descriptor_pool, NULL);
     if (rt->mlp_silu_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->mlp_silu_descriptor_pool, NULL);
     if (rt->mlp_fc2_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->mlp_fc2_descriptor_pool, NULL);
-    if (rt->mlp_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->mlp_residual_descriptor_pool, NULL);
+    for (int i = 0; i < WORLD_VULKAN_MAX_PASSES; ++i) {
+        if (rt->mlp_residual_descriptor_pool[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_residual_descriptor_pool[i], NULL);
+        if (rt->out_norm_silu_descriptor_pool[i]) vkDestroyDescriptorPool(rt->device, rt->out_norm_silu_descriptor_pool[i], NULL);
+    }
+    if (rt->latent_update_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_update_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
@@ -5873,6 +6212,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
     if (rt->runtime_add_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_pipeline, NULL);
+    if (rt->runtime_out_norm_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_out_norm_silu_pipeline, NULL);
+    if (rt->runtime_latent_update_pipeline) vkDestroyPipeline(rt->device, rt->runtime_latent_update_pipeline, NULL);
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
@@ -5888,6 +6229,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
     if (rt->runtime_add_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_pipeline_layout, NULL);
+    if (rt->runtime_out_norm_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_out_norm_silu_pipeline_layout, NULL);
+    if (rt->runtime_latent_update_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_latent_update_pipeline_layout, NULL);
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
@@ -5903,6 +6246,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_gated_residual_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_gated_residual_set_layout, NULL);
     if (rt->runtime_add_channel_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_channel_silu_set_layout, NULL);
     if (rt->runtime_add_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_set_layout, NULL);
+    if (rt->runtime_out_norm_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_out_norm_silu_set_layout, NULL);
+    if (rt->runtime_latent_update_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_latent_update_set_layout, NULL);
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
@@ -5918,6 +6263,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
     if (rt->runtime_add_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_shader, NULL);
+    if (rt->runtime_out_norm_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_out_norm_silu_shader, NULL);
+    if (rt->runtime_latent_update_shader) vkDestroyShaderModule(rt->device, rt->runtime_latent_update_shader, NULL);
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
     if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
@@ -5977,6 +6324,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->mlp_hidden_buffer, rt->mlp_hidden_memory, rt->mlp_hidden_mapped);
     destroy_host_buffer(rt, rt->mlp_out_buffer, rt->mlp_out_memory, rt->mlp_out_mapped);
     destroy_host_buffer(rt, rt->tokens_after_mlp_buffer, rt->tokens_after_mlp_memory, rt->tokens_after_mlp_mapped);
+    destroy_host_buffer(rt, rt->final_tokens_buffer, rt->final_tokens_memory, rt->final_tokens_mapped);
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
     destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
     destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);
