@@ -1,0 +1,128 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 768, local_size_y = 1, local_size_z = 1) in;
+
+#define HEAD_DIM 64
+#define K_BLOCK 32
+#define FLASH_WARPS 24
+#define PART_STRIDE 66
+
+layout(std430, binding = 0) readonly buffer Q {
+    float q[];
+} in_q;
+
+layout(std430, binding = 1) readonly buffer K {
+    float k[];
+} in_k;
+
+layout(std430, binding = 2) readonly buffer V {
+    float v[];
+} in_v;
+
+layout(std430, binding = 3) readonly buffer Indices {
+    uint indices[];
+} in_indices;
+
+layout(std430, binding = 4) buffer Partial {
+    float partial[];
+} out_partial;
+
+layout(std430, binding = 5) readonly buffer Count {
+    uint count[];
+} in_count;
+
+layout(push_constant) uniform Push {
+    uint B;
+    uint Hq;
+    uint Hkv;
+    uint Tq;
+    uint Nkv;
+    uint Tk;
+    uint D;
+    float scale;
+} pc;
+
+shared float sh_k[K_BLOCK * HEAD_DIM];
+shared float sh_v[K_BLOCK * HEAD_DIM];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = tid & 31u;
+    uint warp = tid >> 5u;
+    if (pc.D != 64u || pc.Hkv == 0u || pc.Hq == 0u || pc.Nkv == 0u) {
+        return;
+    }
+
+    uint group = pc.Hq / pc.Hkv;
+    if (group == 0u || group > FLASH_WARPS || (pc.Hq != group * pc.Hkv)) {
+        return;
+    }
+
+    uint q_per_h = FLASH_WARPS / group;
+    if (q_per_h == 0u) q_per_h = 1u;
+    uint q_blocks = (pc.Tq + q_per_h - 1u) / q_per_h;
+    uint k_tiles = pc.Nkv;
+    uint k_tile = gl_WorkGroupID.x % k_tiles;
+    uint q_group = gl_WorkGroupID.x / k_tiles;
+    uint q_block = q_group % q_blocks;
+    uint bhk = q_group / q_blocks;
+    uint hk = bhk % pc.Hkv;
+    uint b = bhk / pc.Hkv;
+
+    uint local_h = warp / q_per_h;
+    uint tq = q_block * q_per_h + (warp - local_h * q_per_h);
+    bool valid_q = b < pc.B && local_h < group && tq < pc.Tq;
+    uint hq = hk * group + local_h;
+    uint rows = pc.B * pc.Tq * pc.Hq;
+    uint row_id = (b * pc.Tq + tq) * pc.Hq + hq;
+
+    uint q_base = (((b * pc.Hq + hq) * pc.Tq + tq) * 64u);
+    uint k_base = ((b * pc.Hkv + hk) * pc.Tk * 64u);
+    uint v_base = k_base;
+    uint Nkv = min(in_count.count[0], pc.Tk);
+    uint n0 = k_tile * K_BLOCK;
+    uint active_count = n0 < Nkv ? min(K_BLOCK, Nkv - n0) : 0u;
+
+    float q0 = valid_q ? in_q.q[q_base + lane] : 0.0;
+    float q1 = valid_q ? in_q.q[q_base + lane + 32u] : 0.0;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float m = -3.4028234663852886e38;
+    float l = 0.0;
+
+    uint tile_elems = active_count * 64u;
+    for (uint i = tid; i < tile_elems; i += 768u) {
+        uint n = i >> 6u;
+        uint d = i & 63u;
+        uint tk = in_indices.indices[n0 + n];
+        sh_k[i] = in_k.k[k_base + tk * 64u + d];
+        sh_v[i] = in_v.v[v_base + tk * 64u + d];
+    }
+    barrier();
+
+    if (valid_q) {
+        for (uint n = 0u; n < active_count; ++n) {
+            uint row = n * 64u;
+            float partial = q0 * sh_k[row + lane] + q1 * sh_k[row + lane + 32u];
+            float dot = subgroupAdd(partial);
+            float score = dot * pc.scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            acc0 = acc0 * alpha + beta * sh_v[row + lane];
+            acc1 = acc1 * alpha + beta * sh_v[row + lane + 32u];
+            l = l * alpha + beta;
+            m = new_m;
+        }
+
+        uint base = (k_tile * rows + row_id) * PART_STRIDE;
+        out_partial.partial[base + lane] = acc0;
+        out_partial.partial[base + lane + 32u] = acc1;
+        if (lane == 0u) {
+            out_partial.partial[base + 64u] = m;
+            out_partial.partial[base + 65u] = l;
+        }
+    }
+}
