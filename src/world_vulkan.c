@@ -196,6 +196,43 @@ typedef struct {
     float weight;
 } WorldVulkanLerpPush;
 
+typedef struct {
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+} WorldVulkanTaehvRepeatClampPush;
+
+typedef struct {
+    uint32_t N;
+    uint32_t C_in;
+    uint32_t C_out;
+    uint32_t H;
+    uint32_t W;
+    uint32_t K;
+    uint32_t has_bias;
+} WorldVulkanTaehvConv2dPush;
+
+typedef struct {
+    uint32_t N;
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+} WorldVulkanTaehvNchwPush;
+
+typedef struct {
+    uint32_t N;
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+    uint32_t stride;
+} WorldVulkanTaehvTgrowPush;
+
+typedef struct {
+    uint32_t N;
+    uint32_t H;
+    uint32_t W;
+} WorldVulkanTaehvPixelShufflePush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -3090,6 +3127,42 @@ static float probe_value(int i, float scale) {
     return ((float)v - 14.0f) * scale;
 }
 
+static int run_probe_compute(
+        WorldVulkanRuntime *rt,
+        const char *shader_name,
+        uint32_t binding_count,
+        size_t push_size,
+        VkBuffer *buffers,
+        VkDeviceSize *sizes,
+        const void *push,
+        uint32_t gx,
+        uint32_t gy,
+        uint32_t gz) {
+    int rc = 1;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+
+    if (create_storage_pipeline(rt, shader_name, binding_count, push_size,
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    if (create_storage_descriptor_set(rt, set_layout, binding_count, buffers, sizes, NULL,
+                &descriptor_pool, &descriptor_set)) goto cleanup;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, push, push_size, gx, gy, gz)) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    return rc;
+}
+
 static void fill_probe_rope_tables(float *xy, float *inv_t, int D, int height, int width) {
     int d_t = D / 4;
     int d_xy = D / 8;
@@ -3901,6 +3974,343 @@ cleanup:
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
         destroy_host_buffer(rt, end_buffer, end_memory, end_mapped);
     }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_taehv_primitives_probe(void) {
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) return 1;
+
+    {
+        enum { C = 3, H = 2, W = 5 };
+        int ok = 1;
+        VkBuffer latent_buffer = VK_NULL_HANDLE, out_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory latent_memory = VK_NULL_HANDLE, out_memory = VK_NULL_HANDLE;
+        void *latent_mapped = NULL, *out_mapped = NULL;
+        size_t latent_bytes = (size_t)C * H * W * sizeof(float);
+        size_t out_bytes = (size_t)4 * C * H * W * sizeof(float);
+        if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &latent_buffer, &latent_memory, &latent_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, out_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) ok = 0;
+        if (ok) {
+            float *latent = (float *)latent_mapped;
+            float *out = (float *)out_mapped;
+            for (int i = 0; i < C * H * W; ++i) latent[i] = probe_value(i + 11, 0.75f);
+            memset(out, 0, out_bytes);
+            VkBuffer buffers[2] = {latent_buffer, out_buffer};
+            VkDeviceSize sizes[2] = {latent_bytes, out_bytes};
+            WorldVulkanTaehvRepeatClampPush push = {C, H, W};
+            if (run_probe_compute(rt, "taehv_repeat_clamp_f32.comp", 2, sizeof(push),
+                        buffers, sizes, &push, (uint32_t)((4 * C * H * W + 255) / 256), 1, 1)) ok = 0;
+            float max_abs = 0.0f, mean_abs = 0.0f;
+            for (int i = 0; ok && i < 4 * C * H * W; ++i) {
+                float ref = tanhf(latent[i % (C * H * W)] / 3.0f) * 3.0f;
+                float diff = fabsf(out[i] - ref);
+                if (diff > max_abs) max_abs = diff;
+                mean_abs += diff;
+            }
+            mean_abs /= (float)(4 * C * H * W);
+            fprintf(stderr, "vulkan taehv_repeat_clamp_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+            if (max_abs > 2.0e-6f) ok = 0;
+        }
+        destroy_host_buffer(rt, latent_buffer, latent_memory, latent_mapped);
+        destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    {
+        enum { N = 211 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, a_buffer = VK_NULL_HANDLE, b_buffer = VK_NULL_HANDLE, out_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, a_memory = VK_NULL_HANDLE, b_memory = VK_NULL_HANDLE, out_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *a_mapped = NULL, *b_mapped = NULL, *out_mapped = NULL;
+        size_t bytes = (size_t)N * sizeof(float);
+        if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &a_buffer, &a_memory, &a_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            float *a = (float *)a_mapped;
+            float *b = (float *)b_mapped;
+            float *out = (float *)out_mapped;
+            for (int i = 0; i < N; ++i) {
+                x[i] = probe_value(i + 23, 0.125f);
+                a[i] = probe_value(i + 31, 0.25f);
+                b[i] = probe_value(i + 47, 0.1875f);
+                out[i] = 0.0f;
+            }
+            VkBuffer relu_buffers[1] = {x_buffer};
+            VkDeviceSize relu_sizes[1] = {bytes};
+            WorldVulkanSiluPush push = {N};
+            if (run_probe_compute(rt, "taehv_relu_f32.comp", 1, sizeof(push),
+                        relu_buffers, relu_sizes, &push, (uint32_t)((N + 255) / 256), 1, 1)) ok = 0;
+            float relu_max = 0.0f;
+            for (int i = 0; ok && i < N; ++i) {
+                float ref = probe_value(i + 23, 0.125f);
+                if (ref < 0.0f) ref = 0.0f;
+                float diff = fabsf(x[i] - ref);
+                if (diff > relu_max) relu_max = diff;
+            }
+            VkBuffer add_buffers[3] = {a_buffer, b_buffer, out_buffer};
+            VkDeviceSize add_sizes[3] = {bytes, bytes, bytes};
+            if (ok && run_probe_compute(rt, "taehv_add_relu_f32.comp", 3, sizeof(push),
+                        add_buffers, add_sizes, &push, (uint32_t)((N + 255) / 256), 1, 1)) ok = 0;
+            float add_max = 0.0f;
+            for (int i = 0; ok && i < N; ++i) {
+                float ref = a[i] + b[i];
+                if (ref < 0.0f) ref = 0.0f;
+                float diff = fabsf(out[i] - ref);
+                if (diff > add_max) add_max = diff;
+            }
+            fprintf(stderr, "vulkan taehv_relu/add_relu_f32 probe: relu_max=%g add_relu_max=%g\n", relu_max, add_max);
+            if (relu_max != 0.0f || add_max != 0.0f) ok = 0;
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, a_buffer, a_memory, a_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    {
+        enum { N = 2, C_IN = 3, C_OUT = 4, H = 5, W = 4, K = 3 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, w_buffer = VK_NULL_HANDLE, b_buffer = VK_NULL_HANDLE, y_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, w_memory = VK_NULL_HANDLE, b_memory = VK_NULL_HANDLE, y_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *w_mapped = NULL, *b_mapped = NULL, *y_mapped = NULL;
+        size_t x_bytes = (size_t)N * C_IN * H * W * sizeof(float);
+        size_t w_bytes = (size_t)C_OUT * C_IN * K * K * sizeof(float);
+        size_t b_bytes = (size_t)C_OUT * sizeof(float);
+        size_t y_bytes = (size_t)N * C_OUT * H * W * sizeof(float);
+        if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, w_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &w_buffer, &w_memory, &w_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, b_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            float *w = (float *)w_mapped;
+            float *b = (float *)b_mapped;
+            float *y = (float *)y_mapped;
+            for (int i = 0; i < N * C_IN * H * W; ++i) x[i] = probe_value(i + 59, 0.03125f);
+            for (int i = 0; i < C_OUT * C_IN * K * K; ++i) w[i] = probe_value(i + 73, 0.0234375f);
+            for (int i = 0; i < C_OUT; ++i) b[i] = probe_value(i + 89, 0.015625f);
+            memset(y, 0, y_bytes);
+            VkBuffer buffers[4] = {x_buffer, w_buffer, b_buffer, y_buffer};
+            VkDeviceSize sizes[4] = {x_bytes, w_bytes, b_bytes, y_bytes};
+            WorldVulkanTaehvConv2dPush push = {N, C_IN, C_OUT, H, W, K, 1};
+            if (run_probe_compute(rt, "taehv_conv2d_nchw_f32.comp", 4, sizeof(push),
+                        buffers, sizes, &push, (uint32_t)((N * C_OUT * H * W + 255) / 256), 1, 1)) ok = 0;
+            float max_abs = 0.0f, mean_abs = 0.0f;
+            for (int n = 0; ok && n < N; ++n) {
+                for (int co = 0; co < C_OUT; ++co) {
+                    for (int yy = 0; yy < H; ++yy) {
+                        for (int xx = 0; xx < W; ++xx) {
+                            float ref = b[co];
+                            for (int ci = 0; ci < C_IN; ++ci) {
+                                for (int ky = 0; ky < K; ++ky) {
+                                    int iy = yy + ky - K / 2;
+                                    if (iy < 0 || iy >= H) continue;
+                                    for (int kx = 0; kx < K; ++kx) {
+                                        int ix = xx + kx - K / 2;
+                                        if (ix < 0 || ix >= W) continue;
+                                        ref += x[((n * C_IN + ci) * H + iy) * W + ix] *
+                                            w[(((co * C_IN + ci) * K + ky) * K + kx)];
+                                    }
+                                }
+                            }
+                            int idx = ((n * C_OUT + co) * H + yy) * W + xx;
+                            float diff = fabsf(y[idx] - ref);
+                            if (diff > max_abs) max_abs = diff;
+                            mean_abs += diff;
+                        }
+                    }
+                }
+            }
+            mean_abs /= (float)(N * C_OUT * H * W);
+            fprintf(stderr, "vulkan taehv_conv2d_nchw_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+            if (max_abs > 2.0e-6f) ok = 0;
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    {
+        enum { N = 4, C = 2, H = 3, W = 5 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, y_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, y_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *y_mapped = NULL;
+        size_t x_bytes = (size_t)N * C * H * W * sizeof(float);
+        size_t y_bytes = (size_t)N * 2 * C * H * W * sizeof(float);
+        if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            float *y = (float *)y_mapped;
+            for (int i = 0; i < N * C * H * W; ++i) x[i] = probe_value(i + 97, 0.046875f);
+            memset(y, 0, y_bytes);
+            VkBuffer buffers[2] = {x_buffer, y_buffer};
+            VkDeviceSize sizes[2] = {x_bytes, y_bytes};
+            WorldVulkanTaehvNchwPush push = {N, C, H, W};
+            if (run_probe_compute(rt, "taehv_concat_past_nchw_f32.comp", 2, sizeof(push),
+                        buffers, sizes, &push, (uint32_t)((N * 2 * C * H * W + 255) / 256), 1, 1)) ok = 0;
+            float max_abs = 0.0f;
+            for (int n = 0; ok && n < N; ++n) {
+                for (int c2 = 0; c2 < 2 * C; ++c2) {
+                    for (int yy = 0; yy < H; ++yy) {
+                        for (int xx = 0; xx < W; ++xx) {
+                            float ref = 0.0f;
+                            if (c2 < C) ref = x[((n * C + c2) * H + yy) * W + xx];
+                            else if (n > 0) ref = x[(((n - 1) * C + (c2 - C)) * H + yy) * W + xx];
+                            int idx = ((n * 2 * C + c2) * H + yy) * W + xx;
+                            float diff = fabsf(y[idx] - ref);
+                            if (diff > max_abs) max_abs = diff;
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "vulkan taehv_concat_past_nchw_f32 probe: max_abs=%g\n", max_abs);
+            if (max_abs != 0.0f) ok = 0;
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    {
+        enum { N = 2, C = 3, H = 2, W = 4, STRIDE = 2 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, up_buffer = VK_NULL_HANDLE, tgrow_in_buffer = VK_NULL_HANDLE, tgrow_out_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, up_memory = VK_NULL_HANDLE, tgrow_in_memory = VK_NULL_HANDLE, tgrow_out_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *up_mapped = NULL, *tgrow_in_mapped = NULL, *tgrow_out_mapped = NULL;
+        size_t x_bytes = (size_t)N * C * H * W * sizeof(float);
+        size_t up_bytes = (size_t)N * C * H * 2 * W * 2 * sizeof(float);
+        size_t tgrow_in_bytes = (size_t)N * C * STRIDE * H * W * sizeof(float);
+        size_t tgrow_out_bytes = (size_t)N * STRIDE * C * H * W * sizeof(float);
+        if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, up_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &up_buffer, &up_memory, &up_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, tgrow_in_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tgrow_in_buffer, &tgrow_in_memory, &tgrow_in_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, tgrow_out_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tgrow_out_buffer, &tgrow_out_memory, &tgrow_out_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            float *up = (float *)up_mapped;
+            float *tgrow_in = (float *)tgrow_in_mapped;
+            float *tgrow_out = (float *)tgrow_out_mapped;
+            for (int i = 0; i < N * C * H * W; ++i) x[i] = probe_value(i + 113, 0.0625f);
+            for (int i = 0; i < N * C * STRIDE * H * W; ++i) tgrow_in[i] = probe_value(i + 127, 0.0390625f);
+            memset(up, 0, up_bytes);
+            memset(tgrow_out, 0, tgrow_out_bytes);
+            VkBuffer up_buffers[2] = {x_buffer, up_buffer};
+            VkDeviceSize up_sizes[2] = {x_bytes, up_bytes};
+            WorldVulkanTaehvNchwPush up_push = {N, C, H, W};
+            if (run_probe_compute(rt, "taehv_upsample2_nchw_f32.comp", 2, sizeof(up_push),
+                        up_buffers, up_sizes, &up_push, (uint32_t)((N * C * H * 2 * W * 2 + 255) / 256), 1, 1)) ok = 0;
+            float up_max = 0.0f;
+            for (int n = 0; ok && n < N; ++n) {
+                for (int c = 0; c < C; ++c) {
+                    for (int yy = 0; yy < H * 2; ++yy) {
+                        for (int xx = 0; xx < W * 2; ++xx) {
+                            int idx = ((n * C + c) * (H * 2) + yy) * (W * 2) + xx;
+                            float ref = x[((n * C + c) * H + yy / 2) * W + xx / 2];
+                            float diff = fabsf(up[idx] - ref);
+                            if (diff > up_max) up_max = diff;
+                        }
+                    }
+                }
+            }
+            VkBuffer tgrow_buffers[2] = {tgrow_in_buffer, tgrow_out_buffer};
+            VkDeviceSize tgrow_sizes[2] = {tgrow_in_bytes, tgrow_out_bytes};
+            WorldVulkanTaehvTgrowPush tgrow_push = {N, C, H, W, STRIDE};
+            if (ok && run_probe_compute(rt, "taehv_tgrow_reshape_nchw_f32.comp", 2, sizeof(tgrow_push),
+                        tgrow_buffers, tgrow_sizes, &tgrow_push, (uint32_t)((N * STRIDE * C * H * W + 255) / 256), 1, 1)) ok = 0;
+            float tgrow_max = 0.0f;
+            for (int n = 0; ok && n < N; ++n) {
+                for (int s = 0; s < STRIDE; ++s) {
+                    for (int c = 0; c < C; ++c) {
+                        for (int yy = 0; yy < H; ++yy) {
+                            for (int xx = 0; xx < W; ++xx) {
+                                int out_idx = (((n * STRIDE + s) * C + c) * H + yy) * W + xx;
+                                int in_idx = ((n * (C * STRIDE) + (s * C + c)) * H + yy) * W + xx;
+                                float diff = fabsf(tgrow_out[out_idx] - tgrow_in[in_idx]);
+                                if (diff > tgrow_max) tgrow_max = diff;
+                            }
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "vulkan taehv_upsample2/tgrow_f32 probe: upsample_max=%g tgrow_max=%g\n", up_max, tgrow_max);
+            if (up_max != 0.0f || tgrow_max != 0.0f) ok = 0;
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, up_buffer, up_memory, up_mapped);
+        destroy_host_buffer(rt, tgrow_in_buffer, tgrow_in_memory, tgrow_in_mapped);
+        destroy_host_buffer(rt, tgrow_out_buffer, tgrow_out_memory, tgrow_out_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    {
+        enum { N = 6, H = 3, W = 4 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, rgba_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, rgba_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *rgba_mapped = NULL;
+        size_t x_bytes = (size_t)N * 12 * H * W * sizeof(float);
+        size_t rgba_bytes = (size_t)4 * H * 2 * W * 2 * sizeof(uint32_t);
+        if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, rgba_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &rgba_buffer, &rgba_memory, &rgba_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            uint32_t *rgba = (uint32_t *)rgba_mapped;
+            for (int i = 0; i < N * 12 * H * W; ++i) x[i] = probe_value(i + 149, 0.125f) + 0.5f;
+            memset(rgba, 0, rgba_bytes);
+            VkBuffer buffers[2] = {x_buffer, rgba_buffer};
+            VkDeviceSize sizes[2] = {x_bytes, rgba_bytes};
+            WorldVulkanTaehvPixelShufflePush push = {N, H, W};
+            if (run_probe_compute(rt, "taehv_pixel_shuffle_rgba_f32.comp", 2, sizeof(push),
+                        buffers, sizes, &push, (uint32_t)((4 * H * 2 * W * 2 + 255) / 256), 1, 1)) ok = 0;
+            uint32_t mismatches = 0;
+            for (int f = 0; ok && f < 4; ++f) {
+                int n = N - 4 + f;
+                for (int oy = 0; oy < H * 2; ++oy) {
+                    for (int ox = 0; ox < W * 2; ++ox) {
+                        uint32_t comps[3];
+                        for (int c = 0; c < 3; ++c) {
+                            int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
+                            float v = x[((n * 12 + ic) * H + oy / 2) * W + ox / 2];
+                            if (v < 0.0f) v = 0.0f;
+                            if (v > 1.0f) v = 1.0f;
+                            comps[c] = (uint32_t)(v * 255.0f);
+                        }
+                        uint32_t ref = 0xff000000u | comps[0] | (comps[1] << 8) | (comps[2] << 16);
+                        uint32_t got = rgba[(f * H * 2 + oy) * (W * 2) + ox];
+                        if (got != ref) ++mismatches;
+                    }
+                }
+            }
+            fprintf(stderr, "vulkan taehv_pixel_shuffle_rgba_f32 probe: mismatches=%u\n", mismatches);
+            if (mismatches != 0) ok = 0;
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, rgba_buffer, rgba_memory, rgba_mapped);
+        if (!ok) goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
     world_vulkan_runtime_destroy(rt);
     return rc;
 }

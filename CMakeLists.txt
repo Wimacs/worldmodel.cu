@@ -111,6 +111,14 @@ if(WORLD_ENABLE_VULKAN)
     qkv_rms_rope_f32.comp
     rms_norm_f32.comp
     silu_f32.comp
+    taehv_add_relu_f32.comp
+    taehv_concat_past_nchw_f32.comp
+    taehv_conv2d_nchw_f32.comp
+    taehv_pixel_shuffle_rgba_f32.comp
+    taehv_relu_f32.comp
+    taehv_repeat_clamp_f32.comp
+    taehv_tgrow_reshape_nchw_f32.comp
+    taehv_upsample2_nchw_f32.comp
     latent_update_f32.comp
     unpatchify_f32.comp
     unpatchify_orig_f32.comp

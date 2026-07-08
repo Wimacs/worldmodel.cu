@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InBuf {
+    float x[];
+};
+
+layout(std430, binding = 1) buffer RgbaBuf {
+    uint rgba[];
+};
+
+layout(push_constant) uniform Push {
+    uint N;
+    uint H;
+    uint W;
+} pc;
+
+uint to_u8(float v) {
+    float clamped = clamp(v, 0.0, 1.0) * 255.0;
+    return uint(clamped);
+}
+
+void main() {
+    uint H2 = pc.H * 2u;
+    uint W2 = pc.W * 2u;
+    uint i = gl_GlobalInvocationID.x;
+    uint total = 4u * H2 * W2;
+    if (i >= total) {
+        return;
+    }
+
+    uint ox = i % W2;
+    uint q = i / W2;
+    uint oy = q % H2;
+    uint f = q / H2;
+    uint n = pc.N - 4u + f;
+    uint sub = (oy & 1u) * 2u + (ox & 1u);
+    uint base = ((n * 12u) * pc.H + (oy / 2u)) * pc.W + (ox / 2u);
+    uint r = to_u8(x[base + (0u * 4u + sub) * pc.H * pc.W]);
+    uint g = to_u8(x[base + (1u * 4u + sub) * pc.H * pc.W]);
+    uint b = to_u8(x[base + (2u * 4u + sub) * pc.H * pc.W]);
+    rgba[i] = 0xff000000u | r | (g << 8) | (b << 16);
+}
