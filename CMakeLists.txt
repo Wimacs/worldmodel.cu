@@ -116,6 +116,7 @@ if(WORLD_ENABLE_VULKAN)
     lerp_inplace_f32.comp
     linear_f16_coopmat.comp
     linear_f16x_wf16_gated_residual.comp
+    linear_f16x_wf16_gated_residual_n16.comp
     linear_f16x_wf16_gated_residual_n32.comp
     linear_f16x_wf16_coopmat.comp
     linear_f32_coopmat.comp

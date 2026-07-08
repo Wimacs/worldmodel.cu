@@ -9,6 +9,7 @@ int world_vulkan_linear_f32_wf16_coopmat_probe(void);
 int world_vulkan_linear_f32_wf16_gated_residual_n32_probe(void);
 int world_vulkan_linear_f16x_wf16_coopmat_probe(void);
 int world_vulkan_linear_f16x_wf16_gated_residual_probe(void);
+int world_vulkan_linear_f16x_wf16_gated_residual_n16_probe(void);
 int world_vulkan_linear_f16x_wf16_gated_residual_n32_probe(void);
 int world_vulkan_linear_f32_wf16_silu_f16_n32_probe(void);
 int world_vulkan_silu_f32_probe(void);
@@ -71,6 +72,11 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_linear_f16x_wf16_gated_residual_probe: ok\n");
+    if (world_vulkan_linear_f16x_wf16_gated_residual_n16_probe()) {
+        fprintf(stderr, "world_vulkan_linear_f16x_wf16_gated_residual_n16_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_linear_f16x_wf16_gated_residual_n16_probe: ok\n");
     if (world_vulkan_linear_f16x_wf16_gated_residual_n32_probe()) {
         fprintf(stderr, "world_vulkan_linear_f16x_wf16_gated_residual_n32_probe: failed\n");
         return 1;
