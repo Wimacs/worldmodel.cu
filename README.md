@@ -55,14 +55,17 @@ the GLSL files in `shaders/vulkan/` to SPIR-V. The runtime creates a Vulkan
 device, resident compute pipelines, and returns RGB frames through the same
 raylib/headless path. When real model weights are supplied, the Vulkan raylib
 path now runs a resident latent visualization slice every frame:
+`control_input -> linear_f32.comp -> silu_f32.comp -> linear_f32.comp ->
+rms_norm_f32.comp`, followed by
 `patchify_f32.comp -> unpatchify_orig_f32.comp -> latent_to_rgba.comp`.
-This wires the loaded patch/unpatch weights into the interactive runtime while
-the full transformer/VAE port is still in progress. Without weights, it falls
-back to the simple `fill_rgba.comp` scaffold for lightweight probes.
+This wires the loaded control embedding and patch/unpatch weights into the
+interactive runtime while the full transformer/VAE port is still in progress.
+Without weights, it falls back to the simple `fill_rgba.comp` scaffold for
+lightweight probes.
 
 `worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
 elementwise `silu_f32.comp`, rowwise `rms_norm_f32.comp`, fused
-`ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused
+control embedding, `ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused
 `qkv_rms_rope_f32.comp`, `masked_attention_f32.comp`, the KV-cache helpers,
 `indexed_attention_f32.comp`, and the patch/unpatch latent-token boundary.
 

@@ -10,6 +10,10 @@ layout(std430, binding = 1) buffer OutputPixels {
     uint rgba[];
 } out_pixels;
 
+layout(std430, binding = 2) readonly buffer ControlEmbedding {
+    float ctrl[];
+} in_ctrl;
+
 layout(push_constant) uniform Push {
     uint out_width;
     uint out_height;
@@ -18,6 +22,7 @@ layout(push_constant) uniform Push {
     uint latent_h;
     uint latent_w;
     uint frame_ordinal;
+    uint ctrl_dim;
     float control_x;
     float control_y;
 } pc;
@@ -39,11 +44,16 @@ void main() {
 
     uint lx = min((x * pc.latent_w) / pc.out_width, pc.latent_w - 1u);
     uint ly = min((y * pc.latent_h) / pc.out_height, pc.latent_h - 1u);
+    float c0 = pc.ctrl_dim > 0u ? in_ctrl.ctrl[0] : 0.0;
+    float c1 = pc.ctrl_dim > 1u ? in_ctrl.ctrl[1] : 0.0;
+    float c2 = pc.ctrl_dim > 2u ? in_ctrl.ctrl[2] : 0.0;
+    float c3 = pc.ctrl_dim > 3u ? in_ctrl.ctrl[3] : 0.0;
     float drift = 0.015 * float(f) + 0.025 * float(pc.frame_ordinal & 31u);
-    float steer = 0.08 * pc.control_x + 0.05 * pc.control_y;
+    float steer = 0.08 * pc.control_x + 0.05 * pc.control_y + 0.025 * c0 - 0.015 * c1;
+    float tint = 0.018 * c2 - 0.012 * c3;
     float r_f = 0.5 + 0.5 * tanh(read_latent(0u, ly, lx) * 0.55 + steer + drift);
-    float g_f = 0.5 + 0.5 * tanh(read_latent(1u, ly, lx) * 0.55 + 0.35 * steer);
-    float b_f = 0.5 + 0.5 * tanh(read_latent(2u, ly, lx) * 0.55 - 0.25 * steer - drift);
+    float g_f = 0.5 + 0.5 * tanh(read_latent(1u, ly, lx) * 0.55 + 0.35 * steer + tint);
+    float b_f = 0.5 + 0.5 * tanh(read_latent(2u, ly, lx) * 0.55 - 0.25 * steer - drift - tint);
 
     uint r = uint(clamp(r_f * 255.0, 0.0, 255.0));
     uint g = uint(clamp(g_f * 255.0, 0.0, 255.0));
