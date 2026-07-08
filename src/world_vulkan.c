@@ -1006,6 +1006,68 @@ static int create_weight_buffer_from_data(
     return upload_to_device_buffer(rt, *buffer, src, bytes);
 }
 
+static int create_device_storage_buffer(
+        WorldVulkanRuntime *rt,
+        VkDeviceSize bytes,
+        VkBuffer *buffer,
+        VkDeviceMemory *memory) {
+    return create_device_buffer(rt, bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            buffer, memory);
+}
+
+static int clear_device_buffer(WorldVulkanRuntime *rt, VkBuffer buffer, VkDeviceSize bytes) {
+    if (!buffer || bytes == 0) return 0;
+    if ((bytes & 3u) != 0u) {
+        fprintf(stderr, "Vulkan clear_device_buffer size must be 4-byte aligned: %llu\n",
+                (unsigned long long)bytes);
+        return 1;
+    }
+    int rc = 1;
+    if (vkResetFences(rt->device, 1, &rt->fence) != VK_SUCCESS) goto cleanup;
+    if (vkResetCommandBuffer(rt->command_buffer, 0) != VK_SUCCESS) goto cleanup;
+    VkCommandBufferBeginInfo begin_info;
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(rt->command_buffer, &begin_info) != VK_SUCCESS) goto cleanup;
+    vkCmdFillBuffer(rt->command_buffer, buffer, 0, bytes, 0u);
+    if (vkEndCommandBuffer(rt->command_buffer) != VK_SUCCESS) goto cleanup;
+
+    VkSubmitInfo submit_info;
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &rt->command_buffer;
+    if (vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence) != VK_SUCCESS) goto cleanup;
+    if (vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) goto cleanup;
+    rc = 0;
+
+cleanup:
+    return rc;
+}
+
+static int download_from_device_buffer(
+        WorldVulkanRuntime *rt,
+        VkBuffer src,
+        void *dst,
+        VkDeviceSize bytes) {
+    if (!src || !dst || bytes == 0) return 0;
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *staging_mapped = NULL;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                &staging_buffer, &staging_memory, &staging_mapped)) return 1;
+    int rc = copy_buffer_to_device(rt, src, staging_buffer, bytes);
+    if (rc == 0) {
+        memcpy(dst, staging_mapped, (size_t)bytes);
+    }
+    destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
+    return rc;
+}
+
 static int create_output_buffer(WorldVulkanRuntime *rt) {
     return create_host_buffer(rt,
             rt->pixel_count * sizeof(uint32_t),
@@ -2241,22 +2303,22 @@ static int create_runtime_model_slice(
     }
     if (create_weight_buffer_from_data(rt, (VkDeviceSize)patch_weight_bytes, weights->patchify_weight,
                 &rt->patch_weight_buffer, &rt->patch_weight_memory)) return 1;
-    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                &rt->tokens_buffer, &rt->tokens_memory, &rt->tokens_mapped)) return 1;
+    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                &rt->tokens_buffer, &rt->tokens_memory)) return 1;
     if (rt->layer_qkv_enabled) {
-        if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    &rt->norm_buffer, &rt->norm_memory, &rt->norm_mapped)) return 1;
-        if (create_host_buffer(rt, qkv_raw_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    &rt->qkv_raw_buffer, &rt->qkv_raw_memory, &rt->qkv_raw_mapped)) return 1;
-        if (create_host_buffer(rt, q_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    &rt->q_buffer, &rt->q_memory, &rt->q_mapped)) return 1;
-        if (create_host_buffer(rt, kv_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    &rt->k_buffer, &rt->k_memory, &rt->k_mapped)) return 1;
-        if (create_host_buffer(rt, kv_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                    &rt->v_buffer, &rt->v_memory, &rt->v_mapped)) return 1;
+        if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                    &rt->norm_buffer, &rt->norm_memory)) return 1;
+        if (create_device_storage_buffer(rt, (VkDeviceSize)qkv_raw_bytes,
+                    &rt->qkv_raw_buffer, &rt->qkv_raw_memory)) return 1;
+        if (create_device_storage_buffer(rt, (VkDeviceSize)q_rope_bytes,
+                    &rt->q_buffer, &rt->q_memory)) return 1;
+        if (create_device_storage_buffer(rt, (VkDeviceSize)kv_rope_bytes,
+                    &rt->k_buffer, &rt->k_memory)) return 1;
+        if (create_device_storage_buffer(rt, (VkDeviceSize)kv_rope_bytes,
+                    &rt->v_buffer, &rt->v_memory)) return 1;
         if (rt->cfg.value_residual) {
-            if (create_host_buffer(rt, kv_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->v_first_buffer, &rt->v_first_memory, &rt->v_first_mapped)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)kv_rope_bytes,
+                        &rt->v_first_buffer, &rt->v_first_memory)) return 1;
         }
         if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                     &rt->x_pos_buffer, &rt->x_pos_memory, &rt->x_pos_mapped)) return 1;
@@ -2278,18 +2340,18 @@ static int create_runtime_model_slice(
             if (!rt->kv_upsert_descriptor_pools || !rt->kv_upsert_descriptor_sets ||
                     !rt->cache_indices_descriptor_pools || !rt->cache_indices_descriptor_sets ||
                     !rt->indexed_attention_descriptor_pools || !rt->indexed_attention_descriptor_sets) return 1;
-            if (create_host_buffer(rt, cache_kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->cache_k_buffer, &rt->cache_k_memory, &rt->cache_k_mapped)) return 1;
-            if (create_host_buffer(rt, cache_kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->cache_v_buffer, &rt->cache_v_memory, &rt->cache_v_mapped)) return 1;
-            if (create_host_buffer(rt, cache_meta_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->cache_written_buffer, &rt->cache_written_memory, &rt->cache_written_mapped)) return 1;
-            if (create_host_buffer(rt, cache_meta_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->cache_indices_buffer, &rt->cache_indices_memory, &rt->cache_indices_mapped)) return 1;
-            if (create_host_buffer(rt, cache_count_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->cache_index_count_buffer, &rt->cache_index_count_memory, &rt->cache_index_count_mapped)) return 1;
-            if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        &rt->attn_buffer, &rt->attn_memory, &rt->attn_mapped)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_bytes,
+                        &rt->cache_k_buffer, &rt->cache_k_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_bytes,
+                        &rt->cache_v_buffer, &rt->cache_v_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
+                        &rt->cache_written_buffer, &rt->cache_written_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
+                        &rt->cache_indices_buffer, &rt->cache_indices_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_count_bytes,
+                        &rt->cache_index_count_buffer, &rt->cache_index_count_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                        &rt->attn_buffer, &rt->attn_memory)) return 1;
             if (rt->layer_attn_out_enabled) {
                 rt->attn_out_proj_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
                 rt->attn_out_proj_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
@@ -2300,10 +2362,10 @@ static int create_runtime_model_slice(
                 if (create_device_buffer(rt, (VkDeviceSize)attn_out_proj_weight_bytes,
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             &rt->attn_out_proj_weight_buffer, &rt->attn_out_proj_weight_memory)) return 1;
-                if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            &rt->attn_proj_buffer, &rt->attn_proj_memory, &rt->attn_proj_mapped)) return 1;
-                if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            &rt->tokens_after_attn_buffer, &rt->tokens_after_attn_memory, &rt->tokens_after_attn_mapped)) return 1;
+                if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                            &rt->attn_proj_buffer, &rt->attn_proj_memory)) return 1;
+                if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                            &rt->tokens_after_attn_buffer, &rt->tokens_after_attn_memory)) return 1;
                 if (rt->layer_ctrl_enabled) {
                     rt->ctrl_cond_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
                     rt->ctrl_cond_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
@@ -2328,14 +2390,14 @@ static int create_runtime_model_slice(
                                 &rt->ctrl_fc2_weight_buffer_layer, &rt->ctrl_fc2_weight_memory_layer)) return 1;
                     if (create_host_buffer(rt, ctrl_cond_table_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                 &rt->ctrl_cond_buffer, &rt->ctrl_cond_memory, &rt->ctrl_cond_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->ctrl_norm_buffer, &rt->ctrl_norm_memory, &rt->ctrl_norm_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->ctrl_hidden_layer_buffer, &rt->ctrl_hidden_layer_memory, &rt->ctrl_hidden_layer_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->ctrl_out_buffer, &rt->ctrl_out_memory, &rt->ctrl_out_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->tokens_after_ctrl_buffer, &rt->tokens_after_ctrl_memory, &rt->tokens_after_ctrl_mapped)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->ctrl_norm_buffer, &rt->ctrl_norm_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->ctrl_hidden_layer_buffer, &rt->ctrl_hidden_layer_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->ctrl_out_buffer, &rt->ctrl_out_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->tokens_after_ctrl_buffer, &rt->tokens_after_ctrl_memory)) return 1;
                 }
                 if (rt->layer_mlp_enabled) {
                     rt->mlp_ada_descriptor_pools = (VkDescriptorPool *)calloc(pass_layer_count, sizeof(VkDescriptorPool));
@@ -2356,14 +2418,14 @@ static int create_runtime_model_slice(
                     if (create_device_buffer(rt, (VkDeviceSize)dit_mlp_fc2_weight_bytes,
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 &rt->dit_mlp_fc2_weight_buffer, &rt->dit_mlp_fc2_weight_memory)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->mlp_in_buffer, &rt->mlp_in_memory, &rt->mlp_in_mapped)) return 1;
-                    if (create_host_buffer(rt, mlp_hidden_token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->mlp_hidden_buffer, &rt->mlp_hidden_memory, &rt->mlp_hidden_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->mlp_out_buffer, &rt->mlp_out_memory, &rt->mlp_out_mapped)) return 1;
-                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                &rt->tokens_after_mlp_buffer, &rt->tokens_after_mlp_memory, &rt->tokens_after_mlp_mapped)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->mlp_in_buffer, &rt->mlp_in_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)mlp_hidden_token_bytes,
+                                &rt->mlp_hidden_buffer, &rt->mlp_hidden_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->mlp_out_buffer, &rt->mlp_out_memory)) return 1;
+                    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                                &rt->tokens_after_mlp_buffer, &rt->tokens_after_mlp_memory)) return 1;
                 }
             }
         }
@@ -2372,10 +2434,10 @@ static int create_runtime_model_slice(
                 &rt->unpatch_weight_buffer, &rt->unpatch_weight_memory)) return 1;
     if (create_weight_buffer_from_data(rt, (VkDeviceSize)unpatch_bias_bytes, weights->unpatchify_bias,
                 &rt->unpatch_bias_buffer, &rt->unpatch_bias_memory)) return 1;
-    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                &rt->final_tokens_buffer, &rt->final_tokens_memory, &rt->final_tokens_mapped)) return 1;
-    if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                &rt->latent_out_buffer, &rt->latent_out_memory, &rt->latent_out_mapped)) return 1;
+    if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
+                &rt->final_tokens_buffer, &rt->final_tokens_memory)) return 1;
+    if (create_device_storage_buffer(rt, (VkDeviceSize)latent_bytes,
+                &rt->latent_out_buffer, &rt->latent_out_memory)) return 1;
 
     memset(rt->latent_mapped, 0, latent_bytes);
     memset(rt->control_mapped, 0, control_bytes);
@@ -2418,7 +2480,7 @@ static int create_runtime_model_slice(
         if (copy_failed) return 1;
         memset(rt->layer_mod_table_mapped, 0, layer_mod_table_bytes);
     }
-    memset(rt->tokens_mapped, 0, token_bytes);
+    if (clear_device_buffer(rt, rt->tokens_buffer, (VkDeviceSize)token_bytes)) return 1;
     if (rt->layer_qkv_enabled) {
         size_t q_elems = (size_t)rt->D * rt->D;
         size_t kv_elems = (size_t)rt->kv_dim * rt->D;
@@ -2441,29 +2503,36 @@ static int create_runtime_model_slice(
                 (VkDeviceSize)qkv_proj_weight_bytes);
         destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
         if (copy_failed) return 1;
-        memset(rt->norm_mapped, 0, token_bytes);
-        memset(rt->qkv_raw_mapped, 0, qkv_raw_bytes);
-        memset(rt->q_mapped, 0, q_rope_bytes);
-        memset(rt->k_mapped, 0, kv_rope_bytes);
-        memset(rt->v_mapped, 0, kv_rope_bytes);
-        if (rt->v_first_mapped) memset(rt->v_first_mapped, 0, kv_rope_bytes);
+        if (clear_device_buffer(rt, rt->norm_buffer, (VkDeviceSize)token_bytes)) return 1;
+        if (clear_device_buffer(rt, rt->qkv_raw_buffer, (VkDeviceSize)qkv_raw_bytes)) return 1;
+        if (clear_device_buffer(rt, rt->q_buffer, (VkDeviceSize)q_rope_bytes)) return 1;
+        if (clear_device_buffer(rt, rt->k_buffer, (VkDeviceSize)kv_rope_bytes)) return 1;
+        if (clear_device_buffer(rt, rt->v_buffer, (VkDeviceSize)kv_rope_bytes)) return 1;
+        if (rt->v_first_buffer &&
+                clear_device_buffer(rt, rt->v_first_buffer, (VkDeviceSize)kv_rope_bytes)) return 1;
         memset(rt->x_pos_mapped, 0, pos_bytes);
         memset(rt->y_pos_mapped, 0, pos_bytes);
         memset(rt->t_pos_mapped, 0, pos_bytes);
         fill_runtime_rope_tables(rt);
         if (rt->layer_attention_enabled) {
-            memset(rt->cache_k_mapped, 0, cache_kv_bytes);
-            memset(rt->cache_v_mapped, 0, cache_kv_bytes);
-            memset(rt->cache_written_mapped, 0, cache_meta_bytes);
-            memset(rt->cache_indices_mapped, 0, cache_meta_bytes);
-            memset(rt->cache_index_count_mapped, 0, cache_count_bytes);
-            memset(rt->attn_mapped, 0, token_bytes);
-            uint32_t *written = (uint32_t *)rt->cache_written_mapped;
-            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
-                size_t base = rt->cache_meta_offsets[layer_idx];
-                for (int i = rt->cache_ring_lengths[layer_idx]; i < rt->cache_capacities[layer_idx]; ++i) {
-                    written[base + (size_t)i] = 1u;
+            if (clear_device_buffer(rt, rt->cache_k_buffer, (VkDeviceSize)cache_kv_bytes)) return 1;
+            if (clear_device_buffer(rt, rt->cache_v_buffer, (VkDeviceSize)cache_kv_bytes)) return 1;
+            if (clear_device_buffer(rt, rt->cache_indices_buffer, (VkDeviceSize)cache_meta_bytes)) return 1;
+            if (clear_device_buffer(rt, rt->cache_index_count_buffer, (VkDeviceSize)cache_count_bytes)) return 1;
+            if (clear_device_buffer(rt, rt->attn_buffer, (VkDeviceSize)token_bytes)) return 1;
+            {
+                uint32_t *written = (uint32_t *)calloc(rt->cache_total_meta_elems, sizeof(uint32_t));
+                if (!written) return 1;
+                for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                    size_t base = rt->cache_meta_offsets[layer_idx];
+                    for (int i = rt->cache_ring_lengths[layer_idx]; i < rt->cache_capacities[layer_idx]; ++i) {
+                        written[base + (size_t)i] = 1u;
+                    }
                 }
+                int upload_failed = upload_to_device_buffer(rt, rt->cache_written_buffer,
+                        written, (VkDeviceSize)cache_meta_bytes);
+                free(written);
+                if (upload_failed) return 1;
             }
             if (rt->layer_attn_out_enabled) {
                 {
@@ -2485,8 +2554,8 @@ static int create_runtime_model_slice(
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
                 }
-                memset(rt->attn_proj_mapped, 0, token_bytes);
-                memset(rt->tokens_after_attn_mapped, 0, token_bytes);
+                if (clear_device_buffer(rt, rt->attn_proj_buffer, (VkDeviceSize)token_bytes)) return 1;
+                if (clear_device_buffer(rt, rt->tokens_after_attn_buffer, (VkDeviceSize)token_bytes)) return 1;
                 if (rt->layer_ctrl_enabled) {
                     VkBuffer staging_buffer = VK_NULL_HANDLE;
                     VkDeviceMemory staging_memory = VK_NULL_HANDLE;
@@ -2534,10 +2603,10 @@ static int create_runtime_model_slice(
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
                     memset(rt->ctrl_cond_mapped, 0, ctrl_cond_table_bytes);
-                    memset(rt->ctrl_norm_mapped, 0, token_bytes);
-                    memset(rt->ctrl_hidden_layer_mapped, 0, token_bytes);
-                    memset(rt->ctrl_out_mapped, 0, token_bytes);
-                    memset(rt->tokens_after_ctrl_mapped, 0, token_bytes);
+                    if (clear_device_buffer(rt, rt->ctrl_norm_buffer, (VkDeviceSize)token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->ctrl_hidden_layer_buffer, (VkDeviceSize)token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->ctrl_out_buffer, (VkDeviceSize)token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->tokens_after_ctrl_buffer, (VkDeviceSize)token_bytes)) return 1;
                 }
                 if (rt->layer_mlp_enabled) {
                     VkBuffer staging_buffer = VK_NULL_HANDLE;
@@ -2575,16 +2644,16 @@ static int create_runtime_model_slice(
                             (VkDeviceSize)dit_mlp_fc2_weight_bytes);
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
-                    memset(rt->mlp_in_mapped, 0, token_bytes);
-                    memset(rt->mlp_hidden_mapped, 0, mlp_hidden_token_bytes);
-                    memset(rt->mlp_out_mapped, 0, token_bytes);
-                    memset(rt->tokens_after_mlp_mapped, 0, token_bytes);
+                    if (clear_device_buffer(rt, rt->mlp_in_buffer, (VkDeviceSize)token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->mlp_hidden_buffer, (VkDeviceSize)mlp_hidden_token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->mlp_out_buffer, (VkDeviceSize)token_bytes)) return 1;
+                    if (clear_device_buffer(rt, rt->tokens_after_mlp_buffer, (VkDeviceSize)token_bytes)) return 1;
                 }
             }
         }
     }
-    memset(rt->final_tokens_mapped, 0, token_bytes);
-    memset(rt->latent_out_mapped, 0, latent_bytes);
+    if (clear_device_buffer(rt, rt->final_tokens_buffer, (VkDeviceSize)token_bytes)) return 1;
+    if (clear_device_buffer(rt, rt->latent_out_buffer, (VkDeviceSize)latent_bytes)) return 1;
 
     if (create_storage_pipeline(rt, "linear_f32.comp", 4, sizeof(WorldVulkanLinearPush),
                 &rt->runtime_linear_shader, &rt->runtime_linear_set_layout,
@@ -6083,6 +6152,29 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float *final_tokens_ref = NULL;
     float *latent_out_ref = NULL;
     float *latent_final_ref = NULL;
+    float *norm_got = NULL;
+    float *qkv_got = NULL;
+    float *q_got = NULL;
+    float *k_got = NULL;
+    float *v_got = NULL;
+    float *cache_k = NULL;
+    float *cache_v = NULL;
+    uint32_t *written = NULL;
+    uint32_t *indices = NULL;
+    uint32_t *cache_index_count = NULL;
+    float *attn = NULL;
+    float *attn_proj = NULL;
+    float *tokens_after_attn = NULL;
+    float *ctrl_norm = NULL;
+    float *ctrl_hidden = NULL;
+    float *ctrl_out = NULL;
+    float *tokens_after_ctrl = NULL;
+    float *mlp_in = NULL;
+    float *mlp_hidden = NULL;
+    float *mlp_out = NULL;
+    float *tokens_after_mlp = NULL;
+    float *final_tokens = NULL;
+    float *latent_out = NULL;
     WorldVulkanRuntime *rt = NULL;
     WorldLayerWeights layer;
     memset(&layer, 0, sizeof(layer));
@@ -6212,6 +6304,70 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
         }
     }
 
+#define READBACK_ALLOC(ptr, count, type) do { \
+    (ptr) = (type *)malloc((size_t)(count) * sizeof(type)); \
+    if (!(ptr)) goto cleanup; \
+} while (0)
+#define READBACK_BUFFER(ptr, buffer, bytes) do { \
+    if (download_from_device_buffer(rt, (buffer), (ptr), (VkDeviceSize)(bytes))) goto cleanup; \
+} while (0)
+    {
+        size_t token_bytes = (size_t)T * D * sizeof(float);
+        size_t qkv_bytes = (size_t)T * qkv_dim * sizeof(float);
+        size_t kv_rope_bytes = (size_t)T * kv_dim * sizeof(float);
+        size_t cache_kv_bytes = rt->cache_total_kv_elems * sizeof(float);
+        size_t cache_meta_bytes = rt->cache_total_meta_elems * sizeof(uint32_t);
+        size_t cache_count_bytes = (size_t)rt->layers_to_run * sizeof(uint32_t);
+        READBACK_ALLOC(norm_got, (size_t)T * D, float);
+        READBACK_ALLOC(qkv_got, (size_t)T * qkv_dim, float);
+        READBACK_ALLOC(q_got, (size_t)T * D, float);
+        READBACK_ALLOC(k_got, (size_t)T * kv_dim, float);
+        READBACK_ALLOC(v_got, (size_t)T * kv_dim, float);
+        READBACK_ALLOC(cache_k, rt->cache_total_kv_elems, float);
+        READBACK_ALLOC(cache_v, rt->cache_total_kv_elems, float);
+        READBACK_ALLOC(written, rt->cache_total_meta_elems, uint32_t);
+        READBACK_ALLOC(indices, rt->cache_total_meta_elems, uint32_t);
+        READBACK_ALLOC(cache_index_count, rt->layers_to_run, uint32_t);
+        READBACK_ALLOC(attn, (size_t)T * D, float);
+        READBACK_ALLOC(attn_proj, (size_t)T * D, float);
+        READBACK_ALLOC(tokens_after_attn, (size_t)T * D, float);
+        READBACK_ALLOC(ctrl_norm, (size_t)T * D, float);
+        READBACK_ALLOC(ctrl_hidden, (size_t)T * D, float);
+        READBACK_ALLOC(ctrl_out, (size_t)T * D, float);
+        READBACK_ALLOC(tokens_after_ctrl, (size_t)T * D, float);
+        READBACK_ALLOC(mlp_in, (size_t)T * D, float);
+        READBACK_ALLOC(mlp_hidden, mlp_hidden_token_elems, float);
+        READBACK_ALLOC(mlp_out, (size_t)T * D, float);
+        READBACK_ALLOC(tokens_after_mlp, (size_t)T * D, float);
+        READBACK_ALLOC(final_tokens, (size_t)T * D, float);
+        READBACK_ALLOC(latent_out, latent_elems, float);
+        READBACK_BUFFER(norm_got, rt->norm_buffer, token_bytes);
+        READBACK_BUFFER(qkv_got, rt->qkv_raw_buffer, qkv_bytes);
+        READBACK_BUFFER(q_got, rt->q_buffer, token_bytes);
+        READBACK_BUFFER(k_got, rt->k_buffer, kv_rope_bytes);
+        READBACK_BUFFER(v_got, rt->v_buffer, kv_rope_bytes);
+        READBACK_BUFFER(cache_k, rt->cache_k_buffer, cache_kv_bytes);
+        READBACK_BUFFER(cache_v, rt->cache_v_buffer, cache_kv_bytes);
+        READBACK_BUFFER(written, rt->cache_written_buffer, cache_meta_bytes);
+        READBACK_BUFFER(indices, rt->cache_indices_buffer, cache_meta_bytes);
+        READBACK_BUFFER(cache_index_count, rt->cache_index_count_buffer, cache_count_bytes);
+        READBACK_BUFFER(attn, rt->attn_buffer, token_bytes);
+        READBACK_BUFFER(attn_proj, rt->attn_proj_buffer, token_bytes);
+        READBACK_BUFFER(tokens_after_attn, rt->tokens_after_attn_buffer, token_bytes);
+        READBACK_BUFFER(ctrl_norm, rt->ctrl_norm_buffer, token_bytes);
+        READBACK_BUFFER(ctrl_hidden, rt->ctrl_hidden_layer_buffer, token_bytes);
+        READBACK_BUFFER(ctrl_out, rt->ctrl_out_buffer, token_bytes);
+        READBACK_BUFFER(tokens_after_ctrl, rt->tokens_after_ctrl_buffer, token_bytes);
+        READBACK_BUFFER(mlp_in, rt->mlp_in_buffer, token_bytes);
+        READBACK_BUFFER(mlp_hidden, rt->mlp_hidden_buffer, mlp_hidden_token_elems * sizeof(float));
+        READBACK_BUFFER(mlp_out, rt->mlp_out_buffer, token_bytes);
+        READBACK_BUFFER(tokens_after_mlp, rt->tokens_after_mlp_buffer, token_bytes);
+        READBACK_BUFFER(final_tokens, rt->final_tokens_buffer, token_bytes);
+        READBACK_BUFFER(latent_out, rt->latent_out_buffer, latent_elems * sizeof(float));
+    }
+#undef READBACK_BUFFER
+#undef READBACK_ALLOC
+
     for (int t = 0; t < T; ++t) {
         int y = t / width;
         int x = t - y * width;
@@ -6256,11 +6412,6 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float norm_mean = 0.0f;
     float qkv_mean = 0.0f;
     float rope_mean = 0.0f;
-    const float *norm_got = (const float *)rt->norm_mapped;
-    const float *qkv_got = (const float *)rt->qkv_raw_mapped;
-    const float *q_got = (const float *)rt->q_mapped;
-    const float *k_got = (const float *)rt->k_mapped;
-    const float *v_got = (const float *)rt->v_mapped;
     for (int i = 0; i < T * D; ++i) {
         float diff = fabsf(norm_got[i] - norm_ref[i]);
         if (diff > norm_max) norm_max = diff;
@@ -6345,25 +6496,8 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float latent_out_mean = 0.0f;
     float latent_final_mean = 0.0f;
     uint32_t cache_mismatches = 0;
-    const float *cache_k = (const float *)rt->cache_k_mapped;
-    const float *cache_v = (const float *)rt->cache_v_mapped;
-    const uint32_t *written = (const uint32_t *)rt->cache_written_mapped;
-    const uint32_t *indices = (const uint32_t *)rt->cache_indices_mapped;
-    const uint32_t index_count = ((const uint32_t *)rt->cache_index_count_mapped)[0];
-    const float *attn = (const float *)rt->attn_mapped;
-    const float *attn_proj = (const float *)rt->attn_proj_mapped;
-    const float *tokens_after_attn = (const float *)rt->tokens_after_attn_mapped;
+    const uint32_t index_count = cache_index_count[0];
     const float *ctrl_cond = (const float *)rt->ctrl_cond_mapped;
-    const float *ctrl_norm = (const float *)rt->ctrl_norm_mapped;
-    const float *ctrl_hidden = (const float *)rt->ctrl_hidden_layer_mapped;
-    const float *ctrl_out = (const float *)rt->ctrl_out_mapped;
-    const float *tokens_after_ctrl = (const float *)rt->tokens_after_ctrl_mapped;
-    const float *mlp_in = (const float *)rt->mlp_in_mapped;
-    const float *mlp_hidden = (const float *)rt->mlp_hidden_mapped;
-    const float *mlp_out = (const float *)rt->mlp_out_mapped;
-    const float *tokens_after_mlp = (const float *)rt->tokens_after_mlp_mapped;
-    const float *final_tokens = (const float *)rt->final_tokens_mapped;
-    const float *latent_out = (const float *)rt->latent_out_mapped;
     const float *latent_final = (const float *)rt->latent_mapped;
     if (index_count != (uint32_t)T) {
         ++cache_mismatches;
@@ -6672,6 +6806,29 @@ cleanup:
     free(final_tokens_ref);
     free(latent_out_ref);
     free(latent_final_ref);
+    free(norm_got);
+    free(qkv_got);
+    free(q_got);
+    free(k_got);
+    free(v_got);
+    free(cache_k);
+    free(cache_v);
+    free(written);
+    free(indices);
+    free(cache_index_count);
+    free(attn);
+    free(attn_proj);
+    free(tokens_after_attn);
+    free(ctrl_norm);
+    free(ctrl_hidden);
+    free(ctrl_out);
+    free(tokens_after_ctrl);
+    free(mlp_in);
+    free(mlp_hidden);
+    free(mlp_out);
+    free(tokens_after_mlp);
+    free(final_tokens);
+    free(latent_out);
     return rc;
 }
 
