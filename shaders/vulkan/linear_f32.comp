@@ -2,6 +2,8 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+#define TILE 8
+
 layout(std430, binding = 0) readonly buffer InputX {
     float x[];
 } in_x;
@@ -25,16 +27,33 @@ layout(push_constant) uniform Push {
     uint has_bias;
 } pc;
 
+shared float tile_x[TILE][TILE];
+shared float tile_w[TILE][TILE];
+
 void main() {
     uint col = gl_GlobalInvocationID.x;
     uint row = gl_GlobalInvocationID.y;
-    if (row >= pc.rows || col >= pc.cols) {
-        return;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+
+    float acc = (col < pc.cols && pc.has_bias != 0) ? in_b.b[col] : 0.0;
+    for (uint k0 = 0; k0 < pc.inner; k0 += TILE) {
+        uint xk = k0 + lx;
+        uint wk = k0 + ly;
+        tile_x[ly][lx] = (row < pc.rows && xk < pc.inner) ?
+            in_x.x[row * pc.inner + xk] : 0.0;
+        tile_w[ly][lx] = (col < pc.cols && wk < pc.inner) ?
+            in_w.w[col * pc.inner + wk] : 0.0;
+        barrier();
+
+        for (uint k = 0; k < TILE; ++k) {
+            acc += tile_x[ly][k] * tile_w[k][lx];
+        }
+        barrier();
     }
 
-    float acc = pc.has_bias != 0 ? in_b.b[col] : 0.0;
-    for (uint k = 0; k < pc.inner; ++k) {
-        acc += in_x.x[row * pc.inner + k] * in_w.w[col * pc.inner + k];
+    if (row >= pc.rows || col >= pc.cols) {
+        return;
     }
     out_y.y[row * pc.cols + col] = acc;
 }

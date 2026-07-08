@@ -77,7 +77,7 @@ fusion per layer, and CUDA-style value residual via `lerp_inplace_f32.comp`.
 The current Vulkan runtime then applies the precomputed out-norm modulation,
 unpatches to latent velocity, updates the resident latent through the configured
 sigma schedule, and runs the final unfrozen cache pass. The path is still FP32
-with naive `linear_f32.comp`, and VAE decode is still not ported to Vulkan.
+with a shared-memory tiled `linear_f32.comp`; VAE decode is still not ported to Vulkan.
 Without weights, it falls back to the simple `fill_rgba.comp` scaffold for
 lightweight probes.
 
