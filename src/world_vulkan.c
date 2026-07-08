@@ -261,6 +261,10 @@ typedef struct {
     VkDescriptorSet descriptor_set;
 } WorldVulkanVaeOp;
 
+static int vae_conv_uses_1x1_c4(const WorldVulkanVaeOp *op) {
+    return op && op->kind == WORLD_VULKAN_VAE_CONV && op->stride == 1 && (op->C_out % 4) == 0;
+}
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -496,6 +500,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout taehv_conv_c4_set_layout;
     VkPipelineLayout taehv_conv_c4_pipeline_layout;
     VkPipeline taehv_conv_c4_pipeline;
+    VkShaderModule taehv_conv_1x1_c4_shader;
+    VkDescriptorSetLayout taehv_conv_1x1_c4_set_layout;
+    VkPipelineLayout taehv_conv_1x1_c4_pipeline_layout;
+    VkPipeline taehv_conv_1x1_c4_pipeline;
     VkShaderModule taehv_relu_shader;
     VkDescriptorSetLayout taehv_relu_set_layout;
     VkPipelineLayout taehv_relu_pipeline_layout;
@@ -1801,8 +1809,12 @@ static int create_runtime_vae_op_descriptor(WorldVulkanRuntime *rt, WorldVulkanV
             sizes[1] = rt->vae_weight_bytes[idx];
             sizes[2] = rt->vae_bias_buffer[idx] ? rt->vae_bias_bytes[idx] : sizeof(float);
             sizes[3] = rt->vae_scratch_bytes;
-            VkDescriptorSetLayout conv_layout = (op->C_out % 4) == 0 ?
-                rt->taehv_conv_c4_set_layout : rt->taehv_conv_set_layout;
+            VkDescriptorSetLayout conv_layout = rt->taehv_conv_set_layout;
+            if (vae_conv_uses_1x1_c4(op)) {
+                conv_layout = rt->taehv_conv_1x1_c4_set_layout;
+            } else if ((op->C_out % 4) == 0) {
+                conv_layout = rt->taehv_conv_c4_set_layout;
+            }
             return create_storage_descriptor_set(rt, conv_layout,
                     4, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
         }
@@ -1902,6 +1914,9 @@ static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeigh
     if (create_storage_pipeline(rt, "taehv_conv2d_nchw_c4_f32.comp", 4, sizeof(WorldVulkanTaehvConv2dPush),
                 &rt->taehv_conv_c4_shader, &rt->taehv_conv_c4_set_layout,
                 &rt->taehv_conv_c4_pipeline_layout, &rt->taehv_conv_c4_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_conv2d_nchw_1x1_c4_f32.comp", 4, sizeof(WorldVulkanTaehvConv2dPush),
+                &rt->taehv_conv_1x1_c4_shader, &rt->taehv_conv_1x1_c4_set_layout,
+                &rt->taehv_conv_1x1_c4_pipeline_layout, &rt->taehv_conv_1x1_c4_pipeline)) return 1;
     if (create_storage_pipeline(rt, "taehv_relu_f32.comp", 1, sizeof(WorldVulkanSiluPush),
                 &rt->taehv_relu_shader, &rt->taehv_relu_set_layout,
                 &rt->taehv_relu_pipeline_layout, &rt->taehv_relu_pipeline)) return 1;
@@ -1957,8 +1972,15 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                 push.W = (uint32_t)op->W;
                 push.K = (uint32_t)op->stride;
                 push.has_bias = rt->vae_bias_buffer[op->conv_idx] ? 1u : 0u;
-                VkPipeline conv_pipeline = (op->C_out % 4) == 0 ? rt->taehv_conv_c4_pipeline : rt->taehv_conv_pipeline;
-                VkPipelineLayout conv_layout = (op->C_out % 4) == 0 ? rt->taehv_conv_c4_pipeline_layout : rt->taehv_conv_pipeline_layout;
+                VkPipeline conv_pipeline = rt->taehv_conv_pipeline;
+                VkPipelineLayout conv_layout = rt->taehv_conv_pipeline_layout;
+                if (vae_conv_uses_1x1_c4(op)) {
+                    conv_pipeline = rt->taehv_conv_1x1_c4_pipeline;
+                    conv_layout = rt->taehv_conv_1x1_c4_pipeline_layout;
+                } else if ((op->C_out % 4) == 0) {
+                    conv_pipeline = rt->taehv_conv_c4_pipeline;
+                    conv_layout = rt->taehv_conv_c4_pipeline_layout;
+                }
                 vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, conv_pipeline);
                 vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                         conv_layout, 0, 1, &op->descriptor_set, 0, NULL);
@@ -4943,6 +4965,39 @@ int world_vulkan_taehv_primitives_probe(void) {
             fprintf(stderr, "vulkan taehv_conv2d_nchw_f32 probe: max_abs=%g mean_abs=%g c4_max_abs=%g c4_mean_abs=%g\n",
                     max_abs, mean_abs, c4_max_abs, c4_mean_abs);
             if (max_abs > 2.0e-6f || c4_max_abs > 2.0e-6f) ok = 0;
+            if (ok) {
+                for (int i = 0; i < C_OUT * C_IN; ++i) w[i] = probe_value(i + 97, 0.02734375f);
+                memset(y, 0, y_bytes);
+                memset(y_c4, 0, y_bytes);
+                WorldVulkanTaehvConv2dPush push1 = {N, C_IN, C_OUT, H, W, 1, 1};
+                if (run_probe_compute(rt, "taehv_conv2d_nchw_f32.comp", 4, sizeof(push1),
+                            buffers, sizes, &push1, (uint32_t)((N * C_OUT * H * W + 255) / 256), 1, 1)) ok = 0;
+                if (ok && run_probe_compute(rt, "taehv_conv2d_nchw_1x1_c4_f32.comp", 4, sizeof(push1),
+                            c4_buffers, sizes, &push1, (uint32_t)((N * ((C_OUT + 3) / 4) * H * W + 255) / 256), 1, 1)) ok = 0;
+                float k1_max_abs = 0.0f;
+                float k1_c4_max_abs = 0.0f;
+                for (int n = 0; ok && n < N; ++n) {
+                    for (int co = 0; co < C_OUT; ++co) {
+                        for (int yy = 0; yy < H; ++yy) {
+                            for (int xx = 0; xx < W; ++xx) {
+                                float ref = b[co];
+                                for (int ci = 0; ci < C_IN; ++ci) {
+                                    ref += x[((n * C_IN + ci) * H + yy) * W + xx] *
+                                        w[co * C_IN + ci];
+                                }
+                                int idx = ((n * C_OUT + co) * H + yy) * W + xx;
+                                float diff = fabsf(y[idx] - ref);
+                                float c4_diff = fabsf(y_c4[idx] - ref);
+                                if (diff > k1_max_abs) k1_max_abs = diff;
+                                if (c4_diff > k1_c4_max_abs) k1_c4_max_abs = c4_diff;
+                            }
+                        }
+                    }
+                }
+                fprintf(stderr, "vulkan taehv_conv2d_nchw_k1_f32 probe: max_abs=%g c4_max_abs=%g\n",
+                        k1_max_abs, k1_c4_max_abs);
+                if (k1_max_abs > 2.0e-6f || k1_c4_max_abs > 2.0e-6f) ok = 0;
+            }
         }
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
         destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
@@ -7872,6 +7927,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_repeat_clamp_pipeline) vkDestroyPipeline(rt->device, rt->taehv_repeat_clamp_pipeline, NULL);
     if (rt->taehv_conv_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_pipeline, NULL);
     if (rt->taehv_conv_c4_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_c4_pipeline, NULL);
+    if (rt->taehv_conv_1x1_c4_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_1x1_c4_pipeline, NULL);
     if (rt->taehv_relu_pipeline) vkDestroyPipeline(rt->device, rt->taehv_relu_pipeline, NULL);
     if (rt->taehv_concat_past_pipeline) vkDestroyPipeline(rt->device, rt->taehv_concat_past_pipeline, NULL);
     if (rt->taehv_add_relu_pipeline) vkDestroyPipeline(rt->device, rt->taehv_add_relu_pipeline, NULL);
@@ -7899,6 +7955,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_repeat_clamp_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_repeat_clamp_pipeline_layout, NULL);
     if (rt->taehv_conv_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_pipeline_layout, NULL);
     if (rt->taehv_conv_c4_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_c4_pipeline_layout, NULL);
+    if (rt->taehv_conv_1x1_c4_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_1x1_c4_pipeline_layout, NULL);
     if (rt->taehv_relu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_relu_pipeline_layout, NULL);
     if (rt->taehv_concat_past_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_concat_past_pipeline_layout, NULL);
     if (rt->taehv_add_relu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_add_relu_pipeline_layout, NULL);
@@ -7926,6 +7983,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_repeat_clamp_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_repeat_clamp_set_layout, NULL);
     if (rt->taehv_conv_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_set_layout, NULL);
     if (rt->taehv_conv_c4_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_c4_set_layout, NULL);
+    if (rt->taehv_conv_1x1_c4_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_1x1_c4_set_layout, NULL);
     if (rt->taehv_relu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_relu_set_layout, NULL);
     if (rt->taehv_concat_past_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_concat_past_set_layout, NULL);
     if (rt->taehv_add_relu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_add_relu_set_layout, NULL);
@@ -7953,6 +8011,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_repeat_clamp_shader) vkDestroyShaderModule(rt->device, rt->taehv_repeat_clamp_shader, NULL);
     if (rt->taehv_conv_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_shader, NULL);
     if (rt->taehv_conv_c4_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_c4_shader, NULL);
+    if (rt->taehv_conv_1x1_c4_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_1x1_c4_shader, NULL);
     if (rt->taehv_relu_shader) vkDestroyShaderModule(rt->device, rt->taehv_relu_shader, NULL);
     if (rt->taehv_concat_past_shader) vkDestroyShaderModule(rt->device, rt->taehv_concat_past_shader, NULL);
     if (rt->taehv_add_relu_shader) vkDestroyShaderModule(rt->device, rt->taehv_add_relu_shader, NULL);
