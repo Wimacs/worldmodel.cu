@@ -1,0 +1,95 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Q {
+    float q[];
+} in_q;
+
+layout(std430, binding = 1) readonly buffer K {
+    float k[];
+} in_k;
+
+layout(std430, binding = 2) readonly buffer V {
+    float v[];
+} in_v;
+
+layout(std430, binding = 3) readonly buffer Written {
+    uint written[];
+} in_written;
+
+layout(std430, binding = 4) buffer Out {
+    float y[];
+} out_y;
+
+layout(push_constant) uniform Push {
+    uint B;
+    uint Hq;
+    uint Hkv;
+    uint Tq;
+    uint Tk;
+    uint D;
+    float scale;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.B * pc.Hq * pc.Tq || pc.D > 256u) {
+        return;
+    }
+
+    uint tq = row % pc.Tq;
+    uint hq = (row / pc.Tq) % pc.Hq;
+    uint b = row / (pc.Tq * pc.Hq);
+    uint group = pc.Hq / pc.Hkv;
+    uint hk = hq / group;
+
+    uint q_base = (((b * pc.Hq + hq) * pc.Tq + tq) * pc.D);
+    uint k_base = ((b * pc.Hkv + hk) * pc.Tk * pc.D);
+    uint v_base = k_base;
+    uint out_base = q_base;
+
+    float acc = 0.0;
+    float m = -3.4028234663852886e38;
+    float l = 0.0;
+
+    for (uint tk = 0u; tk < pc.Tk; ++tk) {
+        bool is_written = in_written.written[tk] != 0u;
+        float dot = 0.0;
+        if (is_written) {
+            uint k_row = k_base + tk * pc.D;
+            for (uint d = lane; d < pc.D; d += 256u) {
+                dot += in_q.q[q_base + d] * in_k.k[k_row + d];
+            }
+        }
+        partial[lane] = dot;
+        barrier();
+
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                partial[lane] += partial[lane + stride];
+            }
+            barrier();
+        }
+
+        if (is_written) {
+            float score = partial[0] * pc.scale;
+            float new_m = max(m, score);
+            float alpha = exp(m - new_m);
+            float beta = exp(score - new_m);
+            if (lane < pc.D) {
+                acc = acc * alpha + beta * in_v.v[v_base + tk * pc.D + lane];
+            }
+            l = l * alpha + beta;
+            m = new_m;
+        }
+        barrier();
+    }
+
+    if (lane < pc.D) {
+        out_y.y[out_base + lane] = l > 0.0 ? acc / l : 0.0;
+    }
+}

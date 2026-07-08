@@ -59,8 +59,9 @@ currently runs a CPU parity check for the first model-relevant Vulkan op,
 `rms_norm_f32.comp`, plus the fused modulation op `ada_rms_norm_f32.comp`.
 It also checks `ortho_rope_f32.comp` against the current WorldModel RoPE
 formula, and `qkv_rms_rope_f32.comp` for fused Q/K/V split, Q/K RMSNorm, and
-Q/K RoPE. The actual transformer/VAE runtime kernels are still being ported
-from CUDA.
+Q/K RoPE. `masked_attention_f32.comp` checks the written-mask GQA attention
+path. The actual transformer/VAE runtime kernels are still being ported from
+CUDA.
 
 ```sh
 ./build/worldmodel_raylib_vulkan \
