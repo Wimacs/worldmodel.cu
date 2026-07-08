@@ -44,10 +44,11 @@ void main() {
     uint n = q / C4;
     int pad = int(pc.K / 2u);
 
-    float s0 = (pc.has_bias != 0u && co_base + 0u < pc.C_out) ? b[co_base + 0u] : 0.0;
-    float s1 = (pc.has_bias != 0u && co_base + 1u < pc.C_out) ? b[co_base + 1u] : 0.0;
-    float s2 = (pc.has_bias != 0u && co_base + 2u < pc.C_out) ? b[co_base + 2u] : 0.0;
-    float s3 = (pc.has_bias != 0u && co_base + 3u < pc.C_out) ? b[co_base + 3u] : 0.0;
+    float s0 = (pc.has_bias != 0u) ? b[co_base + 0u] : 0.0;
+    float s1 = (pc.has_bias != 0u) ? b[co_base + 1u] : 0.0;
+    float s2 = (pc.has_bias != 0u) ? b[co_base + 2u] : 0.0;
+    float s3 = (pc.has_bias != 0u) ? b[co_base + 3u] : 0.0;
+    uint w_stride = pc.C_in * pc.K * pc.K;
 
     for (uint ci = 0u; ci < pc.C_in; ++ci) {
         for (uint ky = 0u; ky < pc.K; ++ky) {
@@ -62,18 +63,18 @@ void main() {
                 }
                 float xv = x[((n * pc.C_in + ci) * pc.H + uint(iy)) * pc.W + uint(ix)];
                 uint w_base = (((co_base * pc.C_in + ci) * pc.K + ky) * pc.K + kx);
-                if (co_base + 0u < pc.C_out) s0 += xv * w[w_base + 0u * pc.C_in * pc.K * pc.K];
-                if (co_base + 1u < pc.C_out) s1 += xv * w[w_base + 1u * pc.C_in * pc.K * pc.K];
-                if (co_base + 2u < pc.C_out) s2 += xv * w[w_base + 2u * pc.C_in * pc.K * pc.K];
-                if (co_base + 3u < pc.C_out) s3 += xv * w[w_base + 3u * pc.C_in * pc.K * pc.K];
+                s0 += xv * w[w_base + 0u * w_stride];
+                s1 += xv * w[w_base + 1u * w_stride];
+                s2 += xv * w[w_base + 2u * w_stride];
+                s3 += xv * w[w_base + 3u * w_stride];
             }
         }
     }
 
     uint out_base = ((n * pc.C_out + co_base) * pc.H + oy) * pc.W + ox;
     uint stride_c = pc.H * pc.W;
-    if (co_base + 0u < pc.C_out) y[out_base + 0u * stride_c] = s0;
-    if (co_base + 1u < pc.C_out) y[out_base + 1u * stride_c] = s1;
-    if (co_base + 2u < pc.C_out) y[out_base + 2u * stride_c] = s2;
-    if (co_base + 3u < pc.C_out) y[out_base + 3u * stride_c] = s3;
+    y[out_base + 0u * stride_c] = s0;
+    y[out_base + 1u * stride_c] = s1;
+    y[out_base + 2u * stride_c] = s2;
+    y[out_base + 3u * stride_c] = s3;
 }
