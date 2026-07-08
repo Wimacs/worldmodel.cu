@@ -446,6 +446,10 @@ struct WorldVulkanRuntime {
     VkPipelineLayout runtime_indexed_attention_d64_flash_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash_pipeline;
     int runtime_indexed_attention_d64_flash_enabled;
+    VkShaderModule runtime_indexed_attention_d64_flash24w_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_flash24w_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_flash24w_pipeline;
+    int runtime_indexed_attention_d64_flash24w_enabled;
     VkShaderModule runtime_indexed_attention_d64_flash32w_shader;
     VkPipelineLayout runtime_indexed_attention_d64_flash32w_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash32w_pipeline;
@@ -3575,6 +3579,8 @@ static int create_runtime_model_slice(
                             &rt->runtime_indexed_attention_d64_shader,
                             &rt->runtime_indexed_attention_d64_pipeline_layout,
                             &rt->runtime_indexed_attention_d64_pipeline)) return 1;
+                const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
+                int flash_enabled = (!flash_env || flash_env[0] != '0');
                 {
                     const char *flash96_env = getenv("WORLD_VULKAN_FLASH_ATTN96");
                     if (flash96_env && flash96_env[0] == '1') {
@@ -3591,6 +3597,26 @@ static int create_runtime_model_slice(
                                     "warning: WORLD_VULKAN_FLASH_ATTN96=1 ignored; maxComputeSharedMemorySize=%u need=%u\n",
                                     rt->max_compute_shared_memory_size,
                                     96u * 64u * 2u * (uint32_t)sizeof(float));
+                        }
+                    }
+                }
+                {
+                    const char *flash24w_env = getenv("WORLD_VULKAN_FLASH_ATTN24W");
+                    if (flash_enabled && (!flash24w_env || flash24w_env[0] != '0')) {
+                        if (rt->max_compute_work_group_invocations >= 768u &&
+                                rt->max_compute_work_group_size_x >= 768u) {
+                            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash24w_f32.comp",
+                                        rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                        &rt->runtime_indexed_attention_d64_flash24w_shader,
+                                        &rt->runtime_indexed_attention_d64_flash24w_pipeline_layout,
+                                        &rt->runtime_indexed_attention_d64_flash24w_pipeline)) return 1;
+                            rt->runtime_indexed_attention_d64_flash24w_enabled = 1;
+                            fprintf(stderr, "Vulkan d64 flash24w attention enabled; set WORLD_VULKAN_FLASH_ATTN24W=0 to disable\n");
+                        } else {
+                            fprintf(stderr,
+                                    "warning: WORLD_VULKAN_FLASH_ATTN24W enabled but ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u need=768\n",
+                                    rt->max_compute_work_group_invocations,
+                                    rt->max_compute_work_group_size_x);
                         }
                     }
                 }
@@ -3614,8 +3640,7 @@ static int create_runtime_model_slice(
                         }
                     }
                 }
-                const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
-                if (!flash_env || flash_env[0] != '0') {
+                if (flash_enabled) {
                     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
                                 rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                                 &rt->runtime_indexed_attention_d64_flash_shader,
@@ -4551,23 +4576,23 @@ static int record_runtime_model_slice(
                 attn_push.D = (uint32_t)rt->d_head;
                 attn_push.scale = 1.0f / sqrtf((float)rt->d_head);
 
-	                int use_kv_f16 =
-	                    rt->runtime_kv_cache_f16_enabled &&
-	                    rt->runtime_kv_upsert_f16_pipeline &&
-	                    rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
-	                VkPipeline kv_upsert_pipeline = use_kv_f16 ?
-	                    rt->runtime_kv_upsert_f16_pipeline : rt->runtime_kv_upsert_pipeline;
-	                VkPipelineLayout kv_upsert_layout = use_kv_f16 ?
-	                    rt->runtime_kv_upsert_f16_pipeline_layout : rt->runtime_kv_upsert_pipeline_layout;
-	                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, kv_upsert_pipeline);
-	                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-	                        kv_upsert_layout, 0, 1,
-	                        &rt->kv_upsert_descriptor_sets[layer_idx], 0, NULL);
-	                vkCmdPushConstants(rt->command_buffer, kv_upsert_layout,
-	                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
-	                PROFILE_DISPATCH(use_kv_f16 ? "kv_upsert_f16" : "kv_upsert",
-	                        ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
-	                        1, 1);
+                int use_kv_f16 =
+                    rt->runtime_kv_cache_f16_enabled &&
+                    rt->runtime_kv_upsert_f16_pipeline &&
+                    rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
+                VkPipeline kv_upsert_pipeline = use_kv_f16 ?
+                    rt->runtime_kv_upsert_f16_pipeline : rt->runtime_kv_upsert_pipeline;
+                VkPipelineLayout kv_upsert_layout = use_kv_f16 ?
+                    rt->runtime_kv_upsert_f16_pipeline_layout : rt->runtime_kv_upsert_pipeline_layout;
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, kv_upsert_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        kv_upsert_layout, 0, 1,
+                        &rt->kv_upsert_descriptor_sets[layer_idx], 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, kv_upsert_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
+                PROFILE_DISPATCH(use_kv_f16 ? "kv_upsert_f16" : "kv_upsert",
+                        ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
+                        1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
                 vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_cache_indices_pipeline);
@@ -4588,19 +4613,30 @@ static int record_runtime_model_slice(
                 if (rt->d_head == 64 && d64_allowed) {
                     uint32_t group = rt->cfg.n_kv_heads > 0 ?
                         (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
-	                    if (use_kv_f16 &&
-	                            rt->runtime_indexed_attention_d64_flash_kvf16_pipeline &&
-	                            group > 0u && group <= 16u &&
-	                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
-	                        uint32_t q_per_h = 16u / group;
-	                        if (q_per_h == 0u) q_per_h = 1u;
-	                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
-	                        attn_pipeline = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
-	                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout;
-	                        attn_label = "attention.d64_flash_kvf16";
-	                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
-	                    } else if (rt->runtime_indexed_attention_d64_flash32w_enabled &&
-	                            rt->runtime_indexed_attention_d64_flash32w_pipeline &&
+                    if (use_kv_f16 &&
+                            rt->runtime_indexed_attention_d64_flash_kvf16_pipeline &&
+                            group > 0u && group <= 16u &&
+                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+                        uint32_t q_per_h = 16u / group;
+                        if (q_per_h == 0u) q_per_h = 1u;
+                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+                        attn_pipeline = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout;
+                        attn_label = "attention.d64_flash_kvf16";
+                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+                    } else if (rt->runtime_indexed_attention_d64_flash24w_enabled &&
+                            rt->runtime_indexed_attention_d64_flash24w_pipeline &&
+                            group > 0u && group <= 8u &&
+                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+                        uint32_t q_per_h = 24u / group;
+                        if (q_per_h == 0u) q_per_h = 1u;
+                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+                        attn_pipeline = rt->runtime_indexed_attention_d64_flash24w_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash24w_pipeline_layout;
+                        attn_label = "attention.d64_flash24w";
+                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+                    } else if (rt->runtime_indexed_attention_d64_flash32w_enabled &&
+                            rt->runtime_indexed_attention_d64_flash32w_pipeline &&
                             group > 0u && group <= 32u &&
                             (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
                         uint32_t q_per_h = 32u / group;
@@ -9772,6 +9808,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkShaderModule flash_shader = VK_NULL_HANDLE;
     VkPipelineLayout flash_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline flash_pipeline = VK_NULL_HANDLE;
+    VkShaderModule flash24w_shader = VK_NULL_HANDLE;
+    VkPipelineLayout flash24w_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline flash24w_pipeline = VK_NULL_HANDLE;
     VkShaderModule flash32w_shader = VK_NULL_HANDLE;
     VkPipelineLayout flash32w_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline flash32w_pipeline = VK_NULL_HANDLE;
@@ -9946,6 +9985,24 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                 rt->shader_float16_enabled, rt->storage_16bit_enabled);
     }
 
+    if (rt->max_compute_work_group_invocations >= 768u &&
+            rt->max_compute_work_group_size_x >= 768u) {
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash24w_f32.comp",
+                    set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                    &flash24w_shader, &flash24w_pipeline_layout, &flash24w_pipeline)) goto cleanup;
+        int q_per_h24w = 24 / group;
+        if (q_per_h24w < 1) q_per_h24w = 1;
+        int q_blocks24w = (Tq + q_per_h24w - 1) / q_per_h24w;
+        if (submit_compute(rt, flash24w_pipeline, flash24w_pipeline_layout, descriptor_set, &push, sizeof(push),
+                    Hkv * q_blocks24w, 1, 1)) goto cleanup;
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash24w_f32", 0);
+    } else {
+        fprintf(stderr,
+                "vulkan indexed_attention_d64_flash24w_f32 probe: skipped; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u\n",
+                rt->max_compute_work_group_invocations,
+                rt->max_compute_work_group_size_x);
+    }
+
     if (rt->max_compute_work_group_invocations >= 1024u &&
             rt->max_compute_work_group_size_x >= 1024u) {
         if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash32w_f32.comp",
@@ -9986,6 +10043,9 @@ cleanup:
     if (flash_kvf16_pipeline) vkDestroyPipeline(rt->device, flash_kvf16_pipeline, NULL);
     if (flash_kvf16_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash_kvf16_pipeline_layout, NULL);
     if (flash_kvf16_shader) vkDestroyShaderModule(rt->device, flash_kvf16_shader, NULL);
+    if (flash24w_pipeline) vkDestroyPipeline(rt->device, flash24w_pipeline, NULL);
+    if (flash24w_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash24w_pipeline_layout, NULL);
+    if (flash24w_shader) vkDestroyShaderModule(rt->device, flash24w_shader, NULL);
     if (flash32w_pipeline) vkDestroyPipeline(rt->device, flash32w_pipeline, NULL);
     if (flash32w_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash32w_pipeline_layout, NULL);
     if (flash32w_shader) vkDestroyShaderModule(rt->device, flash32w_shader, NULL);
@@ -10124,6 +10184,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_flash24w_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash24w_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash32w_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash32w_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline, NULL);
@@ -10166,6 +10227,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_flash24w_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash24w_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash32w_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash32w_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline_layout, NULL);
@@ -10238,6 +10300,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
     if (rt->runtime_indexed_attention_d64_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_flash24w_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash24w_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash32w_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash32w_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash_kvf16_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash96_shader, NULL);
