@@ -189,12 +189,18 @@ static float clamp_scroll_sign(float x) {
     return 0.0f;
 }
 
+static float clamp_mouse_axis(float x) {
+    if (x > 1.0f) return 1.0f;
+    if (x < -1.0f) return -1.0f;
+    return x;
+}
+
 static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, float mouse_scale) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
     if (ctrl_dim >= n_buttons + 3) {
-        control[0] = delta.x * mouse_scale;
-        control[1] = delta.y * mouse_scale;
+        control[0] = clamp_mouse_axis(delta.x * mouse_scale * 0.01f);
+        control[1] = clamp_mouse_axis(delta.y * mouse_scale * 0.01f);
         set_button_vk(control, n_buttons, WORLD_VK_W, IsKeyDown(KEY_W));
         set_button_vk(control, n_buttons, WORLD_VK_S, IsKeyDown(KEY_S));
         set_button_vk(control, n_buttons, WORLD_VK_A, IsKeyDown(KEY_A));
@@ -210,8 +216,8 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
 
 static void merge_frame_control(LiveShared *s, const float *frame_control) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    s->control[0] += frame_control[0];
-    s->control[1] += frame_control[1];
+    s->control[0] = clamp_mouse_axis(s->control[0] + frame_control[0]);
+    s->control[1] = clamp_mouse_axis(s->control[1] + frame_control[1]);
     for (int i = 0; i < s->n_buttons; ++i) {
         s->control[2 + i] = frame_control[2 + i];
     }
@@ -377,7 +383,7 @@ int main(int argc, char **argv) {
     int headless_smoke = 0;
     int fast_realtime = 0;
     int cache_window_override = -1;
-    float mouse_scale = 0.1f;
+    float mouse_scale = 1.0f;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
 

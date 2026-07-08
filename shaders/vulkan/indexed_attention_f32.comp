@@ -22,6 +22,10 @@ layout(std430, binding = 4) buffer Out {
     float y[];
 } out_y;
 
+layout(std430, binding = 5) readonly buffer Count {
+    uint count[];
+} in_count;
+
 layout(push_constant) uniform Push {
     uint B;
     uint Hq;
@@ -56,8 +60,9 @@ void main() {
     float acc = 0.0;
     float m = -3.4028234663852886e38;
     float l = 0.0;
+    uint Nkv = min(in_count.count[0], pc.Tk);
 
-    for (uint n = 0u; n < pc.Nkv; ++n) {
+    for (uint n = 0u; n < Nkv; ++n) {
         uint tk = in_indices.indices[n];
         float dot = 0.0;
         uint k_row = k_base + tk * pc.D;
@@ -87,6 +92,6 @@ void main() {
     }
 
     if (lane < pc.D) {
-        out_y.y[out_base + lane] = pc.Nkv > 0u ? acc / l : 0.0;
+        out_y.y[out_base + lane] = Nkv > 0u ? acc / l : 0.0;
     }
 }

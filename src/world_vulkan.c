@@ -300,6 +300,7 @@ struct WorldVulkanRuntime {
     int precomputed_total_passes;
     int forced_pass_table_idx;
     unsigned int seed;
+    int noise_mode;
     int model_slice_enabled;
     int C;
     int H;
@@ -1394,22 +1395,38 @@ static int submit_compute(
     return 0;
 }
 
+static uint32_t world_vulkan_lcg_next(uint32_t *state) {
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float world_vulkan_lcg_uniform01(uint32_t *state) {
+    uint32_t r = world_vulkan_lcg_next(state);
+    return (float)((r >> 8) & 0x00ffffffu) / 16777216.0f;
+}
+
 static void fill_runtime_latent(WorldVulkanRuntime *rt, const float *control_input) {
+    (void)control_input;
     float *latent = (float *)rt->latent_mapped;
-    float cx = control_input ? control_input[0] : 0.0f;
-    float cy = control_input ? control_input[1] : 0.0f;
-    float frame = (float)rt->frame_ordinal;
-    for (int c = 0; c < rt->C; ++c) {
-        for (int y = 0; y < rt->H; ++y) {
-            for (int x = 0; x < rt->W; ++x) {
-                float fx = ((float)x + 0.5f) / (float)rt->W;
-                float fy = ((float)y + 0.5f) / (float)rt->H;
-                float fc = (float)(c + 1);
-                float v = sinf(17.0f * fx + 11.0f * fy + 0.07f * frame + 0.13f * fc);
-                v += 0.35f * cosf(9.0f * fx * fc + 0.19f * frame + 0.2f * cx);
-                v += 0.25f * sinf(8.0f * fy + 0.15f * cy + 0.03f * (float)rt->seed);
-                latent[((c * rt->H + y) * rt->W + x)] = v;
+    if (!latent) return;
+    uint32_t state = rt->seed + (uint32_t)rt->frame_ordinal;
+    if (state == 0u) state = 1u;
+    if (rt->noise_mode == WORLD_NOISE_NORMAL) {
+        for (size_t i = 0; i < rt->latent_elems; i += 2) {
+            float u1 = world_vulkan_lcg_uniform01(&state);
+            float u2 = world_vulkan_lcg_uniform01(&state);
+            if (u1 < 1.0e-7f) u1 = 1.0e-7f;
+            float mag = sqrtf(-2.0f * logf(u1));
+            float phase = 2.0f * (float)M_PI * u2;
+            latent[i] = mag * cosf(phase);
+            if (i + 1 < rt->latent_elems) {
+                latent[i + 1] = mag * sinf(phase);
             }
+        }
+    } else {
+        for (size_t i = 0; i < rt->latent_elems; ++i) {
+            float u = world_vulkan_lcg_uniform01(&state);
+            latent[i] = 2.0f * u - 1.0f;
         }
     }
 }
@@ -2792,7 +2809,7 @@ static int create_runtime_model_slice(
             if (create_storage_pipeline(rt, "cache_frame_indices.comp", 3, sizeof(WorldVulkanCacheFrameIndicesPush),
                         &rt->runtime_cache_indices_shader, &rt->runtime_cache_indices_set_layout,
                         &rt->runtime_cache_indices_pipeline_layout, &rt->runtime_cache_indices_pipeline)) return 1;
-            if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 5, sizeof(WorldVulkanIndexedAttentionPush),
+            if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 6, sizeof(WorldVulkanIndexedAttentionPush),
                         &rt->runtime_indexed_attention_shader, &rt->runtime_indexed_attention_set_layout,
                         &rt->runtime_indexed_attention_pipeline_layout, &rt->runtime_indexed_attention_pipeline)) return 1;
             if (rt->layer_attn_out_enabled) {
@@ -3027,12 +3044,16 @@ static int create_runtime_model_slice(
                                 &rt->cache_indices_descriptor_sets[layer_idx])) return 1;
                 }
                 {
-                    VkBuffer attn_buffers[5] = {
-                    rt->q_buffer, rt->cache_k_buffer, rt->cache_v_buffer, rt->cache_indices_buffer, rt->attn_buffer
+                    VkBuffer attn_buffers[6] = {
+                        rt->q_buffer, rt->cache_k_buffer, rt->cache_v_buffer, rt->cache_indices_buffer,
+                        rt->attn_buffer, rt->cache_index_count_buffer
                     };
-                    VkDeviceSize attn_sizes[5] = {q_rope_bytes, layer_cache_kv_bytes, layer_cache_kv_bytes, layer_cache_meta_bytes, token_bytes};
-                    VkDeviceSize attn_offsets[5] = {0, kv_offset, kv_offset, meta_offset, 0};
-                    if (create_storage_descriptor_set(rt, rt->runtime_indexed_attention_set_layout, 5,
+                    VkDeviceSize attn_sizes[6] = {
+                        q_rope_bytes, layer_cache_kv_bytes, layer_cache_kv_bytes,
+                        layer_cache_meta_bytes, token_bytes, sizeof(uint32_t)
+                    };
+                    VkDeviceSize attn_offsets[6] = {0, kv_offset, kv_offset, meta_offset, 0, count_offset};
+                    if (create_storage_descriptor_set(rt, rt->runtime_indexed_attention_set_layout, 6,
                                 attn_buffers, attn_sizes, attn_offsets,
                                 &rt->indexed_attention_descriptor_pools[layer_idx],
                                 &rt->indexed_attention_descriptor_sets[layer_idx])) return 1;
@@ -3835,7 +3856,6 @@ int world_vulkan_runtime_create(
         unsigned int seed,
         int noise_mode,
         const WorldVaeDecoderWeights *vae) {
-    (void)noise_mode;
     if (!out || !cfg) return 1;
     *out = NULL;
 
@@ -3847,6 +3867,7 @@ int world_vulkan_runtime_create(
     rt->frames = 4;
     rt->frame_ordinal = frame_idx;
     rt->seed = seed;
+    rt->noise_mode = noise_mode;
     if (weights && weights->layers && layers_to_run > 0 && layers_to_run <= weights->n_layers) {
         rt->layers_to_run = layers_to_run;
     } else {
@@ -7963,32 +7984,38 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkBuffer v_buffer = VK_NULL_HANDLE;
     VkBuffer indices_buffer = VK_NULL_HANDLE;
     VkBuffer out_buffer = VK_NULL_HANDLE;
+    VkBuffer count_buffer = VK_NULL_HANDLE;
     VkDeviceMemory q_memory = VK_NULL_HANDLE;
     VkDeviceMemory k_memory = VK_NULL_HANDLE;
     VkDeviceMemory v_memory = VK_NULL_HANDLE;
     VkDeviceMemory indices_memory = VK_NULL_HANDLE;
     VkDeviceMemory out_memory = VK_NULL_HANDLE;
+    VkDeviceMemory count_memory = VK_NULL_HANDLE;
     void *q_mapped = NULL;
     void *k_mapped = NULL;
     void *v_mapped = NULL;
     void *indices_mapped = NULL;
     void *out_mapped = NULL;
+    void *count_mapped = NULL;
 
     if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
     size_t q_bytes = (size_t)B * Hq * Tq * D * sizeof(float);
     size_t kv_bytes = (size_t)B * Hkv * Tk * D * sizeof(float);
     size_t indices_bytes = (size_t)Nkv * sizeof(uint32_t);
+    size_t count_bytes = sizeof(uint32_t);
     if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &q_buffer, &q_memory, &q_mapped)) goto cleanup;
     if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &k_buffer, &k_memory, &k_mapped)) goto cleanup;
     if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &v_buffer, &v_memory, &v_mapped)) goto cleanup;
     if (create_host_buffer(rt, indices_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &indices_buffer, &indices_memory, &indices_mapped)) goto cleanup;
     if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) goto cleanup;
+    if (create_host_buffer(rt, count_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &count_buffer, &count_memory, &count_mapped)) goto cleanup;
 
     float *q = (float *)q_mapped;
     float *k = (float *)k_mapped;
     float *v = (float *)v_mapped;
     uint32_t *indices = (uint32_t *)indices_mapped;
     float *out = (float *)out_mapped;
+    uint32_t *count = (uint32_t *)count_mapped;
     for (int i = 0; i < B * Hq * Tq * D; ++i) q[i] = probe_value(i + 2309, 0.021484375f);
     for (int i = 0; i < B * Hkv * Tk * D; ++i) {
         k[i] = probe_value(i + 2411, 0.01953125f);
@@ -7996,13 +8023,14 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     }
     const uint32_t indices_ref[Nkv] = {0u, 3u, 4u, 9u, 16u};
     memcpy(indices, indices_ref, indices_bytes);
+    count[0] = Nkv;
     memset(out, 0, q_bytes);
 
-    if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 5, sizeof(WorldVulkanIndexedAttentionPush),
+    if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 6, sizeof(WorldVulkanIndexedAttentionPush),
                 &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
-    VkBuffer buffers[5] = {q_buffer, k_buffer, v_buffer, indices_buffer, out_buffer};
-    VkDeviceSize sizes[5] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, q_bytes};
-    if (create_storage_descriptor_set(rt, set_layout, 5, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    VkBuffer buffers[6] = {q_buffer, k_buffer, v_buffer, indices_buffer, out_buffer, count_buffer};
+    VkDeviceSize sizes[6] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, q_bytes, count_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 6, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
     WorldVulkanIndexedAttentionPush push;
     push.B = B;
     push.Hq = Hq;
@@ -8069,6 +8097,7 @@ cleanup:
         destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
         destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
         destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+        destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
