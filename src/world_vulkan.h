@@ -50,6 +50,8 @@ int world_vulkan_qkv_rms_rope_f32_probe(void);
 int world_vulkan_masked_attention_f32_probe(void);
 int world_vulkan_kv_cache_upsert_f32_probe(void);
 int world_vulkan_cache_frame_indices_probe(void);
+int world_vulkan_patchify_f32_probe(void);
+int world_vulkan_unpatchify_f32_probe(void);
 
 #ifdef __cplusplus
 }

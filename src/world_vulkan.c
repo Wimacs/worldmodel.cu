@@ -106,6 +106,32 @@ typedef struct {
     uint32_t write_step;
 } WorldVulkanCacheFrameIndicesPush;
 
+typedef struct {
+    uint32_t B;
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+    uint32_t D;
+    uint32_t ph;
+    uint32_t pw;
+    uint32_t Hp;
+    uint32_t Wp;
+} WorldVulkanPatchifyPush;
+
+typedef struct {
+    uint32_t B;
+    uint32_t T;
+    uint32_t D;
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+    uint32_t ph;
+    uint32_t pw;
+    uint32_t Hp;
+    uint32_t Wp;
+    uint32_t out_dim;
+} WorldVulkanUnpatchifyPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -2125,6 +2151,234 @@ cleanup:
         destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
         destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
         destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_patchify_f32_probe(void) {
+    enum { B = 2, C = 5, H = 8, W = 10, D = 7, ph = 2, pw = 2 };
+    enum { Hp = H / ph, Wp = W / pw, T = Hp * Wp };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer weight_buffer = VK_NULL_HANDLE;
+    VkBuffer tokens_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory weight_memory = VK_NULL_HANDLE;
+    VkDeviceMemory tokens_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *weight_mapped = NULL;
+    void *tokens_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)B * C * H * W * sizeof(float);
+    size_t weight_bytes = (size_t)D * C * ph * pw * sizeof(float);
+    size_t tokens_bytes = (size_t)B * T * D * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &weight_buffer, &weight_memory, &weight_mapped)) goto cleanup;
+    if (create_host_buffer(rt, tokens_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tokens_buffer, &tokens_memory, &tokens_mapped)) goto cleanup;
+
+    float *x = (float *)x_mapped;
+    float *weight = (float *)weight_mapped;
+    float *tokens = (float *)tokens_mapped;
+    for (int i = 0; i < B * C * H * W; ++i) x[i] = probe_value(i + 1801, 0.02734375f);
+    for (int i = 0; i < D * C * ph * pw; ++i) weight[i] = probe_value(i + 1907, 0.033203125f);
+    memset(tokens, 0, tokens_bytes);
+
+    if (create_storage_pipeline(rt, "patchify_f32.comp", 3, sizeof(WorldVulkanPatchifyPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {x_buffer, weight_buffer, tokens_buffer};
+    VkDeviceSize sizes[3] = {x_bytes, weight_bytes, tokens_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanPatchifyPush push;
+    push.B = B;
+    push.C = C;
+    push.H = H;
+    push.W = W;
+    push.D = D;
+    push.ph = ph;
+    push.pw = pw;
+    push.Hp = Hp;
+    push.Wp = Wp;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                B * T * D, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int token = 0; token < T; ++token) {
+            int oy = token / Wp;
+            int ox = token - oy * Wp;
+            for (int d = 0; d < D; ++d) {
+                float ref = 0.0f;
+                for (int c = 0; c < C; ++c) {
+                    for (int dy = 0; dy < ph; ++dy) {
+                        for (int dx = 0; dx < pw; ++dx) {
+                            int iy = oy * ph + dy;
+                            int ix = ox * pw + dx;
+                            float xv = x[((b * C + c) * H + iy) * W + ix];
+                            float wv = weight[(((d * C + c) * ph + dy) * pw + dx)];
+                            ref += xv * wv;
+                        }
+                    }
+                }
+                size_t idx = (size_t)((b * T + token) * D + d);
+                float diff = fabsf(tokens[idx] - ref);
+                if (diff > max_abs) max_abs = diff;
+                mean_abs += diff;
+            }
+        }
+    }
+    mean_abs /= (float)(B * T * D);
+    fprintf(stderr, "vulkan patchify_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 3.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, weight_buffer, weight_memory, weight_mapped);
+        destroy_host_buffer(rt, tokens_buffer, tokens_memory, tokens_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_unpatchify_f32_probe(void) {
+    enum { B = 2, C = 4, H = 6, W = 8, ph = 2, pw = 2, D = 9 };
+    enum { Hp = H / ph, Wp = W / pw, T = Hp * Wp, out_dim = C * ph * pw };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer tokens_buffer = VK_NULL_HANDLE;
+    VkBuffer weight_buffer = VK_NULL_HANDLE;
+    VkBuffer bias_buffer = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory tokens_memory = VK_NULL_HANDLE;
+    VkDeviceMemory weight_memory = VK_NULL_HANDLE;
+    VkDeviceMemory bias_memory = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    void *tokens_mapped = NULL;
+    void *weight_mapped = NULL;
+    void *bias_mapped = NULL;
+    void *x_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t tokens_bytes = (size_t)B * T * D * sizeof(float);
+    size_t weight_bytes = (size_t)out_dim * D * sizeof(float);
+    size_t bias_bytes = (size_t)out_dim * sizeof(float);
+    size_t x_bytes = (size_t)B * C * H * W * sizeof(float);
+    if (create_host_buffer(rt, tokens_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tokens_buffer, &tokens_memory, &tokens_mapped)) goto cleanup;
+    if (create_host_buffer(rt, weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &weight_buffer, &weight_memory, &weight_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &bias_buffer, &bias_memory, &bias_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+
+    float *tokens = (float *)tokens_mapped;
+    float *weight = (float *)weight_mapped;
+    float *bias = (float *)bias_mapped;
+    float *x = (float *)x_mapped;
+    for (int i = 0; i < B * T * D; ++i) tokens[i] = probe_value(i + 2003, 0.029296875f);
+    for (int i = 0; i < out_dim * D; ++i) weight[i] = probe_value(i + 2111, 0.025390625f);
+    for (int i = 0; i < out_dim; ++i) bias[i] = probe_value(i + 2203, 0.017578125f);
+    memset(x, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "unpatchify_f32.comp", 4, sizeof(WorldVulkanUnpatchifyPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[4] = {tokens_buffer, weight_buffer, bias_buffer, x_buffer};
+    VkDeviceSize sizes[4] = {tokens_bytes, weight_bytes, bias_bytes, x_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 4, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanUnpatchifyPush push;
+    push.B = B;
+    push.T = T;
+    push.D = D;
+    push.C = C;
+    push.H = H;
+    push.W = W;
+    push.ph = ph;
+    push.pw = pw;
+    push.Hp = Hp;
+    push.Wp = Wp;
+    push.out_dim = out_dim;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                B * T * out_dim, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int token = 0; token < T; ++token) {
+            int oy = token / Wp;
+            int ox = token - oy * Wp;
+            for (int o = 0; o < out_dim; ++o) {
+                float ref = bias[o];
+                for (int d = 0; d < D; ++d) {
+                    ref += tokens[(b * T + token) * D + d] * weight[o * D + d];
+                }
+                int p = o;
+                int dx = p % pw;
+                p /= pw;
+                int dy = p % ph;
+                p /= ph;
+                int c = p;
+                int iy = oy * ph + dy;
+                int ix = ox * pw + dx;
+                size_t idx = (size_t)(((b * C + c) * H + iy) * W + ix);
+                float diff = fabsf(x[idx] - ref);
+                if (diff > max_abs) max_abs = diff;
+                mean_abs += diff;
+            }
+        }
+    }
+    mean_abs /= (float)(B * C * H * W);
+    fprintf(stderr, "vulkan unpatchify_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 3.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, tokens_buffer, tokens_memory, tokens_mapped);
+        destroy_host_buffer(rt, weight_buffer, weight_memory, weight_mapped);
+        destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;

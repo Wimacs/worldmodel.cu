@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputX {
+    float x[];
+} in_x;
+
+layout(std430, binding = 1) readonly buffer Weight {
+    float weight[];
+} in_weight;
+
+layout(std430, binding = 2) buffer Tokens {
+    float tokens[];
+} out_tokens;
+
+layout(push_constant) uniform Push {
+    uint B;
+    uint C;
+    uint H;
+    uint W;
+    uint D;
+    uint ph;
+    uint pw;
+    uint Hp;
+    uint Wp;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint token_count = pc.Hp * pc.Wp;
+    uint total = pc.B * token_count * pc.D;
+    if (row >= total) {
+        return;
+    }
+
+    uint d = row % pc.D;
+    uint token = (row / pc.D) % token_count;
+    uint b = row / (pc.D * token_count);
+    uint oy = token / pc.Wp;
+    uint ox = token - oy * pc.Wp;
+    uint patch_elems = pc.C * pc.ph * pc.pw;
+
+    float sum = 0.0;
+    for (uint i = lane; i < patch_elems; i += 256u) {
+        uint p = i;
+        uint dx = p % pc.pw;
+        p /= pc.pw;
+        uint dy = p % pc.ph;
+        uint c = p / pc.ph;
+        uint iy = oy * pc.ph + dy;
+        uint ix = ox * pc.pw + dx;
+        float xv = in_x.x[((b * pc.C + c) * pc.H + iy) * pc.W + ix];
+        float wv = in_weight.weight[(((d * pc.C + c) * pc.ph + dy) * pc.pw + dx)];
+        sum += xv * wv;
+    }
+
+    partial[lane] = sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        out_tokens.tokens[(b * token_count + token) * pc.D + d] = partial[0];
+    }
+}

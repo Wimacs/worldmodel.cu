@@ -99,9 +99,11 @@ if(WORLD_ENABLE_VULKAN)
     linear_f32.comp
     masked_attention_f32.comp
     ortho_rope_f32.comp
+    patchify_f32.comp
     qkv_rms_rope_f32.comp
     rms_norm_f32.comp
     silu_f32.comp
+    unpatchify_f32.comp
   )
   set(WORLD_VULKAN_SHADER_SPV)
   foreach(shader_name IN LISTS WORLD_VULKAN_SHADER_SOURCES)
