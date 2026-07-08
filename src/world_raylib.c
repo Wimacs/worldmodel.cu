@@ -2,6 +2,7 @@
 #include "world_cli.c"
 
 #include "raylib.h"
+#include "world_backend.h"
 
 #include <pthread.h>
 #include <math.h>
@@ -22,7 +23,7 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t mutex;
-    WorldCudaRuntime *rt;
+    WorldRuntime *rt;
     float *control;
     int ctrl_dim;
     int n_buttons;
@@ -54,7 +55,7 @@ static void ray_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
             "\n"
-            "Raylib realtime frontend. Loads weights to a resident CUDA runtime, warms up,\n"
+            "Raylib realtime frontend. Loads weights to a resident runtime, warms up,\n"
             "then renders decoded RGB frames to a raylib texture without writing images.\n",
             argv0);
 }
@@ -239,7 +240,7 @@ static void *generation_worker(void *arg) {
         int height = 0;
         int frames = 0;
         float seconds = 0.0f;
-        if (world_cuda_runtime_step_rgb(s->rt, control, &rgb, &width, &height, &frames, &seconds)) {
+        if (world_runtime_step_rgb(s->rt, control, &rgb, &width, &height, &frames, &seconds)) {
             pthread_mutex_lock(&s->mutex);
             s->failed = 1;
             s->stop = 1;
@@ -449,7 +450,7 @@ int main(int argc, char **argv) {
     SafeTensors st;
     LoadedWorldModel model;
     WorldVaeDecoderWeights vae;
-    WorldCudaRuntime *rt = NULL;
+    WorldRuntime *rt = NULL;
     float *seed_latent = NULL;
     memset(&st, 0, sizeof(st));
     memset(&model, 0, sizeof(model));
@@ -469,8 +470,8 @@ int main(int argc, char **argv) {
     memset(&st, 0, sizeof(st));
     if (load_vae_decoder_weights(vae_weights, &vae)) goto cleanup_before_window;
 
-    fprintf(stderr, "creating resident CUDA runtime\n");
-    if (world_cuda_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+    fprintf(stderr, "creating resident %s runtime\n", WORLD_BACKEND_NAME);
+    if (world_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
         goto cleanup_before_window;
     }
     free_loaded_model(&model);
@@ -486,14 +487,14 @@ int main(int argc, char **argv) {
     float warm_seconds = 0.0f;
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
-        if (world_cuda_runtime_seed_latent_rgb(rt, seed_latent, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_runtime_seed_latent_rgb(rt, seed_latent, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(zero_control);
             goto cleanup_before_window;
         }
     }
     for (int i = 0; i < warmup_chunks; ++i) {
         fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
-        if (world_cuda_runtime_step_rgb(rt, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_runtime_step_rgb(rt, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(zero_control);
             goto cleanup_before_window;
         }
@@ -510,7 +511,7 @@ int main(int argc, char **argv) {
         if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h)) {
             free(display_rgb);
             free(seed_latent);
-            world_cuda_runtime_destroy(rt);
+            world_runtime_destroy(rt);
             return 1;
         }
         fprintf(stderr,
@@ -519,7 +520,7 @@ int main(int argc, char **argv) {
                 headless_out_path ? ", wrote debug frames" : ", no image files written");
         free(display_rgb);
         free(seed_latent);
-        world_cuda_runtime_destroy(rt);
+        world_runtime_destroy(rt);
         return 0;
     }
 
@@ -611,7 +612,8 @@ int main(int argc, char **argv) {
         }
 
         char title[256];
-        snprintf(title, sizeof(title), "worldmodel.cu | chunk %d | frame %d/%d | gen %.2fs | %.2f rgb fps",
+        snprintf(title, sizeof(title), "worldmodel.cu %s | chunk %d | frame %d/%d | gen %.2fs | %.2f rgb fps",
+                 WORLD_BACKEND_NAME,
                  chunk_id, playback_frame + 1, rgb_frames, last_generation_seconds,
                  rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
         SetWindowTitle(title);
@@ -641,7 +643,7 @@ int main(int argc, char **argv) {
 
 cleanup_runtime_only:
     free(seed_latent);
-    world_cuda_runtime_destroy(rt);
+    world_runtime_destroy(rt);
     return rc;
 
 cleanup_before_window:
@@ -649,6 +651,6 @@ cleanup_before_window:
     free_loaded_model(&model);
     free_vae_decoder_weights(&vae);
     free(seed_latent);
-    world_cuda_runtime_destroy(rt);
+    world_runtime_destroy(rt);
     return rc;
 }

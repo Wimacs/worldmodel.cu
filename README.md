@@ -1,12 +1,15 @@
 # worldmodel.cu
 
-Small CUDA-first implementation area for the WorldModel runtime.
+Small CUDA-first implementation area for the WorldModel runtime, now with a
+Vulkan backend being ported incrementally.
 
 The current code has two tracks:
 
 - CUDA extension kernels with PyTorch parity tests.
 - A standalone C+CUDA executable that loads Waypoint config/safetensors without
   PyTorch and starts the generation path.
+- A C+Vulkan resident runtime scaffold that shares the raylib frontend and
+  dispatches compute shaders from `shaders/vulkan/`.
 
 Implemented CUDA ops:
 
@@ -38,6 +41,29 @@ Build the standalone no-PyTorch executable:
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+```
+
+CUDA and Vulkan targets are controlled independently:
+
+```sh
+cmake -S . -B build -DWORLD_ENABLE_CUDA=ON -DWORLD_ENABLE_VULKAN=ON
+cmake --build build -j
+```
+
+The Vulkan target currently builds `worldmodel_raylib_vulkan` and compiles
+`shaders/vulkan/fill_rgba.comp` to SPIR-V. This is the first backend slice: it
+creates a Vulkan device, a compute pipeline, dispatches the shader, and returns
+RGB frames through the same raylib/headless path. The actual transformer/VAE
+kernels are still being ported from CUDA.
+
+```sh
+./build/worldmodel_raylib_vulkan \
+  --model-dir ../Waypoint-1.5-1B-360P \
+  --vae-weights ../Waypoint-1.5-1B/vae/diffusion_pytorch_model.safetensors \
+  --layers 1 \
+  --steps 4 \
+  --cache-window 8 \
+  --headless-smoke
 ```
 
 If `3rd/raylib` is present, the build also produces `worldmodel_raylib`, a
