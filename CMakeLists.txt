@@ -101,6 +101,7 @@ if(WORLD_ENABLE_VULKAN)
     indexed_attention_f32.comp
     kv_cache_mask.comp
     kv_cache_upsert_copy_f32.comp
+    lerp_inplace_f32.comp
     linear_f32.comp
     latent_to_rgba.comp
     masked_attention_f32.comp

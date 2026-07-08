@@ -63,26 +63,28 @@ At initialization it also precomputes the CUDA-style scheduler conditioning path
 `noise_embed -> denoise MLP -> out_norm modulation table`, plus per-layer
 `cond + bias -> silu -> 6x layer modulation table`, for all requested scheduler
 passes. This wires the loaded control embedding, denoise/out-norm, layer
-conditioning, and patch/unpatch weights into the interactive runtime. The first
-layer's attention input side is also resident now:
+conditioning, and patch/unpatch weights into the interactive runtime. The DiT
+block loop is now resident for all requested layers:
 `ada_rms_norm_f32.comp -> linear_f32.comp(QKV) -> qkv_rms_rope_f32.comp ->
 kv_cache_upsert_copy_f32.comp -> cache_frame_indices.comp ->
 indexed_attention_f32.comp -> linear_f32.comp(attn out_proj) ->
 gated_residual_add_f32.comp -> rms_norm_f32.comp(ctrl) ->
 linear_f32.comp(ctrl fc1_x/fc1_c/fc2) -> add_channel_silu_f32.comp ->
 add_f32.comp -> ada_rms_norm_f32.comp(MLP) -> linear_f32.comp(dit_mlp fc1/fc2)
--> silu_f32.comp -> gated_residual_add_f32.comp`, with intermediate CPU
-parity probes through the MLP-fused token buffer. The current Vulkan runtime
-then applies the precomputed out-norm modulation, unpatches to latent velocity,
-updates the resident latent through the configured sigma schedule, and runs the
-final unfrozen cache pass. Multi-layer block looping and VAE decode are still
-in progress. Without weights, it falls back to the simple `fill_rgba.comp`
-scaffold for lightweight probes.
+-> silu_f32.comp -> gated_residual_add_f32.comp`, with per-layer KV cache
+offsets, local/global cache parameters, token ping-pong, optional control
+fusion per layer, and CUDA-style value residual via `lerp_inplace_f32.comp`.
+The current Vulkan runtime then applies the precomputed out-norm modulation,
+unpatches to latent velocity, updates the resident latent through the configured
+sigma schedule, and runs the final unfrozen cache pass. The path is still FP32
+with naive `linear_f32.comp`, and VAE decode is still not ported to Vulkan.
+Without weights, it falls back to the simple `fill_rgba.comp` scaffold for
+lightweight probes.
 
 `worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
 elementwise `silu_f32.comp`, fused `add_bias_silu_f32.comp`,
 `add_channel_silu_f32.comp`, `add_f32.comp`, `out_norm_silu_f32.comp`,
-`latent_update_f32.comp`, rowwise `rms_norm_f32.comp`, fused control embedding,
+`latent_update_f32.comp`, `lerp_inplace_f32.comp`, rowwise `rms_norm_f32.comp`, fused control embedding,
 denoise/out-norm scheduler conditioning and layer
 modulation precompute, `gated_residual_add_f32.comp`, the runtime layer0
 QKV/cache/attention/out-projection/control-fusion/DiT-MLP/scheduler-update slice,
@@ -94,7 +96,7 @@ and the patch/unpatch latent-token boundary.
 ./build/worldmodel_raylib_vulkan \
   --model-dir ../Waypoint-1.5-1B-360P \
   --vae-weights ../Waypoint-1.5-1B/vae/diffusion_pytorch_model.safetensors \
-  --layers 1 \
+  --layers 4 \
   --steps 4 \
   --cache-window 8 \
   --headless-smoke

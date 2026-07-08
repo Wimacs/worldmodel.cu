@@ -48,6 +48,7 @@ int world_vulkan_add_channel_silu_f32_probe(void);
 int world_vulkan_add_f32_probe(void);
 int world_vulkan_out_norm_silu_f32_probe(void);
 int world_vulkan_latent_update_f32_probe(void);
+int world_vulkan_lerp_inplace_f32_probe(void);
 int world_vulkan_rms_norm_f32_probe(void);
 int world_vulkan_control_embedding_f32_probe(void);
 int world_vulkan_denoise_out_norm_f32_probe(void);
