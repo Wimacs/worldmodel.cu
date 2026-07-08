@@ -113,6 +113,7 @@ if(WORLD_ENABLE_VULKAN)
     silu_f32.comp
     taehv_add_relu_f32.comp
     taehv_concat_past_nchw_f32.comp
+    taehv_conv2d_nchw_c4_f32.comp
     taehv_conv2d_nchw_f32.comp
     taehv_pixel_shuffle_rgba_f32.comp
     taehv_relu_f32.comp
