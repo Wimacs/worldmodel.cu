@@ -211,6 +211,12 @@ struct WorldVulkanRuntime {
     int out_dim;
     int mlp_hidden;
     int ctrl_dim;
+    int d_head;
+    int kv_dim;
+    int qkv_dim;
+    int d_xy;
+    int d_t;
+    int frame_stride;
     size_t latent_elems;
     size_t token_elems;
     int use_external_latent_once;
@@ -218,6 +224,7 @@ struct WorldVulkanRuntime {
     int ctrl_embedding_enabled;
     int denoise_out_norm_enabled;
     int layer_mod_enabled;
+    int layer_qkv_enabled;
     VkShaderModule runtime_linear_shader;
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
@@ -234,6 +241,14 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_rms_set_layout;
     VkPipelineLayout runtime_rms_pipeline_layout;
     VkPipeline runtime_rms_pipeline;
+    VkShaderModule runtime_ada_rms_shader;
+    VkDescriptorSetLayout runtime_ada_rms_set_layout;
+    VkPipelineLayout runtime_ada_rms_pipeline_layout;
+    VkPipeline runtime_ada_rms_pipeline;
+    VkShaderModule runtime_qkv_rms_rope_shader;
+    VkDescriptorSetLayout runtime_qkv_rms_rope_set_layout;
+    VkPipelineLayout runtime_qkv_rms_rope_pipeline_layout;
+    VkPipeline runtime_qkv_rms_rope_pipeline;
     VkDescriptorPool ctrl_fc1_descriptor_pool;
     VkDescriptorSet ctrl_fc1_descriptor_set;
     VkDescriptorPool ctrl_silu_descriptor_pool;
@@ -256,6 +271,12 @@ struct WorldVulkanRuntime {
     VkDescriptorSet *layer_bias_silu_descriptor_sets;
     VkDescriptorPool *layer_mod_descriptor_pools;
     VkDescriptorSet *layer_mod_descriptor_sets;
+    VkDescriptorPool *attn_ada_descriptor_pools;
+    VkDescriptorSet *attn_ada_descriptor_sets;
+    VkDescriptorPool *qkv_proj_descriptor_pools;
+    VkDescriptorSet *qkv_proj_descriptor_sets;
+    VkDescriptorPool qkv_rms_rope_descriptor_pool;
+    VkDescriptorSet qkv_rms_rope_descriptor_set;
     VkShaderModule patchify_shader;
     VkDescriptorSetLayout patchify_set_layout;
     VkPipelineLayout patchify_pipeline_layout;
@@ -334,12 +355,45 @@ struct WorldVulkanRuntime {
     VkBuffer layer_mod_table_buffer;
     VkDeviceMemory layer_mod_table_memory;
     void *layer_mod_table_mapped;
+    VkBuffer qkv_proj_weight_buffer;
+    VkDeviceMemory qkv_proj_weight_memory;
+    void *qkv_proj_weight_mapped;
     VkBuffer patch_weight_buffer;
     VkDeviceMemory patch_weight_memory;
     void *patch_weight_mapped;
     VkBuffer tokens_buffer;
     VkDeviceMemory tokens_memory;
     void *tokens_mapped;
+    VkBuffer norm_buffer;
+    VkDeviceMemory norm_memory;
+    void *norm_mapped;
+    VkBuffer qkv_raw_buffer;
+    VkDeviceMemory qkv_raw_memory;
+    void *qkv_raw_mapped;
+    VkBuffer q_buffer;
+    VkDeviceMemory q_memory;
+    void *q_mapped;
+    VkBuffer k_buffer;
+    VkDeviceMemory k_memory;
+    void *k_mapped;
+    VkBuffer v_buffer;
+    VkDeviceMemory v_memory;
+    void *v_mapped;
+    VkBuffer x_pos_buffer;
+    VkDeviceMemory x_pos_memory;
+    void *x_pos_mapped;
+    VkBuffer y_pos_buffer;
+    VkDeviceMemory y_pos_memory;
+    void *y_pos_mapped;
+    VkBuffer t_pos_buffer;
+    VkDeviceMemory t_pos_memory;
+    void *t_pos_mapped;
+    VkBuffer xy_buffer;
+    VkDeviceMemory xy_memory;
+    void *xy_mapped;
+    VkBuffer inv_t_buffer;
+    VkDeviceMemory inv_t_memory;
+    void *inv_t_mapped;
     VkBuffer unpatch_weight_buffer;
     VkDeviceMemory unpatch_weight_memory;
     void *unpatch_weight_mapped;
@@ -874,6 +928,38 @@ static void copy_runtime_control(WorldVulkanRuntime *rt, const float *control_in
     }
 }
 
+static void fill_runtime_positions(WorldVulkanRuntime *rt, int frame_timestamp) {
+    uint32_t *x_pos = (uint32_t *)rt->x_pos_mapped;
+    uint32_t *y_pos = (uint32_t *)rt->y_pos_mapped;
+    uint32_t *t_pos = (uint32_t *)rt->t_pos_mapped;
+    if (!x_pos || !y_pos || !t_pos) return;
+    for (int i = 0; i < rt->T; ++i) {
+        int y = i / rt->cfg.width;
+        int x = i - y * rt->cfg.width;
+        x_pos[i] = (uint32_t)x;
+        y_pos[i] = (uint32_t)y;
+        t_pos[i] = (uint32_t)frame_timestamp;
+    }
+}
+
+static void fill_runtime_rope_tables(WorldVulkanRuntime *rt) {
+    float *xy = (float *)rt->xy_mapped;
+    float *inv_t = (float *)rt->inv_t_mapped;
+    if (!xy || !inv_t) return;
+    int n_xy = (rt->d_xy + 1) / 2;
+    float max_freq = (float)(rt->cfg.height < rt->cfg.width ? rt->cfg.height : rt->cfg.width) * 0.8f;
+    for (int i = 0; i < rt->d_xy; ++i) {
+        int src = i / 2;
+        float a = n_xy == 1 ? 0.0f : (float)src / (float)(n_xy - 1);
+        xy[i] = (1.0f + (max_freq * 0.5f - 1.0f) * a) * (float)M_PI;
+    }
+    for (int i = 0; i < rt->d_t; ++i) {
+        int src = i / 2;
+        float exponent = (float)(2 * src) / (float)rt->d_t;
+        inv_t[i] = 1.0f / powf(10000.0f, exponent);
+    }
+}
+
 static void fill_noise_embedding(float *emb, float sigma) {
     int half = 256;
     float root2 = sqrtf(2.0f);
@@ -1059,6 +1145,20 @@ static int create_runtime_model_slice(
     rt->out_dim = rt->C * rt->ph * rt->pw;
     rt->mlp_hidden = rt->D * rt->cfg.mlp_ratio;
     rt->ctrl_dim = rt->cfg.n_buttons + 3;
+    if (rt->cfg.n_heads <= 0 || rt->D % rt->cfg.n_heads != 0) {
+        fprintf(stderr, "invalid Vulkan qkv head config D=%d n_heads=%d\n", rt->D, rt->cfg.n_heads);
+        return 1;
+    }
+    rt->d_head = rt->D / rt->cfg.n_heads;
+    rt->kv_dim = rt->cfg.n_kv_heads * rt->d_head;
+    rt->qkv_dim = rt->D + 2 * rt->kv_dim;
+    rt->d_xy = rt->d_head / 8;
+    rt->d_t = rt->d_head / 4;
+    {
+        int fps_div = rt->cfg.base_fps > 0 ? rt->cfg.inference_fps / rt->cfg.base_fps : 0;
+        rt->frame_stride = fps_div > 0 ? rt->cfg.base_fps / fps_div : 1;
+        if (rt->frame_stride <= 0) rt->frame_stride = 1;
+    }
     rt->rms_eps = 1.0e-6f;
     rt->latent_elems = (size_t)rt->C * rt->H * rt->W;
     rt->token_elems = (size_t)rt->T * rt->D;
@@ -1077,6 +1177,17 @@ static int create_runtime_model_slice(
                 fprintf(stderr, "missing Vulkan layer modulation weights for layer %d\n", layer_idx);
                 return 1;
             }
+        }
+        rt->layer_qkv_enabled = (rt->d_head <= 256 && rt->d_xy > 0 && rt->d_t > 0);
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run && rt->layer_qkv_enabled; ++layer_idx) {
+            const WorldLayerWeights *lw = &weights->layers[layer_idx];
+            if (!lw->q_proj_weight || !lw->k_proj_weight || !lw->v_proj_weight) {
+                rt->layer_qkv_enabled = 0;
+            }
+        }
+        if (!rt->layer_qkv_enabled) {
+            fprintf(stderr, "warning: Vulkan runtime layer QKV disabled; missing q/k/v weights or unsupported d_head=%d\n",
+                    rt->d_head);
         }
     }
 
@@ -1099,6 +1210,14 @@ static int create_runtime_model_slice(
     size_t layer_cond_proj_weight_bytes = (size_t)rt->layers_to_run * 6 * rt->D * rt->D * sizeof(float);
     size_t layer_mod_pass_layer_bytes = (size_t)6 * rt->D * sizeof(float);
     size_t layer_mod_table_bytes = (size_t)rt->total_passes * rt->layers_to_run * layer_mod_pass_layer_bytes;
+    size_t qkv_proj_weight_layer_bytes = (size_t)rt->qkv_dim * rt->D * sizeof(float);
+    size_t qkv_proj_weight_bytes = (size_t)rt->layers_to_run * qkv_proj_weight_layer_bytes;
+    size_t qkv_raw_bytes = (size_t)rt->T * rt->qkv_dim * sizeof(float);
+    size_t q_rope_bytes = (size_t)rt->T * rt->D * sizeof(float);
+    size_t kv_rope_bytes = (size_t)rt->T * rt->kv_dim * sizeof(float);
+    size_t pos_bytes = (size_t)rt->T * sizeof(uint32_t);
+    size_t xy_bytes = (size_t)rt->d_xy * sizeof(float);
+    size_t inv_t_bytes = (size_t)rt->d_t * sizeof(float);
 
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
@@ -1147,11 +1266,43 @@ static int create_runtime_model_slice(
         rt->layer_mod_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorSet));
         if (!rt->layer_bias_silu_descriptor_pools || !rt->layer_bias_silu_descriptor_sets ||
                 !rt->layer_mod_descriptor_pools || !rt->layer_mod_descriptor_sets) return 1;
+        if (rt->layer_qkv_enabled) {
+            if (create_host_buffer(rt, qkv_proj_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        &rt->qkv_proj_weight_buffer, &rt->qkv_proj_weight_memory, &rt->qkv_proj_weight_mapped)) return 1;
+            rt->attn_ada_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorPool));
+            rt->attn_ada_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorSet));
+            rt->qkv_proj_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+            rt->qkv_proj_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+            if (!rt->attn_ada_descriptor_pools || !rt->attn_ada_descriptor_sets ||
+                    !rt->qkv_proj_descriptor_pools || !rt->qkv_proj_descriptor_sets) return 1;
+        }
     }
     if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->patch_weight_buffer, &rt->patch_weight_memory, &rt->patch_weight_mapped)) return 1;
     if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->tokens_buffer, &rt->tokens_memory, &rt->tokens_mapped)) return 1;
+    if (rt->layer_qkv_enabled) {
+        if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->norm_buffer, &rt->norm_memory, &rt->norm_mapped)) return 1;
+        if (create_host_buffer(rt, qkv_raw_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->qkv_raw_buffer, &rt->qkv_raw_memory, &rt->qkv_raw_mapped)) return 1;
+        if (create_host_buffer(rt, q_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->q_buffer, &rt->q_memory, &rt->q_mapped)) return 1;
+        if (create_host_buffer(rt, kv_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->k_buffer, &rt->k_memory, &rt->k_mapped)) return 1;
+        if (create_host_buffer(rt, kv_rope_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->v_buffer, &rt->v_memory, &rt->v_mapped)) return 1;
+        if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->x_pos_buffer, &rt->x_pos_memory, &rt->x_pos_mapped)) return 1;
+        if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->y_pos_buffer, &rt->y_pos_memory, &rt->y_pos_mapped)) return 1;
+        if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->t_pos_buffer, &rt->t_pos_memory, &rt->t_pos_mapped)) return 1;
+        if (create_host_buffer(rt, xy_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->xy_buffer, &rt->xy_memory, &rt->xy_mapped)) return 1;
+        if (create_host_buffer(rt, inv_t_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->inv_t_buffer, &rt->inv_t_memory, &rt->inv_t_mapped)) return 1;
+    }
     if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->unpatch_weight_buffer, &rt->unpatch_weight_memory, &rt->unpatch_weight_mapped)) return 1;
     if (create_host_buffer(rt, unpatch_bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1199,6 +1350,28 @@ static int create_runtime_model_slice(
         memset(rt->layer_mod_table_mapped, 0, layer_mod_table_bytes);
     }
     memset(rt->tokens_mapped, 0, token_bytes);
+    if (rt->layer_qkv_enabled) {
+        float *qkv_dst = (float *)rt->qkv_proj_weight_mapped;
+        size_t q_elems = (size_t)rt->D * rt->D;
+        size_t kv_elems = (size_t)rt->kv_dim * rt->D;
+        size_t layer_elems = q_elems + 2 * kv_elems;
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            const WorldLayerWeights *lw = &weights->layers[layer_idx];
+            float *dst = qkv_dst + (size_t)layer_idx * layer_elems;
+            memcpy(dst, lw->q_proj_weight, q_elems * sizeof(float));
+            memcpy(dst + q_elems, lw->k_proj_weight, kv_elems * sizeof(float));
+            memcpy(dst + q_elems + kv_elems, lw->v_proj_weight, kv_elems * sizeof(float));
+        }
+        memset(rt->norm_mapped, 0, token_bytes);
+        memset(rt->qkv_raw_mapped, 0, qkv_raw_bytes);
+        memset(rt->q_mapped, 0, q_rope_bytes);
+        memset(rt->k_mapped, 0, kv_rope_bytes);
+        memset(rt->v_mapped, 0, kv_rope_bytes);
+        memset(rt->x_pos_mapped, 0, pos_bytes);
+        memset(rt->y_pos_mapped, 0, pos_bytes);
+        memset(rt->t_pos_mapped, 0, pos_bytes);
+        fill_runtime_rope_tables(rt);
+    }
     memset(rt->latent_out_mapped, 0, latent_bytes);
 
     if (create_storage_pipeline(rt, "linear_f32.comp", 4, sizeof(WorldVulkanLinearPush),
@@ -1215,6 +1388,14 @@ static int create_runtime_model_slice(
     if (create_storage_pipeline(rt, "rms_norm_f32.comp", 3, sizeof(WorldVulkanRmsNormPush),
                 &rt->runtime_rms_shader, &rt->runtime_rms_set_layout,
                 &rt->runtime_rms_pipeline_layout, &rt->runtime_rms_pipeline)) return 1;
+    if (rt->layer_qkv_enabled) {
+        if (create_storage_pipeline(rt, "ada_rms_norm_f32.comp", 4, sizeof(WorldVulkanAdaRmsNormPush),
+                    &rt->runtime_ada_rms_shader, &rt->runtime_ada_rms_set_layout,
+                    &rt->runtime_ada_rms_pipeline_layout, &rt->runtime_ada_rms_pipeline)) return 1;
+        if (create_storage_pipeline(rt, "qkv_rms_rope_f32.comp", 9, sizeof(WorldVulkanQkvRmsRopePush),
+                    &rt->runtime_qkv_rms_rope_shader, &rt->runtime_qkv_rms_rope_set_layout,
+                    &rt->runtime_qkv_rms_rope_pipeline_layout, &rt->runtime_qkv_rms_rope_pipeline)) return 1;
+    }
     if (create_storage_pipeline(rt, "patchify_f32.comp", 3, sizeof(WorldVulkanPatchifyPush),
                 &rt->patchify_shader, &rt->patchify_set_layout,
                 &rt->patchify_pipeline_layout, &rt->patchify_pipeline)) return 1;
@@ -1321,6 +1502,52 @@ static int create_runtime_model_slice(
             }
         }
     }
+    if (rt->layer_qkv_enabled) {
+        for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                int table_idx = pass_idx * rt->layers_to_run + layer_idx;
+                VkBuffer buffers[4] = {
+                    rt->tokens_buffer, rt->layer_mod_table_buffer, rt->layer_mod_table_buffer, rt->norm_buffer
+                };
+                VkDeviceSize sizes[4] = {
+                    token_bytes, ctrl_emb_bytes, ctrl_emb_bytes, token_bytes
+                };
+                VkDeviceSize base = (VkDeviceSize)((size_t)table_idx * layer_mod_pass_layer_bytes);
+                VkDeviceSize offsets[4] = {
+                    0,
+                    base,
+                    base + (VkDeviceSize)ctrl_emb_bytes,
+                    0
+                };
+                if (create_storage_descriptor_set(rt, rt->runtime_ada_rms_set_layout, 4, buffers, sizes, offsets,
+                            &rt->attn_ada_descriptor_pools[table_idx],
+                            &rt->attn_ada_descriptor_sets[table_idx])) return 1;
+            }
+        }
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            VkBuffer buffers[4] = {
+                rt->norm_buffer, rt->qkv_proj_weight_buffer, rt->dummy_bias_buffer, rt->qkv_raw_buffer
+            };
+            VkDeviceSize sizes[4] = {token_bytes, qkv_proj_weight_layer_bytes, sizeof(float), qkv_raw_bytes};
+            VkDeviceSize offsets[4] = {0, (VkDeviceSize)((size_t)layer_idx * qkv_proj_weight_layer_bytes), 0, 0};
+            if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
+                        &rt->qkv_proj_descriptor_pools[layer_idx],
+                        &rt->qkv_proj_descriptor_sets[layer_idx])) return 1;
+        }
+        {
+            VkBuffer buffers[9] = {
+                rt->qkv_raw_buffer, rt->x_pos_buffer, rt->y_pos_buffer, rt->t_pos_buffer,
+                rt->xy_buffer, rt->inv_t_buffer, rt->q_buffer, rt->k_buffer, rt->v_buffer
+            };
+            VkDeviceSize sizes[9] = {
+                qkv_raw_bytes, pos_bytes, pos_bytes, pos_bytes, xy_bytes, inv_t_bytes,
+                q_rope_bytes, kv_rope_bytes, kv_rope_bytes
+            };
+            if (create_storage_descriptor_set(rt, rt->runtime_qkv_rms_rope_set_layout, 9, buffers, sizes, NULL,
+                        &rt->qkv_rms_rope_descriptor_pool,
+                        &rt->qkv_rms_rope_descriptor_set)) return 1;
+        }
+    }
     {
         VkBuffer buffers[3] = {rt->latent_buffer, rt->patch_weight_buffer, rt->tokens_buffer};
         VkDeviceSize sizes[3] = {latent_bytes, patch_weight_bytes, token_bytes};
@@ -1348,9 +1575,9 @@ static int create_runtime_model_slice(
     if (precompute_runtime_out_mods(rt)) return 1;
     rt->model_slice_enabled = 1;
     fprintf(stderr,
-            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
+            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d qkv=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
             rt->C, rt->H, rt->W, rt->T, rt->D, rt->layers_to_run,
-            rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
+            rt->layer_qkv_enabled, rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
             (double)latent_bytes / (1024.0 * 1024.0));
     return 0;
 }
@@ -1462,6 +1689,70 @@ static int record_runtime_model_slice(
             0, sizeof(patch_push), &patch_push);
     vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->D), 1, 1);
     cmd_shader_barrier(rt->command_buffer);
+
+    if (rt->layer_qkv_enabled) {
+        int layer_idx = 0;
+        int table_idx = 0;
+
+        WorldVulkanAdaRmsNormPush ada_push;
+        memset(&ada_push, 0, sizeof(ada_push));
+        ada_push.B = 1;
+        ada_push.T = (uint32_t)rt->T;
+        ada_push.N = 1;
+        ada_push.D = (uint32_t)rt->D;
+        ada_push.eps = rt->rms_eps;
+
+        WorldVulkanLinearPush qkv_push;
+        memset(&qkv_push, 0, sizeof(qkv_push));
+        qkv_push.rows = (uint32_t)rt->T;
+        qkv_push.cols = (uint32_t)rt->qkv_dim;
+        qkv_push.inner = (uint32_t)rt->D;
+        qkv_push.has_bias = 0;
+
+        WorldVulkanQkvRmsRopePush rope_push;
+        memset(&rope_push, 0, sizeof(rope_push));
+        rope_push.B = 1;
+        rope_push.T = (uint32_t)rt->T;
+        rope_push.n_heads = (uint32_t)rt->cfg.n_heads;
+        rope_push.n_kv_heads = (uint32_t)rt->cfg.n_kv_heads;
+        rope_push.D = (uint32_t)rt->d_head;
+        rope_push.width = (uint32_t)rt->cfg.width;
+        rope_push.height = (uint32_t)rt->cfg.height;
+        rope_push.eps = rt->rms_eps;
+
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
+        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                rt->runtime_ada_rms_pipeline_layout, 0, 1,
+                &rt->attn_ada_descriptor_sets[table_idx], 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->runtime_ada_rms_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ada_push), &ada_push);
+        vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+        cmd_shader_barrier(rt->command_buffer);
+
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                rt->runtime_linear_pipeline_layout, 0, 1,
+                &rt->qkv_proj_descriptor_sets[layer_idx], 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
+        vkCmdDispatch(rt->command_buffer,
+                ((uint32_t)rt->qkv_dim + 7u) / 8u,
+                ((uint32_t)rt->T + 7u) / 8u,
+                1);
+        cmd_shader_barrier(rt->command_buffer);
+
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_qkv_rms_rope_pipeline);
+        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                rt->runtime_qkv_rms_rope_pipeline_layout, 0, 1,
+                &rt->qkv_rms_rope_descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->runtime_qkv_rms_rope_pipeline_layout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rope_push), &rope_push);
+        vkCmdDispatch(rt->command_buffer,
+                (uint32_t)rt->T,
+                (uint32_t)(rt->cfg.n_heads + 2 * rt->cfg.n_kv_heads),
+                1);
+        cmd_shader_barrier(rt->command_buffer);
+    }
 
     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->unpatch_orig_pipeline);
     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1611,6 +1902,9 @@ int world_vulkan_runtime_step_rgb(
             fill_runtime_latent(rt, control_input);
         }
         copy_runtime_control(rt, control_input);
+        if (rt->layer_qkv_enabled) {
+            fill_runtime_positions(rt, rt->frame_ordinal * rt->frame_stride);
+        }
     }
 
     WorldVulkanFillPush push;
@@ -3033,6 +3327,290 @@ cleanup:
     return rc;
 }
 
+int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
+    enum {
+        C = 2,
+        D = 128,
+        n_heads = 4,
+        n_kv_heads = 2,
+        d_head = D / n_heads,
+        kv_dim = n_kv_heads * d_head,
+        qkv_dim = D + 2 * kv_dim,
+        height = 2,
+        width = 2,
+        T = height * width,
+        mlp_ratio = 2,
+        hidden = D * mlp_ratio,
+        n_buttons = 5,
+        ctrl_dim = n_buttons + 3
+    };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = C;
+    cfg.d_model = D;
+    cfg.n_heads = n_heads;
+    cfg.n_kv_heads = n_kv_heads;
+    cfg.n_layers = 1;
+    cfg.height = height;
+    cfg.width = width;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+    cfg.n_buttons = n_buttons;
+    cfg.mlp_ratio = mlp_ratio;
+    cfg.base_fps = 15;
+    cfg.inference_fps = 60;
+    cfg.scheduler_sigmas[0] = 1.0f;
+    cfg.scheduler_sigmas[1] = 0.0f;
+    cfg.scheduler_sigmas_count = 2;
+
+    size_t latent_elems = (size_t)C * height * width;
+    size_t patch_elems = (size_t)D * C;
+    size_t ctrl_fc1_elems = (size_t)hidden * ctrl_dim;
+    size_t ctrl_fc2_elems = (size_t)D * hidden;
+    size_t denoise_fc1_elems = (size_t)hidden * 512u;
+    size_t denoise_fc2_elems = (size_t)D * hidden;
+    size_t out_norm_elems = (size_t)2 * D * D;
+    size_t cond_proj_elems = (size_t)6 * D * D;
+    size_t q_elems = (size_t)D * D;
+    size_t kv_elems = (size_t)kv_dim * D;
+    float *latent = NULL;
+    float *control = NULL;
+    float *patch = NULL;
+    float *ctrl_fc1 = NULL;
+    float *ctrl_fc2 = NULL;
+    float *denoise_fc1 = NULL;
+    float *denoise_fc2 = NULL;
+    float *out_norm = NULL;
+    float *unpatch = NULL;
+    float *unpatch_bias = NULL;
+    float *cond_bias = NULL;
+    float *cond_proj = NULL;
+    float *q_w = NULL;
+    float *k_w = NULL;
+    float *v_w = NULL;
+    float *tokens_ref = NULL;
+    float *norm_ref = NULL;
+    float *qkv_ref = NULL;
+    WorldVulkanRuntime *rt = NULL;
+    WorldLayerWeights layer;
+    memset(&layer, 0, sizeof(layer));
+
+    latent = (float *)malloc(latent_elems * sizeof(float));
+    control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
+    patch = (float *)malloc(patch_elems * sizeof(float));
+    ctrl_fc1 = (float *)malloc(ctrl_fc1_elems * sizeof(float));
+    ctrl_fc2 = (float *)malloc(ctrl_fc2_elems * sizeof(float));
+    denoise_fc1 = (float *)malloc(denoise_fc1_elems * sizeof(float));
+    denoise_fc2 = (float *)malloc(denoise_fc2_elems * sizeof(float));
+    out_norm = (float *)malloc(out_norm_elems * sizeof(float));
+    unpatch = (float *)malloc(patch_elems * sizeof(float));
+    unpatch_bias = (float *)malloc((size_t)C * sizeof(float));
+    cond_bias = (float *)malloc((size_t)D * sizeof(float));
+    cond_proj = (float *)malloc(cond_proj_elems * sizeof(float));
+    q_w = (float *)malloc(q_elems * sizeof(float));
+    k_w = (float *)malloc(kv_elems * sizeof(float));
+    v_w = (float *)malloc(kv_elems * sizeof(float));
+    tokens_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    norm_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    qkv_ref = (float *)malloc((size_t)T * qkv_dim * sizeof(float));
+    if (!latent || !control || !patch || !ctrl_fc1 || !ctrl_fc2 || !denoise_fc1 ||
+            !denoise_fc2 || !out_norm || !unpatch || !unpatch_bias || !cond_bias ||
+            !cond_proj || !q_w || !k_w || !v_w || !tokens_ref || !norm_ref || !qkv_ref) {
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < latent_elems; ++i) latent[i] = probe_value((int)i + 31, 0.25f);
+    for (int i = 0; i < ctrl_dim; ++i) control[i] = probe_value(i + 43, 0.0625f);
+    for (size_t i = 0; i < patch_elems; ++i) {
+        patch[i] = probe_value((int)i + 101, 0.0234375f);
+        unpatch[i] = probe_value((int)i + 151, 0.017578125f);
+    }
+    for (int i = 0; i < C; ++i) unpatch_bias[i] = probe_value(i + 191, 0.01171875f);
+    for (size_t i = 0; i < ctrl_fc1_elems; ++i) ctrl_fc1[i] = probe_value((int)i + 211, 0.001953125f);
+    for (size_t i = 0; i < ctrl_fc2_elems; ++i) ctrl_fc2[i] = probe_value((int)i + 307, 0.001953125f);
+    for (size_t i = 0; i < denoise_fc1_elems; ++i) denoise_fc1[i] = probe_value((int)i + 401, 0.001953125f);
+    for (size_t i = 0; i < denoise_fc2_elems; ++i) denoise_fc2[i] = probe_value((int)i + 503, 0.001953125f);
+    for (size_t i = 0; i < out_norm_elems; ++i) out_norm[i] = probe_value((int)i + 607, 0.00146484375f);
+    for (int i = 0; i < D; ++i) cond_bias[i] = probe_value(i + 701, 0.015625f);
+    for (size_t i = 0; i < cond_proj_elems; ++i) cond_proj[i] = probe_value((int)i + 809, 0.0009765625f);
+    for (size_t i = 0; i < q_elems; ++i) q_w[i] = probe_value((int)i + 907, 0.0029296875f);
+    for (size_t i = 0; i < kv_elems; ++i) {
+        k_w[i] = probe_value((int)i + 1009, 0.0029296875f);
+        v_w[i] = probe_value((int)i + 1103, 0.00390625f);
+    }
+
+    layer.cond_bias = cond_bias;
+    layer.attn_cond_s_weight = cond_proj + 0 * D * D;
+    layer.attn_cond_b_weight = cond_proj + 1 * D * D;
+    layer.attn_cond_g_weight = cond_proj + 2 * D * D;
+    layer.mlp_cond_s_weight = cond_proj + 3 * D * D;
+    layer.mlp_cond_b_weight = cond_proj + 4 * D * D;
+    layer.mlp_cond_g_weight = cond_proj + 5 * D * D;
+    layer.q_proj_weight = q_w;
+    layer.k_proj_weight = k_w;
+    layer.v_proj_weight = v_w;
+
+    WorldModelProbeWeights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.patchify_weight = patch;
+    weights.denoise_fc1_weight = denoise_fc1;
+    weights.denoise_fc2_weight = denoise_fc2;
+    weights.ctrl_emb_fc1_weight = ctrl_fc1;
+    weights.ctrl_emb_fc2_weight = ctrl_fc2;
+    weights.layers = &layer;
+    weights.n_layers = 1;
+    weights.out_norm_fc_weight = out_norm;
+    weights.unpatchify_weight = unpatch;
+    weights.unpatchify_bias = unpatch_bias;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, &weights, 1, 1, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    if (!rt->layer_qkv_enabled) goto cleanup;
+    {
+        const unsigned char *rgb = NULL;
+        int rgb_w = 0, rgb_h = 0, rgb_frames = 0;
+        if (world_vulkan_runtime_seed_latent_rgb(rt, latent, control, &rgb, &rgb_w, &rgb_h, &rgb_frames, NULL)) {
+            goto cleanup;
+        }
+    }
+
+    for (int t = 0; t < T; ++t) {
+        int y = t / width;
+        int x = t - y * width;
+        for (int d = 0; d < D; ++d) {
+            float acc = 0.0f;
+            for (int c = 0; c < C; ++c) {
+                acc += latent[(c * height + y) * width + x] * patch[d * C + c];
+            }
+            tokens_ref[t * D + d] = acc;
+        }
+    }
+
+    const float *layer_mod = (const float *)rt->layer_mod_table_mapped;
+    const float *scale = layer_mod;
+    const float *bias = layer_mod + D;
+    for (int t = 0; t < T; ++t) {
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float v = tokens_ref[t * D + d];
+            sum += v * v;
+        }
+        float inv = 1.0f / sqrtf(sum / (float)D + 1.0e-6f);
+        for (int d = 0; d < D; ++d) {
+            norm_ref[t * D + d] = tokens_ref[t * D + d] * inv * (1.0f + scale[d]) + bias[d];
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        for (int o = 0; o < qkv_dim; ++o) {
+            const float *w = o < D ? q_w + (size_t)o * D :
+                (o < D + kv_dim ? k_w + (size_t)(o - D) * D : v_w + (size_t)(o - D - kv_dim) * D);
+            float acc = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                acc += norm_ref[t * D + d] * w[d];
+            }
+            qkv_ref[t * qkv_dim + o] = acc;
+        }
+    }
+
+    float norm_max = 0.0f;
+    float qkv_max = 0.0f;
+    float rope_max = 0.0f;
+    float norm_mean = 0.0f;
+    float qkv_mean = 0.0f;
+    float rope_mean = 0.0f;
+    const float *norm_got = (const float *)rt->norm_mapped;
+    const float *qkv_got = (const float *)rt->qkv_raw_mapped;
+    const float *q_got = (const float *)rt->q_mapped;
+    const float *k_got = (const float *)rt->k_mapped;
+    const float *v_got = (const float *)rt->v_mapped;
+    for (int i = 0; i < T * D; ++i) {
+        float diff = fabsf(norm_got[i] - norm_ref[i]);
+        if (diff > norm_max) norm_max = diff;
+        norm_mean += diff;
+    }
+    for (int i = 0; i < T * qkv_dim; ++i) {
+        float diff = fabsf(qkv_got[i] - qkv_ref[i]);
+        if (diff > qkv_max) qkv_max = diff;
+        qkv_mean += diff;
+    }
+
+    const uint32_t *x_pos = (const uint32_t *)rt->x_pos_mapped;
+    const uint32_t *y_pos = (const uint32_t *)rt->y_pos_mapped;
+    const uint32_t *t_pos = (const uint32_t *)rt->t_pos_mapped;
+    const float *xy = (const float *)rt->xy_mapped;
+    const float *inv_t = (const float *)rt->inv_t_mapped;
+    int rope_count = 0;
+    for (int t = 0; t < T; ++t) {
+        for (int role = 0; role < n_heads + n_kv_heads; ++role) {
+            int is_k = role >= n_heads;
+            int h = is_k ? role - n_heads : role;
+            int src_head = is_k ? n_heads + h : h;
+            const float *src = qkv_ref + t * qkv_dim + src_head * d_head;
+            float sum = 0.0f;
+            for (int d = 0; d < d_head; ++d) {
+                sum += src[d] * src[d];
+            }
+            float inv = 1.0f / sqrtf(sum / (float)d_head + 1.0e-6f);
+            const float *dst = is_k ? k_got + (h * T + t) * d_head : q_got + (h * T + t) * d_head;
+            for (int p = 0; p < d_head / 2; ++p) {
+                float phase = probe_rope_phase(p, x_pos[t], y_pos[t], t_pos[t], xy, inv_t, d_head, width, height);
+                float c = cosf(phase);
+                float s = sinf(phase);
+                float a = src[2 * p] * inv;
+                float bb = src[2 * p + 1] * inv;
+                float ref0 = a * c - bb * s;
+                float ref1 = bb * c + a * s;
+                float diff0 = fabsf(dst[p] - ref0);
+                float diff1 = fabsf(dst[d_head / 2 + p] - ref1);
+                if (diff0 > rope_max) rope_max = diff0;
+                if (diff1 > rope_max) rope_max = diff1;
+                rope_mean += diff0 + diff1;
+                rope_count += 2;
+            }
+        }
+        for (int h = 0; h < n_kv_heads; ++h) {
+            const float *src = qkv_ref + t * qkv_dim + (n_heads + n_kv_heads + h) * d_head;
+            const float *dst = v_got + (h * T + t) * d_head;
+            for (int d = 0; d < d_head; ++d) {
+                float diff = fabsf(dst[d] - src[d]);
+                if (diff > rope_max) rope_max = diff;
+                rope_mean += diff;
+                rope_count += 1;
+            }
+        }
+    }
+    norm_mean /= (float)(T * D);
+    qkv_mean /= (float)(T * qkv_dim);
+    rope_mean /= (float)rope_count;
+    fprintf(stderr,
+            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g norm_mean=%g qkv_mean=%g rope_mean=%g\n",
+            norm_max, qkv_max, rope_max, norm_mean, qkv_mean, rope_mean);
+    if (norm_max > 4.0e-5f || qkv_max > 7.0e-5f || rope_max > 8.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    world_vulkan_runtime_destroy(rt);
+    free(latent);
+    free(control);
+    free(patch);
+    free(ctrl_fc1);
+    free(ctrl_fc2);
+    free(denoise_fc1);
+    free(denoise_fc2);
+    free(out_norm);
+    free(unpatch);
+    free(unpatch_bias);
+    free(cond_bias);
+    free(cond_proj);
+    free(q_w);
+    free(k_w);
+    free(v_w);
+    free(tokens_ref);
+    free(norm_ref);
+    free(qkv_ref);
+    return rc;
+}
+
 int world_vulkan_masked_attention_f32_probe(void) {
     enum { B = 2, Hq = 6, Hkv = 2, Tq = 7, Tk = 11, D = 64 };
     const float scale = 1.0f / sqrtf((float)D);
@@ -3917,10 +4495,27 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
             }
         }
     }
+    if (rt->attn_ada_descriptor_pools) {
+        for (int i = 0; i < rt->total_passes * rt->layers_to_run; ++i) {
+            if (rt->attn_ada_descriptor_pools[i]) {
+                vkDestroyDescriptorPool(rt->device, rt->attn_ada_descriptor_pools[i], NULL);
+            }
+        }
+    }
+    if (rt->qkv_proj_descriptor_pools) {
+        for (int i = 0; i < rt->layers_to_run; ++i) {
+            if (rt->qkv_proj_descriptor_pools[i]) {
+                vkDestroyDescriptorPool(rt->device, rt->qkv_proj_descriptor_pools[i], NULL);
+            }
+        }
+    }
+    if (rt->qkv_rms_rope_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->qkv_rms_rope_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
     if (rt->runtime_rms_pipeline) vkDestroyPipeline(rt->device, rt->runtime_rms_pipeline, NULL);
+    if (rt->runtime_ada_rms_pipeline) vkDestroyPipeline(rt->device, rt->runtime_ada_rms_pipeline, NULL);
+    if (rt->runtime_qkv_rms_rope_pipeline) vkDestroyPipeline(rt->device, rt->runtime_qkv_rms_rope_pipeline, NULL);
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
@@ -3928,6 +4523,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
     if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
     if (rt->runtime_rms_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_rms_pipeline_layout, NULL);
+    if (rt->runtime_ada_rms_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_ada_rms_pipeline_layout, NULL);
+    if (rt->runtime_qkv_rms_rope_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_qkv_rms_rope_pipeline_layout, NULL);
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
@@ -3935,6 +4532,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_silu_set_layout, NULL);
     if (rt->runtime_add_bias_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_bias_silu_set_layout, NULL);
     if (rt->runtime_rms_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_rms_set_layout, NULL);
+    if (rt->runtime_ada_rms_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_ada_rms_set_layout, NULL);
+    if (rt->runtime_qkv_rms_rope_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_qkv_rms_rope_set_layout, NULL);
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
@@ -3942,6 +4541,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
     if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
     if (rt->runtime_rms_shader) vkDestroyShaderModule(rt->device, rt->runtime_rms_shader, NULL);
+    if (rt->runtime_ada_rms_shader) vkDestroyShaderModule(rt->device, rt->runtime_ada_rms_shader, NULL);
+    if (rt->runtime_qkv_rms_rope_shader) vkDestroyShaderModule(rt->device, rt->runtime_qkv_rms_rope_shader, NULL);
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
     if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
@@ -3965,8 +4566,19 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->layer_cond_bias_buffer, rt->layer_cond_bias_memory, rt->layer_cond_bias_mapped);
     destroy_host_buffer(rt, rt->layer_cond_proj_weight_buffer, rt->layer_cond_proj_weight_memory, rt->layer_cond_proj_weight_mapped);
     destroy_host_buffer(rt, rt->layer_mod_table_buffer, rt->layer_mod_table_memory, rt->layer_mod_table_mapped);
+    destroy_host_buffer(rt, rt->qkv_proj_weight_buffer, rt->qkv_proj_weight_memory, rt->qkv_proj_weight_mapped);
     destroy_host_buffer(rt, rt->patch_weight_buffer, rt->patch_weight_memory, rt->patch_weight_mapped);
     destroy_host_buffer(rt, rt->tokens_buffer, rt->tokens_memory, rt->tokens_mapped);
+    destroy_host_buffer(rt, rt->norm_buffer, rt->norm_memory, rt->norm_mapped);
+    destroy_host_buffer(rt, rt->qkv_raw_buffer, rt->qkv_raw_memory, rt->qkv_raw_mapped);
+    destroy_host_buffer(rt, rt->q_buffer, rt->q_memory, rt->q_mapped);
+    destroy_host_buffer(rt, rt->k_buffer, rt->k_memory, rt->k_mapped);
+    destroy_host_buffer(rt, rt->v_buffer, rt->v_memory, rt->v_mapped);
+    destroy_host_buffer(rt, rt->x_pos_buffer, rt->x_pos_memory, rt->x_pos_mapped);
+    destroy_host_buffer(rt, rt->y_pos_buffer, rt->y_pos_memory, rt->y_pos_mapped);
+    destroy_host_buffer(rt, rt->t_pos_buffer, rt->t_pos_memory, rt->t_pos_mapped);
+    destroy_host_buffer(rt, rt->xy_buffer, rt->xy_memory, rt->xy_mapped);
+    destroy_host_buffer(rt, rt->inv_t_buffer, rt->inv_t_memory, rt->inv_t_mapped);
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
     destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
     destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);
@@ -3987,5 +4599,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->layer_bias_silu_descriptor_sets);
     free(rt->layer_mod_descriptor_pools);
     free(rt->layer_mod_descriptor_sets);
+    free(rt->attn_ada_descriptor_pools);
+    free(rt->attn_ada_descriptor_sets);
+    free(rt->qkv_proj_descriptor_pools);
+    free(rt->qkv_proj_descriptor_sets);
     free(rt);
 }
