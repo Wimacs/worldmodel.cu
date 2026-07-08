@@ -259,6 +259,7 @@ typedef struct {
     int H;
     int W;
     int stride;
+    char profile_label[64];
     VkDescriptorPool descriptor_pool;
     VkDescriptorSet descriptor_set;
 } WorldVulkanVaeOp;
@@ -2263,6 +2264,21 @@ static WorldVulkanVaeOp *vae_add_op(
     op->H = H;
     op->W = W;
     op->stride = stride;
+    if (kind == WORLD_VULKAN_VAE_CONV) {
+        if (stride == 1 && (C_out % 4) == 0) {
+            snprintf(op->profile_label, sizeof(op->profile_label),
+                    "vae.conv_1x1_c4.%dx%d.c%di%d", H, W, C_out, C);
+        } else if ((C_out % 4) == 0) {
+            snprintf(op->profile_label, sizeof(op->profile_label),
+                    "vae.conv_c4.k%d.%dx%d.c%di%d", stride, H, W, C_out, C);
+        } else {
+            snprintf(op->profile_label, sizeof(op->profile_label),
+                    "vae.conv.k%d.%dx%d.c%di%d", stride, H, W, C_out, C);
+        }
+    } else if (kind == WORLD_VULKAN_VAE_CONV_OUT_RGBA) {
+        snprintf(op->profile_label, sizeof(op->profile_label),
+                "vae.conv_out_rgba.k%d.%dx%d.c%di%d", stride, H, W, C_out, C);
+    }
     return op;
 }
 
@@ -2613,8 +2629,9 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                 uint32_t conv_work = (op->C_out % 4) == 0 ?
                     (uint32_t)vae_elems(op->N, op->C_out / 4, op->H, op->W) :
                     (uint32_t)vae_elems(op->N, op->C_out, op->H, op->W);
-                PROFILE_DISPATCH(vae_conv_uses_1x1_c4(op) ? "vae.conv_1x1_c4" :
-                        ((op->C_out % 4) == 0 ? "vae.conv_c4" : "vae.conv"),
+                PROFILE_DISPATCH(op->profile_label[0] ? op->profile_label :
+                        (vae_conv_uses_1x1_c4(op) ? "vae.conv_1x1_c4" :
+                        ((op->C_out % 4) == 0 ? "vae.conv_c4" : "vae.conv")),
                         (conv_work + 255u) / 256u, 1, 1);
                 break;
             }
@@ -2699,7 +2716,7 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                         rt->taehv_conv_out_rgba_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, rt->taehv_conv_out_rgba_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                PROFILE_DISPATCH("vae.conv_out_rgba",
+                PROFILE_DISPATCH(op->profile_label[0] ? op->profile_label : "vae.conv_out_rgba",
                         ((uint32_t)rt->pixel_count + 127u) / 128u, 1, 1);
                 break;
             }
