@@ -93,6 +93,8 @@ if(WORLD_ENABLE_VULKAN)
   set(WORLD_VULKAN_SHADER_SOURCES
     fill_rgba.comp
     linear_f32.comp
+    rms_norm_f32.comp
+    silu_f32.comp
   )
   set(WORLD_VULKAN_SHADER_SPV)
   foreach(shader_name IN LISTS WORLD_VULKAN_SHADER_SOURCES)

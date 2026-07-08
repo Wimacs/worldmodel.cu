@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputX {
+    float x[];
+} in_x;
+
+layout(std430, binding = 1) readonly buffer Weight {
+    float w[];
+} in_w;
+
+layout(std430, binding = 2) buffer OutputY {
+    float y[];
+} out_y;
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    float eps;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint c = lane; c < pc.cols; c += 256u) {
+        float v = in_x.x[row * pc.cols + c];
+        sum += v * v;
+    }
+    partial[lane] = sum;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            partial[lane] += partial[lane + stride];
+        }
+        barrier();
+    }
+
+    float scale = inversesqrt(partial[0] / float(pc.cols) + pc.eps);
+    for (uint c = lane; c < pc.cols; c += 256u) {
+        uint idx = row * pc.cols + c;
+        out_y.y[idx] = in_x.x[idx] * scale * in_w.w[c];
+    }
+}
