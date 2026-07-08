@@ -57,7 +57,9 @@ RGB frames through the same raylib/headless path. `worldmodel_vulkan_probe`
 currently runs a CPU parity check for the first model-relevant Vulkan op,
 `linear_f32.comp`, plus elementwise `silu_f32.comp` and rowwise
 `rms_norm_f32.comp`, plus the fused modulation op `ada_rms_norm_f32.comp`.
-The actual transformer/VAE runtime kernels are still being ported from CUDA.
+It also checks `ortho_rope_f32.comp` against the current WorldModel RoPE
+formula. The actual transformer/VAE runtime kernels are still being ported
+from CUDA.
 
 ```sh
 ./build/worldmodel_raylib_vulkan \

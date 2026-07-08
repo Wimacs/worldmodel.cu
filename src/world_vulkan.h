@@ -45,6 +45,7 @@ int world_vulkan_linear_f32_probe(void);
 int world_vulkan_silu_f32_probe(void);
 int world_vulkan_rms_norm_f32_probe(void);
 int world_vulkan_ada_rms_norm_f32_probe(void);
+int world_vulkan_ortho_rope_f32_probe(void);
 
 #ifdef __cplusplus
 }

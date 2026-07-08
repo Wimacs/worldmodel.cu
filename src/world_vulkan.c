@@ -13,6 +13,10 @@
 #define WORLD_VULKAN_SHADER_DIR "shaders/vulkan"
 #endif
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 typedef struct {
     uint32_t width;
     uint32_t height;
@@ -46,6 +50,15 @@ typedef struct {
     uint32_t D;
     float eps;
 } WorldVulkanAdaRmsNormPush;
+
+typedef struct {
+    uint32_t B;
+    uint32_t H;
+    uint32_t T;
+    uint32_t D;
+    uint32_t width;
+    uint32_t height;
+} WorldVulkanOrthoRopePush;
 
 struct WorldVulkanRuntime {
     WorldConfig cfg;
@@ -742,6 +755,45 @@ static float probe_value(int i, float scale) {
     return ((float)v - 14.0f) * scale;
 }
 
+static void fill_probe_rope_tables(float *xy, float *inv_t, int D, int height, int width) {
+    int d_t = D / 4;
+    int d_xy = D / 8;
+    float max_freq = (float)(height < width ? height : width) * 0.8f;
+    int n = (d_xy + 1) / 2;
+    for (int i = 0; i < d_xy; ++i) {
+        int k = i / 2;
+        float a = n > 1 ? (float)k / (float)(n - 1) : 0.0f;
+        xy[i] = (1.0f + (max_freq * 0.5f - 1.0f) * a) * (float)M_PI;
+    }
+    for (int i = 0; i < d_t; ++i) {
+        int even = (i / 2) * 2;
+        float exponent = (float)even / (float)d_t;
+        inv_t[i] = 1.0f / powf(10000.0f, exponent);
+    }
+}
+
+static float probe_rope_phase(
+        int pair_id,
+        uint32_t x_pos,
+        uint32_t y_pos,
+        uint32_t t_pos,
+        const float *xy,
+        const float *inv_t,
+        int D,
+        int width,
+        int height) {
+    int d_xy = D / 8;
+    if (pair_id < d_xy) {
+        float x = (2.0f * (float)x_pos + 1.0f) / (float)width - 1.0f;
+        return x * xy[pair_id];
+    }
+    if (pair_id < 2 * d_xy) {
+        float y = (2.0f * (float)y_pos + 1.0f) / (float)height - 1.0f;
+        return y * xy[pair_id - d_xy];
+    }
+    return (float)t_pos * inv_t[pair_id - 2 * d_xy];
+}
+
 int world_vulkan_linear_f32_probe(void) {
     enum { rows = 7, cols = 11, inner = 13 };
     int rc = 1;
@@ -1218,6 +1270,144 @@ cleanup:
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
         destroy_host_buffer(rt, scale_buffer, scale_memory, scale_mapped);
         destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_ortho_rope_f32_probe(void) {
+    enum { B = 2, H = 3, T = 11, D = 128, width = 20, height = 18 };
+    enum { half_d = D / 2, d_xy = D / 8, d_t = D / 4 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer x_pos_buffer = VK_NULL_HANDLE;
+    VkBuffer y_pos_buffer = VK_NULL_HANDLE;
+    VkBuffer t_pos_buffer = VK_NULL_HANDLE;
+    VkBuffer xy_buffer = VK_NULL_HANDLE;
+    VkBuffer inv_t_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory x_pos_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_pos_memory = VK_NULL_HANDLE;
+    VkDeviceMemory t_pos_memory = VK_NULL_HANDLE;
+    VkDeviceMemory xy_memory = VK_NULL_HANDLE;
+    VkDeviceMemory inv_t_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *x_pos_mapped = NULL;
+    void *y_pos_mapped = NULL;
+    void *t_pos_mapped = NULL;
+    void *xy_mapped = NULL;
+    void *inv_t_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)B * H * T * D * sizeof(float);
+    size_t pos_bytes = (size_t)T * sizeof(uint32_t);
+    size_t xy_bytes = (size_t)d_xy * sizeof(float);
+    size_t inv_t_bytes = (size_t)d_t * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_pos_buffer, &x_pos_memory, &x_pos_mapped)) goto cleanup;
+    if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_pos_buffer, &y_pos_memory, &y_pos_mapped)) goto cleanup;
+    if (create_host_buffer(rt, pos_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &t_pos_buffer, &t_pos_memory, &t_pos_mapped)) goto cleanup;
+    if (create_host_buffer(rt, xy_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &xy_buffer, &xy_memory, &xy_mapped)) goto cleanup;
+    if (create_host_buffer(rt, inv_t_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &inv_t_buffer, &inv_t_memory, &inv_t_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+
+    float *x = (float *)x_mapped;
+    uint32_t *x_pos = (uint32_t *)x_pos_mapped;
+    uint32_t *y_pos = (uint32_t *)y_pos_mapped;
+    uint32_t *t_pos = (uint32_t *)t_pos_mapped;
+    float *xy = (float *)xy_mapped;
+    float *inv_t = (float *)inv_t_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < B * H * T * D; ++i) x[i] = probe_value(i + 503, 0.03125f);
+    for (int t = 0; t < T; ++t) {
+        y_pos[t] = (uint32_t)(t % height);
+        x_pos[t] = (uint32_t)((t * 3) % width);
+        t_pos[t] = (uint32_t)(t * 7);
+    }
+    fill_probe_rope_tables(xy, inv_t, D, height, width);
+    memset(y, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "ortho_rope_f32.comp", 7, sizeof(WorldVulkanOrthoRopePush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[7] = {
+        x_buffer, x_pos_buffer, y_pos_buffer, t_pos_buffer, xy_buffer, inv_t_buffer, y_buffer
+    };
+    VkDeviceSize sizes[7] = {
+        x_bytes, pos_bytes, pos_bytes, pos_bytes, xy_bytes, inv_t_bytes, x_bytes
+    };
+    if (create_storage_descriptor_set(rt, set_layout, 7, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanOrthoRopePush push;
+    push.B = B;
+    push.H = H;
+    push.T = T;
+    push.D = D;
+    push.width = width;
+    push.height = height;
+    uint32_t total = (uint32_t)(B * H * T * half_d);
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (total + 255u) / 256u, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int b = 0; b < B; ++b) {
+        for (int h = 0; h < H; ++h) {
+            for (int t = 0; t < T; ++t) {
+                size_t base = (size_t)(((b * H + h) * T + t) * D);
+                for (int p = 0; p < half_d; ++p) {
+                    float phase = probe_rope_phase(p, x_pos[t], y_pos[t], t_pos[t], xy, inv_t, D, width, height);
+                    float c = cosf(phase);
+                    float s = sinf(phase);
+                    float x0 = x[base + 2 * p];
+                    float x1 = x[base + 2 * p + 1];
+                    float ref0 = x0 * c - x1 * s;
+                    float ref1 = x1 * c + x0 * s;
+                    float diff0 = fabsf(y[base + p] - ref0);
+                    float diff1 = fabsf(y[base + half_d + p] - ref1);
+                    if (diff0 > max_abs) max_abs = diff0;
+                    if (diff1 > max_abs) max_abs = diff1;
+                    mean_abs += diff0 + diff1;
+                }
+            }
+        }
+    }
+    mean_abs /= (float)(B * H * T * D);
+    fprintf(stderr, "vulkan ortho_rope_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 5.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, x_pos_buffer, x_pos_memory, x_pos_mapped);
+        destroy_host_buffer(rt, y_pos_buffer, y_pos_memory, y_pos_mapped);
+        destroy_host_buffer(rt, t_pos_buffer, t_pos_memory, t_pos_mapped);
+        destroy_host_buffer(rt, xy_buffer, xy_memory, xy_mapped);
+        destroy_host_buffer(rt, inv_t_buffer, inv_t_memory, inv_t_mapped);
         destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
     }
     world_vulkan_runtime_destroy(rt);
