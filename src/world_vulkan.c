@@ -3750,12 +3750,20 @@ static int create_runtime_model_slice(
                     fprintf(stderr, "Vulkan d64 flash-style attention enabled; set WORLD_VULKAN_FLASH_ATTN=0 to disable\n");
                 }
                 if (rt->runtime_kv_cache_f16_enabled) {
-                    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_kvf16_f32.comp",
-                                rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                                &rt->runtime_indexed_attention_d64_flash_kvf16_shader,
-                                &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout,
-                                &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline)) return 1;
-                    fprintf(stderr, "Vulkan d64 f16-KV flash attention enabled (WORLD_VULKAN_KV_CACHE_F16=1)\n");
+                    if (rt->max_compute_work_group_invocations >= 768u &&
+                            rt->max_compute_work_group_size_x >= 768u) {
+                        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_kvf16_f32.comp",
+                                    rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                    &rt->runtime_indexed_attention_d64_flash_kvf16_shader,
+                                    &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout,
+                                    &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline)) return 1;
+                        fprintf(stderr, "Vulkan d64 f16-KV flash24w attention enabled (WORLD_VULKAN_KV_CACHE_F16=1)\n");
+                    } else {
+                        fprintf(stderr,
+                                "warning: WORLD_VULKAN_KV_CACHE_F16=1 attention ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u need=768\n",
+                                rt->max_compute_work_group_invocations,
+                                rt->max_compute_work_group_size_x);
+                    }
                 }
             }
             if (rt->layer_attn_out_enabled) {
@@ -4743,14 +4751,14 @@ static int record_runtime_model_slice(
                         (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
                     if (use_kv_f16 &&
                             rt->runtime_indexed_attention_d64_flash_kvf16_pipeline &&
-                            group > 0u && group <= 16u &&
+                            group > 0u && group <= 8u &&
                             (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
-                        uint32_t q_per_h = 16u / group;
+                        uint32_t q_per_h = 24u / group;
                         if (q_per_h == 0u) q_per_h = 1u;
                         uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
                         attn_pipeline = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
                         attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout;
-                        attn_label = "attention.d64_flash_kvf16";
+                        attn_label = "attention.d64_flash24w_kvf16";
                         attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
                     } else if (rt->runtime_indexed_attention_d64_flash24w_k96_enabled &&
                             rt->runtime_indexed_attention_d64_flash24w_k96_pipeline &&
@@ -10164,17 +10172,24 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                 Hkv * q_blocks, 1, 1)) goto cleanup;
     CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_f32", 0);
 
-    if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+    if (rt->shader_float16_enabled && rt->storage_16bit_enabled &&
+            rt->max_compute_work_group_invocations >= 768u &&
+            rt->max_compute_work_group_size_x >= 768u) {
         if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_kvf16_f32.comp",
                     set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                     &flash_kvf16_shader, &flash_kvf16_pipeline_layout, &flash_kvf16_pipeline)) goto cleanup;
+        int q_per_h24kv = 24 / group;
+        if (q_per_h24kv < 1) q_per_h24kv = 1;
+        int q_blocks24kv = (Tq + q_per_h24kv - 1) / q_per_h24kv;
         if (submit_compute(rt, flash_kvf16_pipeline, flash_kvf16_pipeline_layout, descriptor_set_kvf16, &push, sizeof(push),
-                    Hkv * q_blocks, 1, 1)) goto cleanup;
+                    Hkv * q_blocks24kv, 1, 1)) goto cleanup;
         CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_kvf16_f32", 1);
     } else {
         fprintf(stderr,
-                "vulkan indexed_attention_d64_flash_kvf16_f32 probe: skipped; shaderFloat16=%d storage16=%d\n",
-                rt->shader_float16_enabled, rt->storage_16bit_enabled);
+                "vulkan indexed_attention_d64_flash_kvf16_f32 probe: skipped; shaderFloat16=%d storage16=%d maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u need=768\n",
+                rt->shader_float16_enabled, rt->storage_16bit_enabled,
+                rt->max_compute_work_group_invocations,
+                rt->max_compute_work_group_size_x);
     }
 
     if (rt->max_compute_work_group_invocations >= 768u &&

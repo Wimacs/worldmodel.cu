@@ -4,11 +4,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 
-layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 768, local_size_y = 1, local_size_z = 1) in;
 
 #define HEAD_DIM 64
 #define K_BLOCK 64
-#define FLASH_WARPS 16
+#define FLASH_WARPS 24
 
 layout(std430, binding = 0) readonly buffer Q {
     float q[];
@@ -90,7 +90,7 @@ void main() {
     for (uint n0 = 0u; n0 < Nkv; n0 += K_BLOCK) {
         uint active_count = min(K_BLOCK, Nkv - n0);
         uint tile_elems = active_count * 64u;
-        for (uint i = tid; i < tile_elems; i += 512u) {
+        for (uint i = tid; i < tile_elems; i += 768u) {
             uint n = i >> 6u;
             uint d = i & 63u;
             uint tk = in_indices.indices[n0 + n];
