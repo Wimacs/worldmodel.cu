@@ -481,6 +481,7 @@ struct WorldVulkanRuntime {
     VkPipelineLayout runtime_indexed_attention_d64_splitk_reduce_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_splitk_reduce_pipeline;
     int runtime_indexed_attention_d64_splitk_enabled;
+    uint32_t runtime_indexed_attention_d64_splitk_block;
     VkShaderModule runtime_indexed_attention_d64_flash96_shader;
     VkPipelineLayout runtime_indexed_attention_d64_flash96_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash96_pipeline;
@@ -3012,6 +3013,17 @@ static int create_runtime_model_slice(
     size_t mlp_hidden_token_bytes = (size_t)rt->T * rt->mlp_hidden * sizeof(float);
     size_t mlp_hidden_token_f16_bytes = (size_t)rt->T * rt->mlp_hidden * sizeof(uint16_t);
     size_t pass_layer_count = (size_t)rt->total_passes * (size_t)rt->layers_to_run;
+    const char *splitk_env = getenv("WORLD_VULKAN_SPLITK_ATTENTION");
+    int splitk_env_enabled = splitk_env &&
+        (strcmp(splitk_env, "1") == 0 || strcmp(splitk_env, "64") == 0 || strcmp(splitk_env, "96") == 0);
+    uint32_t splitk96_shared_bytes = 96u * 64u * 2u * (uint32_t)sizeof(float);
+    uint32_t splitk_block = 64u;
+    if (splitk_env && strcmp(splitk_env, "96") == 0) {
+        splitk_block = 96u;
+    } else if (splitk_env && strcmp(splitk_env, "1") == 0 &&
+            rt->max_compute_shared_memory_size >= splitk96_shared_bytes) {
+        splitk_block = 96u;
+    }
     int max_cache_capacity = 0;
     if (rt->cache_capacities) {
         for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
@@ -3020,9 +3032,11 @@ static int create_runtime_model_slice(
             }
         }
     }
-    size_t splitk_tiles_max = max_cache_capacity > 0 ? (size_t)((max_cache_capacity + 63) / 64) : 0;
+    size_t splitk_tiles_max = max_cache_capacity > 0 ?
+        (size_t)(((uint32_t)max_cache_capacity + splitk_block - 1u) / splitk_block) : 0;
     size_t attn_splitk_partial_bytes = splitk_tiles_max *
         (size_t)rt->T * (size_t)rt->cfg.n_heads * 66u * sizeof(float);
+    uint32_t splitk_shared_bytes = splitk_block * 64u * 2u * (uint32_t)sizeof(float);
 
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
@@ -3126,12 +3140,12 @@ static int create_runtime_model_slice(
         if (create_host_buffer(rt, inv_t_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                     &rt->inv_t_buffer, &rt->inv_t_memory, &rt->inv_t_mapped)) return 1;
         if (rt->layer_attention_enabled) {
-            const char *splitk_env = getenv("WORLD_VULKAN_SPLITK_ATTENTION");
             int splitk_requested =
-                splitk_env && splitk_env[0] == '1' &&
+                splitk_env_enabled &&
                 rt->d_head == 64 &&
                 rt->max_compute_work_group_invocations >= 768u &&
                 rt->max_compute_work_group_size_x >= 768u &&
+                rt->max_compute_shared_memory_size >= splitk_shared_bytes &&
                 attn_splitk_partial_bytes > 0;
             rt->kv_upsert_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
             rt->kv_upsert_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
@@ -3748,11 +3762,14 @@ static int create_runtime_model_slice(
                             &rt->runtime_indexed_attention_d64_pipeline_layout,
                             &rt->runtime_indexed_attention_d64_pipeline)) return 1;
                 {
-                    const char *splitk_env = getenv("WORLD_VULKAN_SPLITK_ATTENTION");
-                    if (splitk_env && splitk_env[0] == '1') {
+                    if (splitk_env_enabled) {
                         if (rt->max_compute_work_group_invocations >= 768u &&
-                                rt->max_compute_work_group_size_x >= 768u) {
-                            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_f32.comp",
+                                rt->max_compute_work_group_size_x >= 768u &&
+                                rt->max_compute_shared_memory_size >= splitk_shared_bytes) {
+                            const char *splitk_shader = splitk_block == 96u ?
+                                "indexed_attention_d64_splitk96_part_f32.comp" :
+                                "indexed_attention_d64_splitk64_part_f32.comp";
+                            if (create_storage_pipeline_with_set_layout(rt, splitk_shader,
                                         rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                                         &rt->runtime_indexed_attention_d64_splitk_part_shader,
                                         &rt->runtime_indexed_attention_d64_splitk_part_pipeline_layout,
@@ -3764,12 +3781,16 @@ static int create_runtime_model_slice(
                                         &rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout,
                                         &rt->runtime_indexed_attention_d64_splitk_reduce_pipeline)) return 1;
                             rt->runtime_indexed_attention_d64_splitk_enabled = 1;
-                            fprintf(stderr, "Vulkan d64 split-K block-tiled attention enabled (WORLD_VULKAN_SPLITK_ATTENTION=1)\n");
+                            rt->runtime_indexed_attention_d64_splitk_block = splitk_block;
+                            fprintf(stderr, "Vulkan d64 split-K%u block-tiled attention enabled (WORLD_VULKAN_SPLITK_ATTENTION=%u)\n",
+                                    splitk_block, splitk_block);
                         } else {
                             fprintf(stderr,
-                                    "warning: WORLD_VULKAN_SPLITK_ATTENTION=1 ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u need=768\n",
+                                    "warning: WORLD_VULKAN_SPLITK_ATTENTION ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u maxComputeSharedMemorySize=%u need_invocations=768 need_shared=%u\n",
                                     rt->max_compute_work_group_invocations,
-                                    rt->max_compute_work_group_size_x);
+                                    rt->max_compute_work_group_size_x,
+                                    rt->max_compute_shared_memory_size,
+                                    splitk_shared_bytes);
                         }
                     }
                 }
@@ -5091,7 +5112,9 @@ static int record_runtime_model_slice(
                     uint32_t q_per_h = 24u / group;
                     if (q_per_h == 0u) q_per_h = 1u;
                     uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
-                    uint32_t k_tiles = ((uint32_t)cache_capacity + 63u) / 64u;
+                    uint32_t splitk_block = rt->runtime_indexed_attention_d64_splitk_block ?
+                        rt->runtime_indexed_attention_d64_splitk_block : 64u;
+                    uint32_t k_tiles = ((uint32_t)cache_capacity + splitk_block - 1u) / splitk_block;
                     WorldVulkanIndexedAttentionPush split_push = attn_push;
                     split_push.Nkv = k_tiles;
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -5102,7 +5125,8 @@ static int record_runtime_model_slice(
                     vkCmdPushConstants(rt->command_buffer,
                             rt->runtime_indexed_attention_d64_splitk_part_pipeline_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(split_push), &split_push);
-                    PROFILE_DISPATCH("attention.d64_splitk64.part",
+                    PROFILE_DISPATCH(splitk_block == 96u ?
+                            "attention.d64_splitk96.part" : "attention.d64_splitk64.part",
                             (uint32_t)rt->cfg.n_kv_heads * q_blocks * k_tiles,
                             1, 1);
                     cmd_shader_barrier(rt->command_buffer);
@@ -5115,7 +5139,8 @@ static int record_runtime_model_slice(
                     vkCmdPushConstants(rt->command_buffer,
                             rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(split_push), &split_push);
-                    PROFILE_DISPATCH("attention.d64_splitk64.reduce",
+                    PROFILE_DISPATCH(splitk_block == 96u ?
+                            "attention.d64_splitk96.reduce" : "attention.d64_splitk64.reduce",
                             (uint32_t)(rt->T * rt->cfg.n_heads),
                             1, 1);
                     cmd_shader_barrier(rt->command_buffer);
@@ -10702,6 +10727,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkDescriptorSetLayout splitk_part_set_layout = VK_NULL_HANDLE;
     VkPipelineLayout splitk_part_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline splitk_part_pipeline = VK_NULL_HANDLE;
+    VkShaderModule splitk96_part_shader = VK_NULL_HANDLE;
+    VkPipelineLayout splitk96_part_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline splitk96_part_pipeline = VK_NULL_HANDLE;
     VkShaderModule splitk_reduce_shader = VK_NULL_HANDLE;
     VkDescriptorSetLayout splitk_reduce_set_layout = VK_NULL_HANDLE;
     VkPipelineLayout splitk_reduce_pipeline_layout = VK_NULL_HANDLE;
@@ -10795,6 +10823,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_f32.comp",
                 set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                 &splitk_part_shader, &splitk_part_pipeline_layout, &splitk_part_pipeline)) goto cleanup;
+    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk96_part_f32.comp",
+                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                &splitk96_part_shader, &splitk96_part_pipeline_layout, &splitk96_part_pipeline)) goto cleanup;
     VkBuffer splitk_part_buffers[6] = {q_buffer, k_buffer, v_buffer, indices_buffer, splitk_partial_buffer, count_buffer};
     VkDeviceSize splitk_part_sizes[6] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, splitk_partial_bytes, count_bytes};
     if (create_storage_descriptor_set(rt, set_layout, 6, splitk_part_buffers, splitk_part_sizes, NULL,
@@ -10885,6 +10916,23 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                     splitk_reduce_descriptor_set, &split_push, sizeof(split_push),
                     B * Tq * Hq, 1, 1)) goto cleanup;
         CHECK_INDEXED_ATTENTION("indexed_attention_d64_splitk64_f32", 0);
+    }
+
+    {
+        memset(out, 0, q_bytes);
+        memset(splitk_partial_mapped, 0, splitk_partial_bytes);
+        WorldVulkanIndexedAttentionPush split_push = push;
+        split_push.Nkv = (uint32_t)((Nkv + 95) / 96);
+        int split_q_per_h = 24 / group;
+        if (split_q_per_h < 1) split_q_per_h = 1;
+        int split_q_blocks = (Tq + split_q_per_h - 1) / split_q_per_h;
+        if (submit_compute(rt, splitk96_part_pipeline, splitk96_part_pipeline_layout,
+                    splitk_part_descriptor_set, &split_push, sizeof(split_push),
+                    B * Hkv * split_q_blocks * (int)split_push.Nkv, 1, 1)) goto cleanup;
+        if (submit_compute(rt, splitk_reduce_pipeline, splitk_reduce_pipeline_layout,
+                    splitk_reduce_descriptor_set, &split_push, sizeof(split_push),
+                    B * Tq * Hq, 1, 1)) goto cleanup;
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_splitk96_f32", 0);
     }
 
     memset(out, 0, q_bytes);
@@ -11025,6 +11073,9 @@ cleanup:
     if (splitk_part_descriptor_pool) vkDestroyDescriptorPool(rt->device, splitk_part_descriptor_pool, NULL);
     if (splitk_part_set_layout) vkDestroyDescriptorSetLayout(rt->device, splitk_part_set_layout, NULL);
     if (splitk_part_shader) vkDestroyShaderModule(rt->device, splitk_part_shader, NULL);
+    if (splitk96_part_pipeline) vkDestroyPipeline(rt->device, splitk96_part_pipeline, NULL);
+    if (splitk96_part_pipeline_layout) vkDestroyPipelineLayout(rt->device, splitk96_part_pipeline_layout, NULL);
+    if (splitk96_part_shader) vkDestroyShaderModule(rt->device, splitk96_part_shader, NULL);
     if (d64_pipeline) vkDestroyPipeline(rt->device, d64_pipeline, NULL);
     if (d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, d64_pipeline_layout, NULL);
     if (d64_shader) vkDestroyShaderModule(rt->device, d64_shader, NULL);

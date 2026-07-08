@@ -105,6 +105,7 @@ if(WORLD_ENABLE_VULKAN)
     indexed_attention_d64_flash_kvf16_f32.comp
     indexed_attention_d64_flash_f32.comp
     indexed_attention_d64_splitk64_part_f32.comp
+    indexed_attention_d64_splitk96_part_f32.comp
     indexed_attention_d64_splitk64_reduce_f32.comp
     indexed_attention_d64_warp_f32.comp
     indexed_attention_f32.comp
