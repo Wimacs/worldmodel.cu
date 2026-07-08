@@ -6,7 +6,9 @@ int world_vulkan_linear_f32_probe(void);
 int world_vulkan_linear_f16_coopmat_probe(void);
 int world_vulkan_linear_f32_coopmat_probe(void);
 int world_vulkan_linear_f32_wf16_coopmat_probe(void);
+int world_vulkan_linear_f16x_wf16_coopmat_probe(void);
 int world_vulkan_silu_f32_probe(void);
+int world_vulkan_silu_f32_to_f16_probe(void);
 int world_vulkan_add_bias_silu_f32_probe(void);
 int world_vulkan_add_channel_silu_f32_probe(void);
 int world_vulkan_add_f32_probe(void);
@@ -50,11 +52,21 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_linear_f32_wf16_coopmat_probe: ok\n");
+    if (world_vulkan_linear_f16x_wf16_coopmat_probe()) {
+        fprintf(stderr, "world_vulkan_linear_f16x_wf16_coopmat_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_linear_f16x_wf16_coopmat_probe: ok\n");
     if (world_vulkan_silu_f32_probe()) {
         fprintf(stderr, "world_vulkan_silu_f32_probe: failed\n");
         return 1;
     }
     fprintf(stderr, "world_vulkan_silu_f32_probe: ok\n");
+    if (world_vulkan_silu_f32_to_f16_probe()) {
+        fprintf(stderr, "world_vulkan_silu_f32_to_f16_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_silu_f32_to_f16_probe: ok\n");
     if (world_vulkan_add_bias_silu_f32_probe()) {
         fprintf(stderr, "world_vulkan_add_bias_silu_f32_probe: failed\n");
         return 1;
@@ -120,6 +132,11 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_qkv_rms_rope_f32_probe: ok\n");
+    if (world_vulkan_indexed_attention_f32_probe()) {
+        fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: ok\n");
     if (world_vulkan_runtime_layer0_qkv_f32_probe()) {
         fprintf(stderr, "world_vulkan_runtime_layer0_qkv_f32_probe: failed\n");
         return 1;
@@ -155,10 +172,5 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_unpatchify_f32_probe: ok\n");
-    if (world_vulkan_indexed_attention_f32_probe()) {
-        fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: failed\n");
-        return 1;
-    }
-    fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: ok\n");
     return 0;
 }

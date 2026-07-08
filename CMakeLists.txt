@@ -106,6 +106,7 @@ if(WORLD_ENABLE_VULKAN)
     kv_cache_upsert_copy_f32.comp
     lerp_inplace_f32.comp
     linear_f16_coopmat.comp
+    linear_f16x_wf16_coopmat.comp
     linear_f32_coopmat.comp
     linear_f32_wf16_coopmat.comp
     linear_f32_wf16_coopmat_n16.comp
@@ -118,6 +119,7 @@ if(WORLD_ENABLE_VULKAN)
     patchify_f32.comp
     qkv_rms_rope_f32.comp
     rms_norm_f32.comp
+    silu_f32_to_f16.comp
     silu_f32.comp
     taehv_add_relu_f32.comp
     taehv_concat_past_nchw_f32.comp
