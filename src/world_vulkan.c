@@ -196,6 +196,7 @@ struct WorldVulkanRuntime {
     int height;
     int frames;
     int frame_ordinal;
+    int layers_to_run;
     int steps_to_run;
     int total_passes;
     unsigned int seed;
@@ -216,6 +217,7 @@ struct WorldVulkanRuntime {
     float rms_eps;
     int ctrl_embedding_enabled;
     int denoise_out_norm_enabled;
+    int layer_mod_enabled;
     VkShaderModule runtime_linear_shader;
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
@@ -224,6 +226,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_silu_set_layout;
     VkPipelineLayout runtime_silu_pipeline_layout;
     VkPipeline runtime_silu_pipeline;
+    VkShaderModule runtime_add_bias_silu_shader;
+    VkDescriptorSetLayout runtime_add_bias_silu_set_layout;
+    VkPipelineLayout runtime_add_bias_silu_pipeline_layout;
+    VkPipeline runtime_add_bias_silu_pipeline;
     VkShaderModule runtime_rms_shader;
     VkDescriptorSetLayout runtime_rms_set_layout;
     VkPipelineLayout runtime_rms_pipeline_layout;
@@ -246,6 +252,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSet denoise_cond_silu_descriptor_set;
     VkDescriptorPool out_norm_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
     VkDescriptorSet out_norm_descriptor_set[WORLD_VULKAN_MAX_PASSES];
+    VkDescriptorPool *layer_bias_silu_descriptor_pools;
+    VkDescriptorSet *layer_bias_silu_descriptor_sets;
+    VkDescriptorPool *layer_mod_descriptor_pools;
+    VkDescriptorSet *layer_mod_descriptor_sets;
     VkShaderModule patchify_shader;
     VkDescriptorSetLayout patchify_set_layout;
     VkPipelineLayout patchify_pipeline_layout;
@@ -315,6 +325,15 @@ struct WorldVulkanRuntime {
     VkBuffer out_mod_table_buffer;
     VkDeviceMemory out_mod_table_memory;
     void *out_mod_table_mapped;
+    VkBuffer layer_cond_bias_buffer;
+    VkDeviceMemory layer_cond_bias_memory;
+    void *layer_cond_bias_mapped;
+    VkBuffer layer_cond_proj_weight_buffer;
+    VkDeviceMemory layer_cond_proj_weight_memory;
+    void *layer_cond_proj_weight_mapped;
+    VkBuffer layer_mod_table_buffer;
+    VkDeviceMemory layer_mod_table_memory;
+    void *layer_mod_table_mapped;
     VkBuffer patch_weight_buffer;
     VkDeviceMemory patch_weight_memory;
     void *patch_weight_mapped;
@@ -871,7 +890,7 @@ static void cmd_shader_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier barrier;
     memset(&barrier, 0, sizeof(barrier));
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -911,6 +930,17 @@ static int precompute_runtime_out_mods(WorldVulkanRuntime *rt) {
     out_push.cols = (uint32_t)(2 * rt->D);
     out_push.inner = (uint32_t)rt->D;
     out_push.has_bias = 0;
+
+    WorldVulkanSiluPush layer_bias_push;
+    memset(&layer_bias_push, 0, sizeof(layer_bias_push));
+    layer_bias_push.n = (uint32_t)rt->D;
+
+    WorldVulkanLinearPush layer_mod_push;
+    memset(&layer_mod_push, 0, sizeof(layer_mod_push));
+    layer_mod_push.rows = 1;
+    layer_mod_push.cols = (uint32_t)(6 * rt->D);
+    layer_mod_push.inner = (uint32_t)rt->D;
+    layer_mod_push.has_bias = 0;
 
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
@@ -963,6 +993,31 @@ static int precompute_runtime_out_mods(WorldVulkanRuntime *rt) {
         vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(out_push), &out_push);
         vkCmdDispatch(rt->command_buffer, ((uint32_t)(2 * rt->D) + 7u) / 8u, 1, 1);
+        cmd_shader_barrier(rt->command_buffer);
+
+        if (rt->layer_mod_enabled) {
+            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                int table_idx = pass_idx * rt->layers_to_run + layer_idx;
+
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_bias_silu_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_add_bias_silu_pipeline_layout, 0, 1,
+                        &rt->layer_bias_silu_descriptor_sets[layer_idx], 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_add_bias_silu_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(layer_bias_push), &layer_bias_push);
+                vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->D + 255u) / 256u, 1, 1);
+                cmd_shader_barrier(rt->command_buffer);
+
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_linear_pipeline_layout, 0, 1,
+                        &rt->layer_mod_descriptor_sets[table_idx], 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(layer_mod_push), &layer_mod_push);
+                vkCmdDispatch(rt->command_buffer, ((uint32_t)(6 * rt->D) + 7u) / 8u, 1, 1);
+                cmd_shader_barrier(rt->command_buffer);
+            }
+        }
 
         VK_CALL_RET(vkEndCommandBuffer(rt->command_buffer));
         VkSubmitInfo submit_info;
@@ -973,8 +1028,9 @@ static int precompute_runtime_out_mods(WorldVulkanRuntime *rt) {
         VK_CALL_RET(vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence));
         VK_CALL_RET(vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX));
     }
-    fprintf(stderr, "Vulkan denoise/out_norm table precomputed: passes=%d values=%d\n",
-            rt->total_passes, rt->total_passes * 2 * rt->D);
+    fprintf(stderr, "Vulkan scheduler conditioning precomputed: passes=%d out_values=%d layer_mod_values=%d\n",
+            rt->total_passes, rt->total_passes * 2 * rt->D,
+            rt->layer_mod_enabled ? rt->total_passes * rt->layers_to_run * 6 * rt->D : 0);
     return 0;
 }
 
@@ -1007,6 +1063,23 @@ static int create_runtime_model_slice(
     rt->latent_elems = (size_t)rt->C * rt->H * rt->W;
     rt->token_elems = (size_t)rt->T * rt->D;
 
+    if (rt->layers_to_run > 0) {
+        if (!weights->layers) return 1;
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            const WorldLayerWeights *lw = &weights->layers[layer_idx];
+            if (!lw->cond_bias ||
+                    !lw->attn_cond_s_weight ||
+                    !lw->attn_cond_b_weight ||
+                    !lw->attn_cond_g_weight ||
+                    !lw->mlp_cond_s_weight ||
+                    !lw->mlp_cond_b_weight ||
+                    !lw->mlp_cond_g_weight) {
+                fprintf(stderr, "missing Vulkan layer modulation weights for layer %d\n", layer_idx);
+                return 1;
+            }
+        }
+    }
+
     size_t latent_bytes = rt->latent_elems * sizeof(float);
     size_t token_bytes = rt->token_elems * sizeof(float);
     size_t patch_weight_bytes = (size_t)rt->D * rt->C * rt->ph * rt->pw * sizeof(float);
@@ -1022,6 +1095,10 @@ static int create_runtime_model_slice(
     size_t out_norm_weight_bytes = (size_t)2 * rt->D * rt->D * sizeof(float);
     size_t out_mod_pass_bytes = (size_t)2 * rt->D * sizeof(float);
     size_t out_mod_table_bytes = (size_t)rt->total_passes * out_mod_pass_bytes;
+    size_t layer_cond_bias_bytes = (size_t)rt->layers_to_run * rt->D * sizeof(float);
+    size_t layer_cond_proj_weight_bytes = (size_t)rt->layers_to_run * 6 * rt->D * rt->D * sizeof(float);
+    size_t layer_mod_pass_layer_bytes = (size_t)6 * rt->D * sizeof(float);
+    size_t layer_mod_table_bytes = (size_t)rt->total_passes * rt->layers_to_run * layer_mod_pass_layer_bytes;
 
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
@@ -1057,6 +1134,20 @@ static int create_runtime_model_slice(
                 &rt->out_norm_weight_buffer, &rt->out_norm_weight_memory, &rt->out_norm_weight_mapped)) return 1;
     if (create_host_buffer(rt, out_mod_table_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->out_mod_table_buffer, &rt->out_mod_table_memory, &rt->out_mod_table_mapped)) return 1;
+    if (rt->layers_to_run > 0) {
+        if (create_host_buffer(rt, layer_cond_bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->layer_cond_bias_buffer, &rt->layer_cond_bias_memory, &rt->layer_cond_bias_mapped)) return 1;
+        if (create_host_buffer(rt, layer_cond_proj_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->layer_cond_proj_weight_buffer, &rt->layer_cond_proj_weight_memory, &rt->layer_cond_proj_weight_mapped)) return 1;
+        if (create_host_buffer(rt, layer_mod_table_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->layer_mod_table_buffer, &rt->layer_mod_table_memory, &rt->layer_mod_table_mapped)) return 1;
+        rt->layer_bias_silu_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+        rt->layer_bias_silu_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+        rt->layer_mod_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorPool));
+        rt->layer_mod_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorSet));
+        if (!rt->layer_bias_silu_descriptor_pools || !rt->layer_bias_silu_descriptor_sets ||
+                !rt->layer_mod_descriptor_pools || !rt->layer_mod_descriptor_sets) return 1;
+    }
     if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->patch_weight_buffer, &rt->patch_weight_memory, &rt->patch_weight_mapped)) return 1;
     if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1090,6 +1181,23 @@ static int create_runtime_model_slice(
     memset(rt->cond_mapped, 0, ctrl_emb_bytes);
     memset(rt->cond_act_mapped, 0, ctrl_emb_bytes);
     memset(rt->out_mod_table_mapped, 0, out_mod_table_bytes);
+    if (rt->layers_to_run > 0) {
+        float *bias_dst = (float *)rt->layer_cond_bias_mapped;
+        float *proj_dst = (float *)rt->layer_cond_proj_weight_mapped;
+        size_t block = (size_t)rt->D * rt->D;
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            const WorldLayerWeights *lw = &weights->layers[layer_idx];
+            memcpy(bias_dst + (size_t)layer_idx * rt->D, lw->cond_bias, (size_t)rt->D * sizeof(float));
+            float *dst = proj_dst + (size_t)layer_idx * 6 * block;
+            memcpy(dst + 0 * block, lw->attn_cond_s_weight, block * sizeof(float));
+            memcpy(dst + 1 * block, lw->attn_cond_b_weight, block * sizeof(float));
+            memcpy(dst + 2 * block, lw->attn_cond_g_weight, block * sizeof(float));
+            memcpy(dst + 3 * block, lw->mlp_cond_s_weight, block * sizeof(float));
+            memcpy(dst + 4 * block, lw->mlp_cond_b_weight, block * sizeof(float));
+            memcpy(dst + 5 * block, lw->mlp_cond_g_weight, block * sizeof(float));
+        }
+        memset(rt->layer_mod_table_mapped, 0, layer_mod_table_bytes);
+    }
     memset(rt->tokens_mapped, 0, token_bytes);
     memset(rt->latent_out_mapped, 0, latent_bytes);
 
@@ -1099,6 +1207,11 @@ static int create_runtime_model_slice(
     if (create_storage_pipeline(rt, "silu_f32.comp", 2, sizeof(WorldVulkanSiluPush),
                 &rt->runtime_silu_shader, &rt->runtime_silu_set_layout,
                 &rt->runtime_silu_pipeline_layout, &rt->runtime_silu_pipeline)) return 1;
+    if (rt->layers_to_run > 0) {
+        if (create_storage_pipeline(rt, "add_bias_silu_f32.comp", 3, sizeof(WorldVulkanSiluPush),
+                    &rt->runtime_add_bias_silu_shader, &rt->runtime_add_bias_silu_set_layout,
+                    &rt->runtime_add_bias_silu_pipeline_layout, &rt->runtime_add_bias_silu_pipeline)) return 1;
+    }
     if (create_storage_pipeline(rt, "rms_norm_f32.comp", 3, sizeof(WorldVulkanRmsNormPush),
                 &rt->runtime_rms_shader, &rt->runtime_rms_set_layout,
                 &rt->runtime_rms_pipeline_layout, &rt->runtime_rms_pipeline)) return 1;
@@ -1177,6 +1290,37 @@ static int create_runtime_model_slice(
         if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
                     &rt->out_norm_descriptor_pool[pass_idx], &rt->out_norm_descriptor_set[pass_idx])) return 1;
     }
+    if (rt->layers_to_run > 0) {
+        size_t layer_bias_bytes = (size_t)rt->D * sizeof(float);
+        size_t layer_weight_bytes = (size_t)6 * rt->D * rt->D * sizeof(float);
+        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+            VkBuffer buffers[3] = {rt->cond_buffer, rt->layer_cond_bias_buffer, rt->cond_act_buffer};
+            VkDeviceSize sizes[3] = {ctrl_emb_bytes, layer_bias_bytes, ctrl_emb_bytes};
+            VkDeviceSize offsets[3] = {0, (VkDeviceSize)((size_t)layer_idx * layer_bias_bytes), 0};
+            if (create_storage_descriptor_set(rt, rt->runtime_add_bias_silu_set_layout, 3, buffers, sizes, offsets,
+                        &rt->layer_bias_silu_descriptor_pools[layer_idx],
+                        &rt->layer_bias_silu_descriptor_sets[layer_idx])) return 1;
+        }
+        for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
+            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                int table_idx = pass_idx * rt->layers_to_run + layer_idx;
+                VkBuffer buffers[4] = {
+                    rt->cond_act_buffer, rt->layer_cond_proj_weight_buffer,
+                    rt->dummy_bias_buffer, rt->layer_mod_table_buffer
+                };
+                VkDeviceSize sizes[4] = {ctrl_emb_bytes, layer_weight_bytes, sizeof(float), layer_mod_pass_layer_bytes};
+                VkDeviceSize offsets[4] = {
+                    0,
+                    (VkDeviceSize)((size_t)layer_idx * layer_weight_bytes),
+                    0,
+                    (VkDeviceSize)((size_t)table_idx * layer_mod_pass_layer_bytes)
+                };
+                if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
+                            &rt->layer_mod_descriptor_pools[table_idx],
+                            &rt->layer_mod_descriptor_sets[table_idx])) return 1;
+            }
+        }
+    }
     {
         VkBuffer buffers[3] = {rt->latent_buffer, rt->patch_weight_buffer, rt->tokens_buffer};
         VkDeviceSize sizes[3] = {latent_bytes, patch_weight_bytes, token_bytes};
@@ -1200,11 +1344,13 @@ static int create_runtime_model_slice(
 
     rt->ctrl_embedding_enabled = 1;
     rt->denoise_out_norm_enabled = 1;
+    rt->layer_mod_enabled = rt->layers_to_run > 0;
     if (precompute_runtime_out_mods(rt)) return 1;
     rt->model_slice_enabled = 1;
     fprintf(stderr,
-            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
-            rt->C, rt->H, rt->W, rt->T, rt->D, rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
+            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
+            rt->C, rt->H, rt->W, rt->T, rt->D, rt->layers_to_run,
+            rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
             (double)latent_bytes / (1024.0 * 1024.0));
     return 0;
 }
@@ -1347,7 +1493,6 @@ int world_vulkan_runtime_create(
         unsigned int seed,
         int noise_mode,
         const WorldVaeDecoderWeights *vae) {
-    (void)layers_to_run;
     (void)noise_mode;
     (void)vae;
     if (!out || !cfg) return 1;
@@ -1361,6 +1506,16 @@ int world_vulkan_runtime_create(
     rt->frames = 4;
     rt->frame_ordinal = frame_idx;
     rt->seed = seed;
+    if (weights && weights->layers && layers_to_run > 0 && layers_to_run <= weights->n_layers) {
+        rt->layers_to_run = layers_to_run;
+    } else {
+        rt->layers_to_run = 0;
+        if (layers_to_run > 0) {
+            fprintf(stderr,
+                    "warning: Vulkan layer modulation disabled for layers_to_run=%d n_layers=%d\n",
+                    layers_to_run, weights ? weights->n_layers : 0);
+        }
+    }
     {
         int max_steps = cfg->scheduler_sigmas_count > 1 ? cfg->scheduler_sigmas_count - 1 : 1;
         rt->steps_to_run = (steps_to_run > 0 && steps_to_run <= max_steps) ? steps_to_run : max_steps;
@@ -1857,6 +2012,88 @@ cleanup:
     return rc;
 }
 
+int world_vulkan_add_bias_silu_f32_probe(void) {
+    enum { n = 4099 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer b_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory b_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *b_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t bytes = (size_t)n * sizeof(float);
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+    float *x = (float *)x_mapped;
+    float *b = (float *)b_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < n; ++i) {
+        x[i] = probe_value(i + 41, 0.09375f);
+        b[i] = probe_value(i + 73, 0.0625f);
+    }
+    memset(y, 0, bytes);
+
+    if (create_storage_pipeline(rt, "add_bias_silu_f32.comp", 3, sizeof(WorldVulkanSiluPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {x_buffer, b_buffer, y_buffer};
+    VkDeviceSize sizes[3] = {bytes, bytes, bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanSiluPush push;
+    push.n = n;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (n + 255u) / 256u, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float v = x[i] + b[i];
+        float ref = v / (1.0f + expf(-v));
+        float diff = fabsf(y[i] - ref);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
+    }
+    mean_abs /= (float)n;
+    fprintf(stderr, "vulkan add_bias_silu_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 2.0e-6f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
 int world_vulkan_rms_norm_f32_probe(void) {
     enum { rows = 5, cols = 257 };
     const float eps = 1.0e-6f;
@@ -2175,6 +2412,7 @@ cleanup:
 
 int world_vulkan_denoise_out_norm_f32_probe(void) {
     enum { C = 2, D = 16, mlp_ratio = 2, hidden = D * mlp_ratio, n_buttons = 6, ctrl_dim = n_buttons + 3 };
+    enum { layer_count = 2 };
     enum { steps_to_run = 2, total_passes = steps_to_run + 1 };
     int rc = 1;
     WorldConfig cfg;
@@ -2201,19 +2439,26 @@ int world_vulkan_denoise_out_norm_f32_probe(void) {
     size_t denoise_fc1_elems = (size_t)hidden * 512u;
     size_t denoise_fc2_elems = (size_t)D * hidden;
     size_t out_norm_elems = (size_t)2 * D * D;
+    size_t layer_bias_elems = (size_t)layer_count * D;
+    size_t layer_proj_elems = (size_t)layer_count * 6 * D * D;
     float *patch = NULL;
     float *ctrl_fc1 = NULL;
     float *ctrl_fc2 = NULL;
     float *denoise_fc1 = NULL;
     float *denoise_fc2 = NULL;
     float *out_norm = NULL;
+    float *layer_bias_storage = NULL;
+    float *layer_proj_storage = NULL;
     float *unpatch = NULL;
     float *unpatch_bias = NULL;
     float *noise = NULL;
     float *hidden_ref = NULL;
     float *cond = NULL;
     float *cond_act = NULL;
+    float *layer_cond_act = NULL;
+    WorldLayerWeights layers[layer_count];
     WorldVulkanRuntime *rt = NULL;
+    memset(layers, 0, sizeof(layers));
 
     patch = (float *)malloc(patch_elems * sizeof(float));
     ctrl_fc1 = (float *)malloc(ctrl_fc1_elems * sizeof(float));
@@ -2221,14 +2466,18 @@ int world_vulkan_denoise_out_norm_f32_probe(void) {
     denoise_fc1 = (float *)malloc(denoise_fc1_elems * sizeof(float));
     denoise_fc2 = (float *)malloc(denoise_fc2_elems * sizeof(float));
     out_norm = (float *)malloc(out_norm_elems * sizeof(float));
+    layer_bias_storage = (float *)malloc(layer_bias_elems * sizeof(float));
+    layer_proj_storage = (float *)malloc(layer_proj_elems * sizeof(float));
     unpatch = (float *)malloc(patch_elems * sizeof(float));
     unpatch_bias = (float *)malloc((size_t)C * sizeof(float));
     noise = (float *)malloc(512u * sizeof(float));
     hidden_ref = (float *)malloc((size_t)hidden * sizeof(float));
     cond = (float *)malloc((size_t)D * sizeof(float));
     cond_act = (float *)malloc((size_t)D * sizeof(float));
+    layer_cond_act = (float *)malloc((size_t)D * sizeof(float));
     if (!patch || !ctrl_fc1 || !ctrl_fc2 || !denoise_fc1 || !denoise_fc2 || !out_norm ||
-            !unpatch || !unpatch_bias || !noise || !hidden_ref || !cond || !cond_act) {
+            !layer_bias_storage || !layer_proj_storage || !unpatch || !unpatch_bias || !noise ||
+            !hidden_ref || !cond || !cond_act || !layer_cond_act) {
         goto cleanup;
     }
 
@@ -2242,6 +2491,22 @@ int world_vulkan_denoise_out_norm_f32_probe(void) {
     for (size_t i = 0; i < denoise_fc1_elems; ++i) denoise_fc1[i] = probe_value((int)i + 809, 0.005859375f);
     for (size_t i = 0; i < denoise_fc2_elems; ++i) denoise_fc2[i] = probe_value((int)i + 907, 0.0078125f);
     for (size_t i = 0; i < out_norm_elems; ++i) out_norm[i] = probe_value((int)i + 1009, 0.009765625f);
+    for (size_t i = 0; i < layer_bias_elems; ++i) {
+        layer_bias_storage[i] = probe_value((int)i + 1103, 0.03125f);
+    }
+    for (size_t i = 0; i < layer_proj_elems; ++i) {
+        layer_proj_storage[i] = probe_value((int)i + 1201, 0.0048828125f);
+    }
+    for (int layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+        float *base = layer_proj_storage + (size_t)layer_idx * 6 * D * D;
+        layers[layer_idx].cond_bias = layer_bias_storage + (size_t)layer_idx * D;
+        layers[layer_idx].attn_cond_s_weight = base + 0 * D * D;
+        layers[layer_idx].attn_cond_b_weight = base + 1 * D * D;
+        layers[layer_idx].attn_cond_g_weight = base + 2 * D * D;
+        layers[layer_idx].mlp_cond_s_weight = base + 3 * D * D;
+        layers[layer_idx].mlp_cond_b_weight = base + 4 * D * D;
+        layers[layer_idx].mlp_cond_g_weight = base + 5 * D * D;
+    }
 
     WorldModelProbeWeights weights;
     memset(&weights, 0, sizeof(weights));
@@ -2250,17 +2515,22 @@ int world_vulkan_denoise_out_norm_f32_probe(void) {
     weights.denoise_fc2_weight = denoise_fc2;
     weights.ctrl_emb_fc1_weight = ctrl_fc1;
     weights.ctrl_emb_fc2_weight = ctrl_fc2;
+    weights.layers = layers;
+    weights.n_layers = layer_count;
     weights.out_norm_fc_weight = out_norm;
     weights.unpatchify_weight = unpatch;
     weights.unpatchify_bias = unpatch_bias;
 
-    if (world_vulkan_runtime_create(&rt, &cfg, &weights, 0, steps_to_run, 0, 1234, WORLD_NOISE_NORMAL, NULL)) {
+    if (world_vulkan_runtime_create(&rt, &cfg, &weights, layer_count, steps_to_run, 0, 1234, WORLD_NOISE_NORMAL, NULL)) {
         goto cleanup;
     }
 
     float max_abs = 0.0f;
     float mean_abs = 0.0f;
+    float layer_max_abs = 0.0f;
+    float layer_mean_abs = 0.0f;
     const float *got = (const float *)rt->out_mod_table_mapped;
+    const float *layer_got = (const float *)rt->layer_mod_table_mapped;
     for (int pass_idx = 0; pass_idx < total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= steps_to_run;
         float sigma = is_cache_pass ? 0.0f : cfg.scheduler_sigmas[pass_idx];
@@ -2289,10 +2559,31 @@ int world_vulkan_denoise_out_norm_f32_probe(void) {
             if (diff > max_abs) max_abs = diff;
             mean_abs += diff;
         }
+        for (int layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+            const float *bias = layer_bias_storage + (size_t)layer_idx * D;
+            const float *proj = layer_proj_storage + (size_t)layer_idx * 6 * D * D;
+            for (int d = 0; d < D; ++d) {
+                float v = cond[d] + bias[d];
+                layer_cond_act[d] = v / (1.0f + expf(-v));
+            }
+            for (int o = 0; o < 6 * D; ++o) {
+                float ref = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    ref += layer_cond_act[d] * proj[(size_t)o * D + d];
+                }
+                size_t got_idx = ((size_t)pass_idx * layer_count + layer_idx) * 6 * D + o;
+                float diff = fabsf(layer_got[got_idx] - ref);
+                if (diff > layer_max_abs) layer_max_abs = diff;
+                layer_mean_abs += diff;
+            }
+        }
     }
     mean_abs /= (float)(total_passes * 2 * D);
+    layer_mean_abs /= (float)(total_passes * layer_count * 6 * D);
     fprintf(stderr, "vulkan denoise_out_norm_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    fprintf(stderr, "vulkan layer_mod_f32 probe: max_abs=%g mean_abs=%g\n", layer_max_abs, layer_mean_abs);
     if (max_abs > 8.0e-5f) goto cleanup;
+    if (layer_max_abs > 1.0e-4f) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -2303,12 +2594,15 @@ cleanup:
     free(denoise_fc1);
     free(denoise_fc2);
     free(out_norm);
+    free(layer_bias_storage);
+    free(layer_proj_storage);
     free(unpatch);
     free(unpatch_bias);
     free(noise);
     free(hidden_ref);
     free(cond);
     free(cond_act);
+    free(layer_cond_act);
     return rc;
 }
 
@@ -3609,26 +3903,44 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     for (int i = 0; i < WORLD_VULKAN_MAX_PASSES; ++i) {
         if (rt->out_norm_descriptor_pool[i]) vkDestroyDescriptorPool(rt->device, rt->out_norm_descriptor_pool[i], NULL);
     }
+    if (rt->layer_bias_silu_descriptor_pools) {
+        for (int i = 0; i < rt->layers_to_run; ++i) {
+            if (rt->layer_bias_silu_descriptor_pools[i]) {
+                vkDestroyDescriptorPool(rt->device, rt->layer_bias_silu_descriptor_pools[i], NULL);
+            }
+        }
+    }
+    if (rt->layer_mod_descriptor_pools) {
+        for (int i = 0; i < rt->total_passes * rt->layers_to_run; ++i) {
+            if (rt->layer_mod_descriptor_pools[i]) {
+                vkDestroyDescriptorPool(rt->device, rt->layer_mod_descriptor_pools[i], NULL);
+            }
+        }
+    }
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
+    if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
     if (rt->runtime_rms_pipeline) vkDestroyPipeline(rt->device, rt->runtime_rms_pipeline, NULL);
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
     if (rt->runtime_linear_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
+    if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
     if (rt->runtime_rms_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_rms_pipeline_layout, NULL);
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
     if (rt->runtime_linear_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_linear_set_layout, NULL);
     if (rt->runtime_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_silu_set_layout, NULL);
+    if (rt->runtime_add_bias_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_bias_silu_set_layout, NULL);
     if (rt->runtime_rms_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_rms_set_layout, NULL);
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
     if (rt->runtime_linear_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
+    if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
     if (rt->runtime_rms_shader) vkDestroyShaderModule(rt->device, rt->runtime_rms_shader, NULL);
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
@@ -3650,6 +3962,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->cond_act_buffer, rt->cond_act_memory, rt->cond_act_mapped);
     destroy_host_buffer(rt, rt->out_norm_weight_buffer, rt->out_norm_weight_memory, rt->out_norm_weight_mapped);
     destroy_host_buffer(rt, rt->out_mod_table_buffer, rt->out_mod_table_memory, rt->out_mod_table_mapped);
+    destroy_host_buffer(rt, rt->layer_cond_bias_buffer, rt->layer_cond_bias_memory, rt->layer_cond_bias_mapped);
+    destroy_host_buffer(rt, rt->layer_cond_proj_weight_buffer, rt->layer_cond_proj_weight_memory, rt->layer_cond_proj_weight_mapped);
+    destroy_host_buffer(rt, rt->layer_mod_table_buffer, rt->layer_mod_table_memory, rt->layer_mod_table_mapped);
     destroy_host_buffer(rt, rt->patch_weight_buffer, rt->patch_weight_memory, rt->patch_weight_mapped);
     destroy_host_buffer(rt, rt->tokens_buffer, rt->tokens_memory, rt->tokens_mapped);
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
@@ -3668,5 +3983,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->device) vkDestroyDevice(rt->device, NULL);
     if (rt->instance) vkDestroyInstance(rt->instance, NULL);
     free(rt->rgb_host);
+    free(rt->layer_bias_silu_descriptor_pools);
+    free(rt->layer_bias_silu_descriptor_sets);
+    free(rt->layer_mod_descriptor_pools);
+    free(rt->layer_mod_descriptor_sets);
     free(rt);
 }

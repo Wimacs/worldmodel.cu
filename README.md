@@ -59,15 +59,17 @@ path now runs a resident latent visualization slice every frame:
 rms_norm_f32.comp`, followed by
 `patchify_f32.comp -> unpatchify_orig_f32.comp -> latent_to_rgba.comp`.
 At initialization it also precomputes the CUDA-style scheduler conditioning path
-`noise_embed -> denoise MLP -> out_norm modulation table` for all requested
-scheduler passes. This wires the loaded control embedding, denoise/out-norm,
-and patch/unpatch weights into the interactive runtime while the full
-transformer/VAE port is still in progress. Without weights, it falls back to
-the simple `fill_rgba.comp` scaffold for lightweight probes.
+`noise_embed -> denoise MLP -> out_norm modulation table`, plus per-layer
+`cond + bias -> silu -> 6x layer modulation table`, for all requested scheduler
+passes. This wires the loaded control embedding, denoise/out-norm, layer
+conditioning, and patch/unpatch weights into the interactive runtime while the
+full transformer/VAE port is still in progress. Without weights, it falls back
+to the simple `fill_rgba.comp` scaffold for lightweight probes.
 
 `worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
-elementwise `silu_f32.comp`, rowwise `rms_norm_f32.comp`, fused
-control embedding, denoise/out-norm scheduler conditioning,
+elementwise `silu_f32.comp`, fused `add_bias_silu_f32.comp`, rowwise
+`rms_norm_f32.comp`, fused control embedding, denoise/out-norm scheduler conditioning
+and layer modulation precompute,
 `ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused `qkv_rms_rope_f32.comp`,
 `masked_attention_f32.comp`, the KV-cache helpers, `indexed_attention_f32.comp`,
 and the patch/unpatch latent-token boundary.
