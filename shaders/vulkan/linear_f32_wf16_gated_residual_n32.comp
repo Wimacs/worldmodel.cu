@@ -1,0 +1,106 @@
+#version 450
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputX {
+    float x[];
+} in_x;
+
+layout(std430, binding = 1) readonly buffer Weight {
+    float16_t w[];
+} in_w;
+
+layout(std430, binding = 2) readonly buffer Residual {
+    float residual[];
+} in_residual;
+
+layout(std430, binding = 3) readonly buffer Gate {
+    float gate[];
+} in_gate;
+
+layout(std430, binding = 4) buffer OutputY {
+    float y[];
+} out_y;
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint inner;
+    uint has_bias;
+} pc;
+
+shared float16_t tile_a[16 * 16];
+shared float tile_y[16 * 32];
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint row_base = gl_WorkGroupID.y * 16u;
+    uint col_base = gl_WorkGroupID.x * 32u;
+    if (pc.has_bias != 0u ||
+            row_base + 15u >= pc.rows ||
+            col_base + 31u >= pc.cols ||
+            (pc.inner & 15u) != 0u) {
+        return;
+    }
+
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc2 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc3 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < pc.inner; k0 += 16u) {
+        for (uint i = lane; i < 16u * 16u; i += 32u) {
+            uint r = i >> 4u;
+            uint k = i & 15u;
+            tile_a[i] = float16_t(in_x.x[(row_base + r) * pc.inner + k0 + k]);
+        }
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b0;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b1;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b2;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b3;
+        coopMatLoad(a, tile_a, 0u, 16u,
+                gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b0, in_w.w, (col_base + 0u) * pc.inner + k0, pc.inner,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b1, in_w.w, (col_base + 8u) * pc.inner + k0, pc.inner,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b2, in_w.w, (col_base + 16u) * pc.inner + k0, pc.inner,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b3, in_w.w, (col_base + 24u) * pc.inner + k0, pc.inner,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(a, b0, acc0);
+        acc1 = coopMatMulAdd(a, b1, acc1);
+        acc2 = coopMatMulAdd(a, b2, acc2);
+        acc3 = coopMatMulAdd(a, b3, acc3);
+        barrier();
+    }
+
+    coopMatStore(acc0, tile_y, 0u, 32u,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, tile_y, 8u, 32u,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc2, tile_y, 16u, 32u,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc3, tile_y, 24u, 32u,
+            gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    for (uint i = lane; i < 16u * 32u; i += 32u) {
+        uint r = i / 32u;
+        uint c = i - r * 32u;
+        uint out_idx = (row_base + r) * pc.cols + col_base + c;
+        out_y.y[out_idx] = in_residual.residual[out_idx] +
+            tile_y[i] * in_gate.gate[col_base + c];
+    }
+}

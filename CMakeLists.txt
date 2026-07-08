@@ -118,6 +118,7 @@ if(WORLD_ENABLE_VULKAN)
     linear_f32_wf16_coopmat.comp
     linear_f32_wf16_coopmat_n16.comp
     linear_f32_wf16_coopmat_n32.comp
+    linear_f32_wf16_gated_residual_n32.comp
     linear_f32.comp
     linear_f32_tile64.comp
     latent_to_rgba.comp
