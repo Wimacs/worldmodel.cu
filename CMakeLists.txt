@@ -113,6 +113,7 @@ if(WORLD_ENABLE_VULKAN)
     linear_f16_coopmat.comp
     linear_f16x_wf16_coopmat.comp
     linear_f32_coopmat.comp
+    linear_f32_wf16_silu_f16_n32.comp
     linear_f32_wf16_coopmat.comp
     linear_f32_wf16_coopmat_n16.comp
     linear_f32_wf16_coopmat_n32.comp
