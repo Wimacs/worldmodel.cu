@@ -58,7 +58,8 @@ currently runs a CPU parity check for the first model-relevant Vulkan op,
 `linear_f32.comp`, plus elementwise `silu_f32.comp` and rowwise
 `rms_norm_f32.comp`, plus the fused modulation op `ada_rms_norm_f32.comp`.
 It also checks `ortho_rope_f32.comp` against the current WorldModel RoPE
-formula. The actual transformer/VAE runtime kernels are still being ported
+formula, and `qkv_rms_rope_f32.comp` for fused Q/K/V split, Q/K RMSNorm, and
+Q/K RoPE. The actual transformer/VAE runtime kernels are still being ported
 from CUDA.
 
 ```sh

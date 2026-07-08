@@ -95,6 +95,7 @@ if(WORLD_ENABLE_VULKAN)
     fill_rgba.comp
     linear_f32.comp
     ortho_rope_f32.comp
+    qkv_rms_rope_f32.comp
     rms_norm_f32.comp
     silu_f32.comp
   )
