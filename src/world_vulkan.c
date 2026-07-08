@@ -290,6 +290,8 @@ struct WorldVulkanRuntime {
     int storage_16bit_enabled;
     int cooperative_matrix_enabled;
     uint32_t max_compute_shared_memory_size;
+    uint32_t max_compute_work_group_invocations;
+    uint32_t max_compute_work_group_size_x;
     VkQueue queue;
     VkShaderModule fill_shader;
     VkDescriptorSetLayout descriptor_set_layout;
@@ -424,6 +426,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_kv_upsert_set_layout;
     VkPipelineLayout runtime_kv_upsert_pipeline_layout;
     VkPipeline runtime_kv_upsert_pipeline;
+    VkShaderModule runtime_kv_upsert_f16_shader;
+    VkPipelineLayout runtime_kv_upsert_f16_pipeline_layout;
+    VkPipeline runtime_kv_upsert_f16_pipeline;
+    int runtime_kv_cache_f16_enabled;
     VkShaderModule runtime_cache_indices_shader;
     VkDescriptorSetLayout runtime_cache_indices_set_layout;
     VkPipelineLayout runtime_cache_indices_pipeline_layout;
@@ -439,6 +445,13 @@ struct WorldVulkanRuntime {
     VkPipelineLayout runtime_indexed_attention_d64_flash_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash_pipeline;
     int runtime_indexed_attention_d64_flash_enabled;
+    VkShaderModule runtime_indexed_attention_d64_flash32w_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_flash32w_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_flash32w_pipeline;
+    int runtime_indexed_attention_d64_flash32w_enabled;
+    VkShaderModule runtime_indexed_attention_d64_flash_kvf16_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_flash_kvf16_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_flash_kvf16_pipeline;
     VkShaderModule runtime_indexed_attention_d64_flash96_shader;
     VkPipelineLayout runtime_indexed_attention_d64_flash96_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash96_pipeline;
@@ -741,6 +754,10 @@ struct WorldVulkanRuntime {
     VkBuffer cache_v_buffer;
     VkDeviceMemory cache_v_memory;
     void *cache_v_mapped;
+    VkBuffer cache_k_f16_buffer;
+    VkDeviceMemory cache_k_f16_memory;
+    VkBuffer cache_v_f16_buffer;
+    VkDeviceMemory cache_v_f16_memory;
     VkBuffer cache_written_buffer;
     VkDeviceMemory cache_written_memory;
     void *cache_written_mapped;
@@ -979,6 +996,8 @@ static int pick_physical_device(WorldVulkanRuntime *rt) {
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(rt->physical_device, &props);
     rt->max_compute_shared_memory_size = props.limits.maxComputeSharedMemorySize;
+    rt->max_compute_work_group_invocations = props.limits.maxComputeWorkGroupInvocations;
+    rt->max_compute_work_group_size_x = props.limits.maxComputeWorkGroupSize[0];
     fprintf(stderr, "Vulkan device: %s queue_family=%u\n", props.deviceName, rt->queue_family);
     free(devices);
     return 0;
@@ -2856,6 +2875,18 @@ static int create_runtime_model_slice(
             }
         }
     }
+    {
+        const char *kv_f16_env = getenv("WORLD_VULKAN_KV_CACHE_F16");
+        if (kv_f16_env && kv_f16_env[0] == '1') {
+            if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+                rt->runtime_kv_cache_f16_enabled = 1;
+            } else {
+                fprintf(stderr,
+                        "warning: WORLD_VULKAN_KV_CACHE_F16=1 ignored; shaderFloat16=%d storage16=%d\n",
+                        rt->shader_float16_enabled, rt->storage_16bit_enabled);
+            }
+        }
+    }
 
     size_t latent_bytes = rt->latent_elems * sizeof(float);
     size_t token_bytes = rt->token_elems * sizeof(float);
@@ -2887,6 +2918,7 @@ static int create_runtime_model_slice(
     size_t xy_bytes = (size_t)rt->d_xy * sizeof(float);
     size_t inv_t_bytes = (size_t)rt->d_t * sizeof(float);
     size_t cache_kv_bytes = rt->cache_total_kv_elems * sizeof(float);
+    size_t cache_kv_f16_bytes = rt->cache_total_kv_elems * sizeof(uint16_t);
     size_t cache_meta_bytes = rt->cache_total_meta_elems * sizeof(uint32_t);
     size_t cache_count_bytes = (size_t)rt->layers_to_run * sizeof(uint32_t);
     size_t attn_out_proj_weight_layer_bytes = (size_t)rt->D * rt->D * sizeof(float);
@@ -3023,6 +3055,12 @@ static int create_runtime_model_slice(
                         &rt->cache_k_buffer, &rt->cache_k_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_bytes,
                         &rt->cache_v_buffer, &rt->cache_v_memory)) return 1;
+            if (rt->runtime_kv_cache_f16_enabled) {
+                if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_f16_bytes,
+                            &rt->cache_k_f16_buffer, &rt->cache_k_f16_memory)) return 1;
+                if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_f16_bytes,
+                            &rt->cache_v_f16_buffer, &rt->cache_v_f16_memory)) return 1;
+            }
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
                         &rt->cache_written_buffer, &rt->cache_written_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
@@ -3247,6 +3285,10 @@ static int create_runtime_model_slice(
         if (rt->layer_attention_enabled) {
             if (clear_device_buffer(rt, rt->cache_k_buffer, (VkDeviceSize)cache_kv_bytes)) return 1;
             if (clear_device_buffer(rt, rt->cache_v_buffer, (VkDeviceSize)cache_kv_bytes)) return 1;
+            if (rt->cache_k_f16_buffer &&
+                    clear_device_buffer(rt, rt->cache_k_f16_buffer, (VkDeviceSize)cache_kv_f16_bytes)) return 1;
+            if (rt->cache_v_f16_buffer &&
+                    clear_device_buffer(rt, rt->cache_v_f16_buffer, (VkDeviceSize)cache_kv_f16_bytes)) return 1;
             if (clear_device_buffer(rt, rt->cache_indices_buffer, (VkDeviceSize)cache_meta_bytes)) return 1;
             if (clear_device_buffer(rt, rt->cache_index_count_buffer, (VkDeviceSize)cache_count_bytes)) return 1;
             if (clear_device_buffer(rt, rt->attn_buffer, (VkDeviceSize)token_bytes)) return 1;
@@ -3507,6 +3549,13 @@ static int create_runtime_model_slice(
             if (create_storage_pipeline(rt, "kv_cache_upsert_copy_f32.comp", 5, sizeof(WorldVulkanKvCacheUpsertPush),
                         &rt->runtime_kv_upsert_shader, &rt->runtime_kv_upsert_set_layout,
                         &rt->runtime_kv_upsert_pipeline_layout, &rt->runtime_kv_upsert_pipeline)) return 1;
+            if (rt->runtime_kv_cache_f16_enabled) {
+                if (create_storage_pipeline_with_set_layout(rt, "kv_cache_upsert_copy_f16.comp",
+                            rt->runtime_kv_upsert_set_layout, sizeof(WorldVulkanKvCacheUpsertPush),
+                            &rt->runtime_kv_upsert_f16_shader,
+                            &rt->runtime_kv_upsert_f16_pipeline_layout,
+                            &rt->runtime_kv_upsert_f16_pipeline)) return 1;
+            }
             if (create_storage_pipeline(rt, "cache_frame_indices.comp", 3, sizeof(WorldVulkanCacheFrameIndicesPush),
                         &rt->runtime_cache_indices_shader, &rt->runtime_cache_indices_set_layout,
                         &rt->runtime_cache_indices_pipeline_layout, &rt->runtime_cache_indices_pipeline)) return 1;
@@ -3538,6 +3587,26 @@ static int create_runtime_model_slice(
                         }
                     }
                 }
+                {
+                    const char *flash32w_env = getenv("WORLD_VULKAN_FLASH_ATTN32W");
+                    if (flash32w_env && flash32w_env[0] == '1') {
+                        if (rt->max_compute_work_group_invocations >= 1024u &&
+                                rt->max_compute_work_group_size_x >= 1024u) {
+                            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash32w_f32.comp",
+                                        rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                        &rt->runtime_indexed_attention_d64_flash32w_shader,
+                                        &rt->runtime_indexed_attention_d64_flash32w_pipeline_layout,
+                                        &rt->runtime_indexed_attention_d64_flash32w_pipeline)) return 1;
+                            rt->runtime_indexed_attention_d64_flash32w_enabled = 1;
+                            fprintf(stderr, "Vulkan d64 flash32w attention enabled (WORLD_VULKAN_FLASH_ATTN32W=1)\n");
+                        } else {
+                            fprintf(stderr,
+                                    "warning: WORLD_VULKAN_FLASH_ATTN32W=1 ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u need=1024\n",
+                                    rt->max_compute_work_group_invocations,
+                                    rt->max_compute_work_group_size_x);
+                        }
+                    }
+                }
                 const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
                 if (!flash_env || flash_env[0] != '0') {
                     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
@@ -3547,6 +3616,14 @@ static int create_runtime_model_slice(
                                 &rt->runtime_indexed_attention_d64_flash_pipeline)) return 1;
                     rt->runtime_indexed_attention_d64_flash_enabled = 1;
                     fprintf(stderr, "Vulkan d64 flash-style attention enabled; set WORLD_VULKAN_FLASH_ATTN=0 to disable\n");
+                }
+                if (rt->runtime_kv_cache_f16_enabled) {
+                    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_kvf16_f32.comp",
+                                rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                &rt->runtime_indexed_attention_d64_flash_kvf16_shader,
+                                &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout,
+                                &rt->runtime_indexed_attention_d64_flash_kvf16_pipeline)) return 1;
+                    fprintf(stderr, "Vulkan d64 f16-KV flash attention enabled (WORLD_VULKAN_KV_CACHE_F16=1)\n");
                 }
             }
             if (rt->layer_attn_out_enabled) {
@@ -3765,26 +3842,43 @@ static int create_runtime_model_slice(
         if (rt->layer_attention_enabled) {
             for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
                 VkDeviceSize kv_offset = (VkDeviceSize)(rt->cache_kv_offsets[layer_idx] * sizeof(float));
+                VkDeviceSize kv_offset_f16 = (VkDeviceSize)(rt->cache_kv_offsets[layer_idx] * sizeof(uint16_t));
                 VkDeviceSize meta_offset = (VkDeviceSize)(rt->cache_meta_offsets[layer_idx] * sizeof(uint32_t));
                 VkDeviceSize count_offset = (VkDeviceSize)((size_t)layer_idx * sizeof(uint32_t));
                 VkDeviceSize layer_cache_kv_bytes = (VkDeviceSize)((size_t)rt->cfg.n_kv_heads *
                     (size_t)rt->cache_capacities[layer_idx] * (size_t)rt->d_head * sizeof(float));
+                VkDeviceSize layer_cache_kv_f16_bytes = (VkDeviceSize)((size_t)rt->cfg.n_kv_heads *
+                    (size_t)rt->cache_capacities[layer_idx] * (size_t)rt->d_head * sizeof(uint16_t));
                 VkDeviceSize layer_cache_meta_bytes = (VkDeviceSize)((size_t)rt->cache_capacities[layer_idx] * sizeof(uint32_t));
+                int use_kv_f16 =
+                    rt->runtime_kv_cache_f16_enabled &&
+                    rt->runtime_kv_upsert_f16_pipeline &&
+                    rt->runtime_indexed_attention_d64_flash_kvf16_pipeline &&
+                    rt->cache_k_f16_buffer &&
+                    rt->cache_v_f16_buffer;
                 VkBuffer buffers[5] = {
-                    rt->cache_k_buffer, rt->cache_v_buffer, rt->k_buffer,
+                    use_kv_f16 ? rt->cache_k_f16_buffer : rt->cache_k_buffer,
+                    use_kv_f16 ? rt->cache_v_f16_buffer : rt->cache_v_buffer,
+                    rt->k_buffer,
                     (rt->cfg.value_residual && layer_idx == 0 && rt->v_first_buffer) ? rt->v_first_buffer : rt->v_buffer,
                     rt->cache_written_buffer
                 };
                 VkDeviceSize sizes[5] = {
-                    layer_cache_kv_bytes, layer_cache_kv_bytes, kv_rope_bytes, kv_rope_bytes, layer_cache_meta_bytes
+                    use_kv_f16 ? layer_cache_kv_f16_bytes : layer_cache_kv_bytes,
+                    use_kv_f16 ? layer_cache_kv_f16_bytes : layer_cache_kv_bytes,
+                    kv_rope_bytes, kv_rope_bytes, layer_cache_meta_bytes
                 };
-                VkDeviceSize offsets[5] = {kv_offset, kv_offset, 0, 0, meta_offset};
+                VkDeviceSize offsets[5] = {
+                    use_kv_f16 ? kv_offset_f16 : kv_offset,
+                    use_kv_f16 ? kv_offset_f16 : kv_offset,
+                    0, 0, meta_offset
+                };
                 if (create_storage_descriptor_set(rt, rt->runtime_kv_upsert_set_layout, 5, buffers, sizes, offsets,
                             &rt->kv_upsert_descriptor_pools[layer_idx],
                             &rt->kv_upsert_descriptor_sets[layer_idx])) return 1;
                 {
                     VkBuffer index_buffers[3] = {
-                    rt->cache_written_buffer, rt->cache_indices_buffer, rt->cache_index_count_buffer
+                        rt->cache_written_buffer, rt->cache_indices_buffer, rt->cache_index_count_buffer
                     };
                     VkDeviceSize index_sizes[3] = {layer_cache_meta_bytes, layer_cache_meta_bytes, sizeof(uint32_t)};
                     VkDeviceSize index_offsets[3] = {meta_offset, meta_offset, count_offset};
@@ -3795,14 +3889,24 @@ static int create_runtime_model_slice(
                 }
                 {
                     VkBuffer attn_buffers[6] = {
-                        rt->q_buffer, rt->cache_k_buffer, rt->cache_v_buffer, rt->cache_indices_buffer,
+                        rt->q_buffer,
+                        use_kv_f16 ? rt->cache_k_f16_buffer : rt->cache_k_buffer,
+                        use_kv_f16 ? rt->cache_v_f16_buffer : rt->cache_v_buffer,
+                        rt->cache_indices_buffer,
                         rt->attn_buffer, rt->cache_index_count_buffer
                     };
                     VkDeviceSize attn_sizes[6] = {
-                        q_rope_bytes, layer_cache_kv_bytes, layer_cache_kv_bytes,
+                        q_rope_bytes,
+                        use_kv_f16 ? layer_cache_kv_f16_bytes : layer_cache_kv_bytes,
+                        use_kv_f16 ? layer_cache_kv_f16_bytes : layer_cache_kv_bytes,
                         layer_cache_meta_bytes, token_bytes, sizeof(uint32_t)
                     };
-                    VkDeviceSize attn_offsets[6] = {0, kv_offset, kv_offset, meta_offset, 0, count_offset};
+                    VkDeviceSize attn_offsets[6] = {
+                        0,
+                        use_kv_f16 ? kv_offset_f16 : kv_offset,
+                        use_kv_f16 ? kv_offset_f16 : kv_offset,
+                        meta_offset, 0, count_offset
+                    };
                     if (create_storage_descriptor_set(rt, rt->runtime_indexed_attention_set_layout, 6,
                                 attn_buffers, attn_sizes, attn_offsets,
                                 &rt->indexed_attention_descriptor_pools[layer_idx],
@@ -4422,15 +4526,23 @@ static int record_runtime_model_slice(
                 attn_push.D = (uint32_t)rt->d_head;
                 attn_push.scale = 1.0f / sqrtf((float)rt->d_head);
 
-                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_kv_upsert_pipeline);
-                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        rt->runtime_kv_upsert_pipeline_layout, 0, 1,
-                        &rt->kv_upsert_descriptor_sets[layer_idx], 0, NULL);
-                vkCmdPushConstants(rt->command_buffer, rt->runtime_kv_upsert_pipeline_layout,
-                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
-                PROFILE_DISPATCH("kv_upsert",
-                        ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
-                        1, 1);
+	                int use_kv_f16 =
+	                    rt->runtime_kv_cache_f16_enabled &&
+	                    rt->runtime_kv_upsert_f16_pipeline &&
+	                    rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
+	                VkPipeline kv_upsert_pipeline = use_kv_f16 ?
+	                    rt->runtime_kv_upsert_f16_pipeline : rt->runtime_kv_upsert_pipeline;
+	                VkPipelineLayout kv_upsert_layout = use_kv_f16 ?
+	                    rt->runtime_kv_upsert_f16_pipeline_layout : rt->runtime_kv_upsert_pipeline_layout;
+	                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, kv_upsert_pipeline);
+	                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+	                        kv_upsert_layout, 0, 1,
+	                        &rt->kv_upsert_descriptor_sets[layer_idx], 0, NULL);
+	                vkCmdPushConstants(rt->command_buffer, kv_upsert_layout,
+	                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(upsert_push), &upsert_push);
+	                PROFILE_DISPATCH(use_kv_f16 ? "kv_upsert_f16" : "kv_upsert",
+	                        ((uint32_t)(rt->cfg.n_kv_heads * rt->T * rt->d_head) + 255u) / 256u,
+	                        1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
                 vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_cache_indices_pipeline);
@@ -4451,7 +4563,29 @@ static int record_runtime_model_slice(
                 if (rt->d_head == 64 && d64_allowed) {
                     uint32_t group = rt->cfg.n_kv_heads > 0 ?
                         (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
-                    if (rt->runtime_indexed_attention_d64_flash96_enabled &&
+	                    if (use_kv_f16 &&
+	                            rt->runtime_indexed_attention_d64_flash_kvf16_pipeline &&
+	                            group > 0u && group <= 16u &&
+	                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+	                        uint32_t q_per_h = 16u / group;
+	                        if (q_per_h == 0u) q_per_h = 1u;
+	                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+	                        attn_pipeline = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline;
+	                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout;
+	                        attn_label = "attention.d64_flash_kvf16";
+	                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+	                    } else if (rt->runtime_indexed_attention_d64_flash32w_enabled &&
+	                            rt->runtime_indexed_attention_d64_flash32w_pipeline &&
+                            group > 0u && group <= 32u &&
+                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+                        uint32_t q_per_h = 32u / group;
+                        if (q_per_h == 0u) q_per_h = 1u;
+                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+                        attn_pipeline = rt->runtime_indexed_attention_d64_flash32w_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash32w_pipeline_layout;
+                        attn_label = "attention.d64_flash32w";
+                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+                    } else if (rt->runtime_indexed_attention_d64_flash96_enabled &&
                             rt->runtime_indexed_attention_d64_flash96_pipeline &&
                             group > 0u && group <= 16u &&
                             (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
@@ -8981,6 +9115,7 @@ static int run_kv_cache_upsert_probe_case(
         VkPipelineLayout upsert_pipeline_layout,
         VkPipeline upsert_pipeline,
         const char *name,
+        int cache_f16,
         uint32_t B,
         uint32_t H,
         uint32_t T,
@@ -8997,7 +9132,8 @@ static int run_kv_cache_upsert_probe_case(
     uint32_t write_step = (frame_idx % pinned_dilation) == 0u ? 1u : 0u;
     size_t cache_values = (size_t)B * H * capacity * D;
     size_t kv_values = (size_t)B * H * T * D;
-    size_t cache_bytes = cache_values * sizeof(float);
+    size_t cache_bytes = cache_values * (cache_f16 ? sizeof(uint16_t) : sizeof(float));
+    size_t ref_cache_bytes = cache_values * sizeof(float);
     size_t kv_bytes = kv_values * sizeof(float);
     size_t written_bytes = (size_t)capacity * sizeof(uint32_t);
 
@@ -9043,14 +9179,23 @@ static int run_kv_cache_upsert_probe_case(
 
     float *cache_k = (float *)cache_k_mapped;
     float *cache_v = (float *)cache_v_mapped;
+    uint16_t *cache_k16 = (uint16_t *)cache_k_mapped;
+    uint16_t *cache_v16 = (uint16_t *)cache_v_mapped;
     float *k = (float *)k_mapped;
     float *v = (float *)v_mapped;
     uint32_t *written = (uint32_t *)written_mapped;
     uint32_t *mask = (uint32_t *)mask_mapped;
 
     for (size_t i = 0; i < cache_values; ++i) {
-        cache_k[i] = frozen ? probe_value((int)i + 1009, 0.017578125f) : 0.0f;
-        cache_v[i] = frozen ? probe_value((int)i + 1201, 0.01953125f) : 0.0f;
+        float ck = frozen ? probe_value((int)i + 1009, 0.017578125f) : 0.0f;
+        float cv = frozen ? probe_value((int)i + 1201, 0.01953125f) : 0.0f;
+        if (cache_f16) {
+            cache_k16[i] = probe_f32_to_f16(ck);
+            cache_v16[i] = probe_f32_to_f16(cv);
+        } else {
+            cache_k[i] = ck;
+            cache_v[i] = cv;
+        }
     }
     for (size_t i = 0; i < kv_values; ++i) {
         k[i] = probe_value((int)i + 1409, 0.025390625f);
@@ -9062,13 +9207,15 @@ static int run_kv_cache_upsert_probe_case(
     for (uint32_t i = L; i < capacity; ++i) written[i] = 1u;
     memset(mask, 0, written_bytes);
 
-    ref_cache_k = (float *)malloc(cache_bytes);
-    ref_cache_v = (float *)malloc(cache_bytes);
+    ref_cache_k = (float *)malloc(ref_cache_bytes);
+    ref_cache_v = (float *)malloc(ref_cache_bytes);
     ref_written = (uint32_t *)malloc(written_bytes);
     ref_mask = (uint32_t *)malloc(written_bytes);
     if (!ref_cache_k || !ref_cache_v || !ref_written || !ref_mask) goto cleanup;
-    memcpy(ref_cache_k, cache_k, cache_bytes);
-    memcpy(ref_cache_v, cache_v, cache_bytes);
+    for (size_t i = 0; i < cache_values; ++i) {
+        ref_cache_k[i] = cache_f16 ? probe_f16_to_f32(cache_k16[i]) : cache_k[i];
+        ref_cache_v[i] = cache_f16 ? probe_f16_to_f32(cache_v16[i]) : cache_v[i];
+    }
     memcpy(ref_written, written, written_bytes);
     memcpy(ref_mask, written, written_bytes);
 
@@ -9085,11 +9232,13 @@ static int run_kv_cache_upsert_probe_case(
                     size_t src = (size_t)(((b * H + h) * T + t) * D + d);
                     size_t tail = (size_t)(((b * H + h) * capacity + tail_idx) * D + d);
                     size_t dst = (size_t)(((b * H + h) * capacity + dst_idx) * D + d);
-                    ref_cache_k[tail] = k[src];
-                    ref_cache_v[tail] = v[src];
+                    float kval = cache_f16 ? probe_f16_to_f32(probe_f32_to_f16(k[src])) : k[src];
+                    float vval = cache_f16 ? probe_f16_to_f32(probe_f32_to_f16(v[src])) : v[src];
+                    ref_cache_k[tail] = kval;
+                    ref_cache_v[tail] = vval;
                     if (!frozen) {
-                        ref_cache_k[dst] = k[src];
-                        ref_cache_v[dst] = v[src];
+                        ref_cache_k[dst] = kval;
+                        ref_cache_v[dst] = vval;
                     }
                 }
             }
@@ -9133,8 +9282,10 @@ static int run_kv_cache_upsert_probe_case(
     float max_abs = 0.0f;
     uint32_t mismatches = 0;
     for (size_t i = 0; i < cache_values; ++i) {
-        float dk = fabsf(cache_k[i] - ref_cache_k[i]);
-        float dv = fabsf(cache_v[i] - ref_cache_v[i]);
+        float got_k = cache_f16 ? probe_f16_to_f32(cache_k16[i]) : cache_k[i];
+        float got_v = cache_f16 ? probe_f16_to_f32(cache_v16[i]) : cache_v[i];
+        float dk = fabsf(got_k - ref_cache_k[i]);
+        float dv = fabsf(got_v - ref_cache_v[i]);
         if (dk > max_abs) max_abs = dk;
         if (dv > max_abs) max_abs = dv;
         if (dk != 0.0f || dv != 0.0f) ++mismatches;
@@ -9143,8 +9294,8 @@ static int run_kv_cache_upsert_probe_case(
         if (written[i] != ref_written[i]) ++mismatches;
         if (mask[i] != ref_mask[i]) ++mismatches;
     }
-    fprintf(stderr, "vulkan kv_cache_upsert_f32 probe (%s): max_abs=%g mismatches=%u\n",
-            name, max_abs, mismatches);
+    fprintf(stderr, "vulkan kv_cache_upsert_%s probe (%s): max_abs=%g mismatches=%u\n",
+            cache_f16 ? "f16" : "f32", name, max_abs, mismatches);
     if (mismatches != 0 || max_abs != 0.0f) goto cleanup;
     rc = 0;
 
@@ -9184,19 +9335,39 @@ int world_vulkan_kv_cache_upsert_f32_probe(void) {
     VkDescriptorSetLayout upsert_set_layout = VK_NULL_HANDLE;
     VkPipelineLayout upsert_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline upsert_pipeline = VK_NULL_HANDLE;
+    VkShaderModule upsert_f16_shader = VK_NULL_HANDLE;
+    VkPipelineLayout upsert_f16_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline upsert_f16_pipeline = VK_NULL_HANDLE;
 
     if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
     if (create_storage_pipeline(rt, "kv_cache_mask.comp", 2, sizeof(WorldVulkanKvCacheMaskPush),
                 &mask_shader, &mask_set_layout, &mask_pipeline_layout, &mask_pipeline)) goto cleanup;
     if (create_storage_pipeline(rt, "kv_cache_upsert_copy_f32.comp", 5, sizeof(WorldVulkanKvCacheUpsertPush),
                 &upsert_shader, &upsert_set_layout, &upsert_pipeline_layout, &upsert_pipeline)) goto cleanup;
+    if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+        if (create_storage_pipeline_with_set_layout(rt, "kv_cache_upsert_copy_f16.comp",
+                    upsert_set_layout, sizeof(WorldVulkanKvCacheUpsertPush),
+                    &upsert_f16_shader, &upsert_f16_pipeline_layout, &upsert_f16_pipeline)) goto cleanup;
+    } else {
+        fprintf(stderr,
+                "vulkan kv_cache_upsert_f16 probe: skipped; shaderFloat16=%d storage16=%d\n",
+                rt->shader_float16_enabled, rt->storage_16bit_enabled);
+    }
 
     if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
                 upsert_set_layout, upsert_pipeline_layout, upsert_pipeline,
-                "frozen_write_step", 1, 2, 4, 8, 16, 4, 1, 1)) goto cleanup;
+                "frozen_write_step", 0, 1, 2, 4, 8, 16, 4, 1, 1)) goto cleanup;
     if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
                 upsert_set_layout, upsert_pipeline_layout, upsert_pipeline,
-                "unfrozen_pinned_dilation", 1, 3, 4, 16, 32, 5, 2, 0)) goto cleanup;
+                "unfrozen_pinned_dilation", 0, 1, 3, 4, 16, 32, 5, 2, 0)) goto cleanup;
+    if (upsert_f16_pipeline) {
+        if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
+                    upsert_set_layout, upsert_f16_pipeline_layout, upsert_f16_pipeline,
+                    "frozen_write_step", 1, 1, 2, 4, 8, 16, 4, 1, 1)) goto cleanup;
+        if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
+                    upsert_set_layout, upsert_f16_pipeline_layout, upsert_f16_pipeline,
+                    "unfrozen_pinned_dilation", 1, 1, 3, 4, 16, 32, 5, 2, 0)) goto cleanup;
+    }
     rc = 0;
 
 cleanup:
@@ -9205,6 +9376,9 @@ cleanup:
     if (mask_pipeline_layout) vkDestroyPipelineLayout(rt->device, mask_pipeline_layout, NULL);
     if (mask_set_layout) vkDestroyDescriptorSetLayout(rt->device, mask_set_layout, NULL);
     if (mask_shader) vkDestroyShaderModule(rt->device, mask_shader, NULL);
+    if (upsert_f16_pipeline) vkDestroyPipeline(rt->device, upsert_f16_pipeline, NULL);
+    if (upsert_f16_pipeline_layout) vkDestroyPipelineLayout(rt->device, upsert_f16_pipeline_layout, NULL);
+    if (upsert_f16_shader) vkDestroyShaderModule(rt->device, upsert_f16_shader, NULL);
     if (upsert_pipeline) vkDestroyPipeline(rt->device, upsert_pipeline, NULL);
     if (upsert_pipeline_layout) vkDestroyPipelineLayout(rt->device, upsert_pipeline_layout, NULL);
     if (upsert_set_layout) vkDestroyDescriptorSetLayout(rt->device, upsert_set_layout, NULL);
@@ -9569,26 +9743,40 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkShaderModule flash_shader = VK_NULL_HANDLE;
     VkPipelineLayout flash_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline flash_pipeline = VK_NULL_HANDLE;
+    VkShaderModule flash32w_shader = VK_NULL_HANDLE;
+    VkPipelineLayout flash32w_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline flash32w_pipeline = VK_NULL_HANDLE;
+    VkShaderModule flash_kvf16_shader = VK_NULL_HANDLE;
+    VkPipelineLayout flash_kvf16_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline flash_kvf16_pipeline = VK_NULL_HANDLE;
     VkShaderModule flash96_shader = VK_NULL_HANDLE;
     VkPipelineLayout flash96_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline flash96_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool_kvf16 = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set_kvf16 = VK_NULL_HANDLE;
     VkBuffer q_buffer = VK_NULL_HANDLE;
     VkBuffer k_buffer = VK_NULL_HANDLE;
     VkBuffer v_buffer = VK_NULL_HANDLE;
+    VkBuffer k_f16_buffer = VK_NULL_HANDLE;
+    VkBuffer v_f16_buffer = VK_NULL_HANDLE;
     VkBuffer indices_buffer = VK_NULL_HANDLE;
     VkBuffer out_buffer = VK_NULL_HANDLE;
     VkBuffer count_buffer = VK_NULL_HANDLE;
     VkDeviceMemory q_memory = VK_NULL_HANDLE;
     VkDeviceMemory k_memory = VK_NULL_HANDLE;
     VkDeviceMemory v_memory = VK_NULL_HANDLE;
+    VkDeviceMemory k_f16_memory = VK_NULL_HANDLE;
+    VkDeviceMemory v_f16_memory = VK_NULL_HANDLE;
     VkDeviceMemory indices_memory = VK_NULL_HANDLE;
     VkDeviceMemory out_memory = VK_NULL_HANDLE;
     VkDeviceMemory count_memory = VK_NULL_HANDLE;
     void *q_mapped = NULL;
     void *k_mapped = NULL;
     void *v_mapped = NULL;
+    void *k_f16_mapped = NULL;
+    void *v_f16_mapped = NULL;
     void *indices_mapped = NULL;
     void *out_mapped = NULL;
     void *count_mapped = NULL;
@@ -9596,11 +9784,14 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
     size_t q_bytes = (size_t)B * Hq * Tq * D * sizeof(float);
     size_t kv_bytes = (size_t)B * Hkv * Tk * D * sizeof(float);
+    size_t kv_f16_bytes = (size_t)B * Hkv * Tk * D * sizeof(uint16_t);
     size_t indices_bytes = (size_t)Nkv * sizeof(uint32_t);
     size_t count_bytes = sizeof(uint32_t);
     if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &q_buffer, &q_memory, &q_mapped)) goto cleanup;
     if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &k_buffer, &k_memory, &k_mapped)) goto cleanup;
     if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &v_buffer, &v_memory, &v_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_f16_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &k_f16_buffer, &k_f16_memory, &k_f16_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_f16_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &v_f16_buffer, &v_f16_memory, &v_f16_mapped)) goto cleanup;
     if (create_host_buffer(rt, indices_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &indices_buffer, &indices_memory, &indices_mapped)) goto cleanup;
     if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) goto cleanup;
     if (create_host_buffer(rt, count_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &count_buffer, &count_memory, &count_mapped)) goto cleanup;
@@ -9608,6 +9799,8 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     float *q = (float *)q_mapped;
     float *k = (float *)k_mapped;
     float *v = (float *)v_mapped;
+    uint16_t *k_f16 = (uint16_t *)k_f16_mapped;
+    uint16_t *v_f16 = (uint16_t *)v_f16_mapped;
     uint32_t *indices = (uint32_t *)indices_mapped;
     float *out = (float *)out_mapped;
     uint32_t *count = (uint32_t *)count_mapped;
@@ -9615,6 +9808,8 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     for (int i = 0; i < B * Hkv * Tk * D; ++i) {
         k[i] = probe_value(i + 2411, 0.01953125f);
         v[i] = probe_value(i + 2503, 0.02734375f);
+        k_f16[i] = probe_f32_to_f16(k[i]);
+        v_f16[i] = probe_f32_to_f16(v[i]);
     }
     const uint32_t indices_ref[Nkv] = {0u, 3u, 4u, 9u, 16u};
     memcpy(indices, indices_ref, indices_bytes);
@@ -9626,6 +9821,10 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkBuffer buffers[6] = {q_buffer, k_buffer, v_buffer, indices_buffer, out_buffer, count_buffer};
     VkDeviceSize sizes[6] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, q_bytes, count_bytes};
     if (create_storage_descriptor_set(rt, set_layout, 6, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    VkBuffer buffers_kvf16[6] = {q_buffer, k_f16_buffer, v_f16_buffer, indices_buffer, out_buffer, count_buffer};
+    VkDeviceSize sizes_kvf16[6] = {q_bytes, kv_f16_bytes, kv_f16_bytes, indices_bytes, q_bytes, count_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 6, buffers_kvf16, sizes_kvf16, NULL,
+                &descriptor_pool_kvf16, &descriptor_set_kvf16)) goto cleanup;
     WorldVulkanIndexedAttentionPush push;
     push.B = B;
     push.Hq = Hq;
@@ -9639,7 +9838,7 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                 B * Hq * Tq, 1, 1)) goto cleanup;
 
     int group = Hq / Hkv;
-#define CHECK_INDEXED_ATTENTION(label) do { \
+#define CHECK_INDEXED_ATTENTION(label, ref_kv_f16) do { \
         float max_abs = 0.0f; \
         float mean_abs = 0.0f; \
         for (int b = 0; b < B; ++b) { \
@@ -9649,12 +9848,17 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                     const float *qrow = q + ((b * Hq + hq) * Tq + tq) * D; \
                     const float *kbase = k + (b * Hkv + hk) * Tk * D; \
                     const float *vbase = v + (b * Hkv + hk) * Tk * D; \
+                    const uint16_t *k16base = k_f16 + (b * Hkv + hk) * Tk * D; \
+                    const uint16_t *v16base = v_f16 + (b * Hkv + hk) * Tk * D; \
                     float scores[Nkv]; \
                     float max_score = -INFINITY; \
                     for (int n = 0; n < Nkv; ++n) { \
                         int tk = (int)indices[n]; \
                         float dot = 0.0f; \
-                        for (int d = 0; d < D; ++d) dot += qrow[d] * kbase[tk * D + d]; \
+                        for (int d = 0; d < D; ++d) { \
+                            float kval = (ref_kv_f16) ? probe_f16_to_f32(k16base[tk * D + d]) : kbase[tk * D + d]; \
+                            dot += qrow[d] * kval; \
+                        } \
                         scores[n] = dot * scale; \
                         if (scores[n] > max_score) max_score = scores[n]; \
                     } \
@@ -9664,7 +9868,8 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                         float ref = 0.0f; \
                         for (int n = 0; n < Nkv; ++n) { \
                             int tk = (int)indices[n]; \
-                            ref += expf(scores[n] - max_score) * vbase[tk * D + d]; \
+                            float vval = (ref_kv_f16) ? probe_f16_to_f32(v16base[tk * D + d]) : vbase[tk * D + d]; \
+                            ref += expf(scores[n] - max_score) * vval; \
                         } \
                         ref /= denom; \
                         size_t idx = (size_t)(((b * Tq + tq) * Hq + hq) * D + d); \
@@ -9680,14 +9885,14 @@ int world_vulkan_indexed_attention_f32_probe(void) {
         if (max_abs > 4.0e-5f) goto cleanup; \
     } while (0)
 
-    CHECK_INDEXED_ATTENTION("indexed_attention_f32");
+    CHECK_INDEXED_ATTENTION("indexed_attention_f32", 0);
 
     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_warp_f32.comp",
                 set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                 &d64_shader, &d64_pipeline_layout, &d64_pipeline)) goto cleanup;
     if (submit_compute(rt, d64_pipeline, d64_pipeline_layout, descriptor_set, &push, sizeof(push),
                 B * Hq * Tq, 1, 1)) goto cleanup;
-    CHECK_INDEXED_ATTENTION("indexed_attention_d64_warp_f32");
+    CHECK_INDEXED_ATTENTION("indexed_attention_d64_warp_f32", 0);
 
     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
                 set_layout, sizeof(WorldVulkanIndexedAttentionPush),
@@ -9697,7 +9902,38 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     int q_blocks = (Tq + q_per_h - 1) / q_per_h;
     if (submit_compute(rt, flash_pipeline, flash_pipeline_layout, descriptor_set, &push, sizeof(push),
                 Hkv * q_blocks, 1, 1)) goto cleanup;
-    CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_f32");
+    CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_f32", 0);
+
+    if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_kvf16_f32.comp",
+                    set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                    &flash_kvf16_shader, &flash_kvf16_pipeline_layout, &flash_kvf16_pipeline)) goto cleanup;
+        if (submit_compute(rt, flash_kvf16_pipeline, flash_kvf16_pipeline_layout, descriptor_set_kvf16, &push, sizeof(push),
+                    Hkv * q_blocks, 1, 1)) goto cleanup;
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_kvf16_f32", 1);
+    } else {
+        fprintf(stderr,
+                "vulkan indexed_attention_d64_flash_kvf16_f32 probe: skipped; shaderFloat16=%d storage16=%d\n",
+                rt->shader_float16_enabled, rt->storage_16bit_enabled);
+    }
+
+    if (rt->max_compute_work_group_invocations >= 1024u &&
+            rt->max_compute_work_group_size_x >= 1024u) {
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash32w_f32.comp",
+                    set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                    &flash32w_shader, &flash32w_pipeline_layout, &flash32w_pipeline)) goto cleanup;
+        int q_per_h32w = 32 / group;
+        if (q_per_h32w < 1) q_per_h32w = 1;
+        int q_blocks32w = (Tq + q_per_h32w - 1) / q_per_h32w;
+        if (submit_compute(rt, flash32w_pipeline, flash32w_pipeline_layout, descriptor_set, &push, sizeof(push),
+                    Hkv * q_blocks32w, 1, 1)) goto cleanup;
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash32w_f32", 0);
+    } else {
+        fprintf(stderr,
+                "vulkan indexed_attention_d64_flash32w_f32 probe: skipped; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u\n",
+                rt->max_compute_work_group_invocations,
+                rt->max_compute_work_group_size_x);
+    }
 
     if (rt->max_compute_shared_memory_size >= 96u * 64u * 2u * (uint32_t)sizeof(float)) {
         if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash96_f32.comp",
@@ -9705,7 +9941,7 @@ int world_vulkan_indexed_attention_f32_probe(void) {
                     &flash96_shader, &flash96_pipeline_layout, &flash96_pipeline)) goto cleanup;
         if (submit_compute(rt, flash96_pipeline, flash96_pipeline_layout, descriptor_set, &push, sizeof(push),
                     Hkv * q_blocks, 1, 1)) goto cleanup;
-        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash96_f32");
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash96_f32", 0);
     } else {
         fprintf(stderr, "vulkan indexed_attention_d64_flash96_f32 probe: skipped; maxComputeSharedMemorySize=%u\n",
                 rt->max_compute_shared_memory_size);
@@ -9718,6 +9954,12 @@ cleanup:
     if (flash96_pipeline) vkDestroyPipeline(rt->device, flash96_pipeline, NULL);
     if (flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash96_pipeline_layout, NULL);
     if (flash96_shader) vkDestroyShaderModule(rt->device, flash96_shader, NULL);
+    if (flash_kvf16_pipeline) vkDestroyPipeline(rt->device, flash_kvf16_pipeline, NULL);
+    if (flash_kvf16_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash_kvf16_pipeline_layout, NULL);
+    if (flash_kvf16_shader) vkDestroyShaderModule(rt->device, flash_kvf16_shader, NULL);
+    if (flash32w_pipeline) vkDestroyPipeline(rt->device, flash32w_pipeline, NULL);
+    if (flash32w_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash32w_pipeline_layout, NULL);
+    if (flash32w_shader) vkDestroyShaderModule(rt->device, flash32w_shader, NULL);
     if (flash_pipeline) vkDestroyPipeline(rt->device, flash_pipeline, NULL);
     if (flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash_pipeline_layout, NULL);
     if (flash_shader) vkDestroyShaderModule(rt->device, flash_shader, NULL);
@@ -9726,6 +9968,7 @@ cleanup:
     if (d64_shader) vkDestroyShaderModule(rt->device, d64_shader, NULL);
     if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
     if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool_kvf16) vkDestroyDescriptorPool(rt->device, descriptor_pool_kvf16, NULL);
     if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
     if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
     if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
@@ -9733,6 +9976,8 @@ cleanup:
         destroy_host_buffer(rt, q_buffer, q_memory, q_mapped);
         destroy_host_buffer(rt, k_buffer, k_memory, k_mapped);
         destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
+        destroy_host_buffer(rt, k_f16_buffer, k_f16_memory, k_f16_mapped);
+        destroy_host_buffer(rt, v_f16_buffer, v_f16_memory, v_f16_mapped);
         destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
         destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
         destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
@@ -9845,10 +10090,13 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_ada_rms_pipeline) vkDestroyPipeline(rt->device, rt->runtime_ada_rms_pipeline, NULL);
     if (rt->runtime_qkv_rms_rope_pipeline) vkDestroyPipeline(rt->device, rt->runtime_qkv_rms_rope_pipeline, NULL);
     if (rt->runtime_kv_upsert_pipeline) vkDestroyPipeline(rt->device, rt->runtime_kv_upsert_pipeline, NULL);
+    if (rt->runtime_kv_upsert_f16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_kv_upsert_f16_pipeline, NULL);
     if (rt->runtime_cache_indices_pipeline) vkDestroyPipeline(rt->device, rt->runtime_cache_indices_pipeline, NULL);
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_flash32w_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash32w_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
@@ -9884,10 +10132,13 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_ada_rms_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_ada_rms_pipeline_layout, NULL);
     if (rt->runtime_qkv_rms_rope_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_qkv_rms_rope_pipeline_layout, NULL);
     if (rt->runtime_kv_upsert_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_kv_upsert_pipeline_layout, NULL);
+    if (rt->runtime_kv_upsert_f16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_kv_upsert_f16_pipeline_layout, NULL);
     if (rt->runtime_cache_indices_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_cache_indices_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_flash32w_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash32w_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
@@ -9953,10 +10204,13 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_ada_rms_shader) vkDestroyShaderModule(rt->device, rt->runtime_ada_rms_shader, NULL);
     if (rt->runtime_qkv_rms_rope_shader) vkDestroyShaderModule(rt->device, rt->runtime_qkv_rms_rope_shader, NULL);
     if (rt->runtime_kv_upsert_shader) vkDestroyShaderModule(rt->device, rt->runtime_kv_upsert_shader, NULL);
+    if (rt->runtime_kv_upsert_f16_shader) vkDestroyShaderModule(rt->device, rt->runtime_kv_upsert_f16_shader, NULL);
     if (rt->runtime_cache_indices_shader) vkDestroyShaderModule(rt->device, rt->runtime_cache_indices_shader, NULL);
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
     if (rt->runtime_indexed_attention_d64_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_flash32w_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash32w_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_kvf16_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_kvf16_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash96_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
@@ -10022,6 +10276,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->inv_t_buffer, rt->inv_t_memory, rt->inv_t_mapped);
     destroy_host_buffer(rt, rt->cache_k_buffer, rt->cache_k_memory, rt->cache_k_mapped);
     destroy_host_buffer(rt, rt->cache_v_buffer, rt->cache_v_memory, rt->cache_v_mapped);
+    destroy_host_buffer(rt, rt->cache_k_f16_buffer, rt->cache_k_f16_memory, NULL);
+    destroy_host_buffer(rt, rt->cache_v_f16_buffer, rt->cache_v_f16_memory, NULL);
     destroy_host_buffer(rt, rt->cache_written_buffer, rt->cache_written_memory, rt->cache_written_mapped);
     destroy_host_buffer(rt, rt->cache_indices_buffer, rt->cache_indices_memory, rt->cache_indices_mapped);
     destroy_host_buffer(rt, rt->cache_index_count_buffer, rt->cache_index_count_memory, rt->cache_index_count_mapped);
