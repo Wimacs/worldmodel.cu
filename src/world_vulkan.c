@@ -297,6 +297,8 @@ struct WorldVulkanRuntime {
     int layers_to_run;
     int steps_to_run;
     int total_passes;
+    int precomputed_total_passes;
+    int forced_pass_table_idx;
     unsigned int seed;
     int model_slice_enabled;
     int C;
@@ -3394,6 +3396,13 @@ static int record_runtime_model_slice(
 
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
+        int table_pass_idx = rt->forced_pass_table_idx >= 0 ? rt->forced_pass_table_idx : pass_idx;
+        if (table_pass_idx < 0 || table_pass_idx >= rt->precomputed_total_passes) {
+            fprintf(stderr,
+                    "invalid Vulkan runtime pass table index %d for precomputed_total_passes=%d\n",
+                    table_pass_idx, rt->precomputed_total_passes);
+            return 1;
+        }
 
         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->patchify_pipeline);
         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3431,7 +3440,7 @@ static int record_runtime_model_slice(
             rope_push.eps = rt->rms_eps;
 
             for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
-                int table_idx = pass_idx * rt->layers_to_run + layer_idx;
+                int table_idx = table_pass_idx * rt->layers_to_run + layer_idx;
 
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_ada_rms_pipeline);
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3775,7 +3784,7 @@ static int record_runtime_model_slice(
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_out_norm_silu_pipeline);
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                     rt->runtime_out_norm_silu_pipeline_layout, 0, 1,
-                    &rt->out_norm_silu_descriptor_set[pass_idx], 0, NULL);
+                    &rt->out_norm_silu_descriptor_set[table_pass_idx], 0, NULL);
             vkCmdPushConstants(rt->command_buffer, rt->runtime_out_norm_silu_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_norm_push), &out_norm_push);
             vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
@@ -3852,6 +3861,8 @@ int world_vulkan_runtime_create(
         int max_steps = cfg->scheduler_sigmas_count > 1 ? cfg->scheduler_sigmas_count - 1 : 1;
         rt->steps_to_run = (steps_to_run > 0 && steps_to_run <= max_steps) ? steps_to_run : max_steps;
         rt->total_passes = rt->steps_to_run + 1;
+        rt->precomputed_total_passes = rt->total_passes;
+        rt->forced_pass_table_idx = -1;
         if (rt->total_passes > WORLD_VULKAN_MAX_PASSES) {
             fprintf(stderr, "invalid Vulkan total_passes=%d max=%d\n", rt->total_passes, WORLD_VULKAN_MAX_PASSES);
             goto fail;
@@ -4049,11 +4060,23 @@ int world_vulkan_runtime_seed_latent_rgb(
         int *height_out,
         int *frames_out,
         float *seconds_out) {
+    int old_steps_to_run = rt ? rt->steps_to_run : 0;
+    int old_total_passes = rt ? rt->total_passes : 0;
+    int old_forced_pass_table_idx = rt ? rt->forced_pass_table_idx : -1;
     if (rt && latent && rt->model_slice_enabled && rt->latent_mapped) {
         memcpy(rt->latent_mapped, latent, rt->latent_elems * sizeof(float));
         rt->use_external_latent_once = 1;
+        rt->steps_to_run = 0;
+        rt->total_passes = 1;
+        rt->forced_pass_table_idx = old_steps_to_run;
     }
-    return world_vulkan_runtime_step_rgb(rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
+    int rc = world_vulkan_runtime_step_rgb(rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
+    if (rt) {
+        rt->steps_to_run = old_steps_to_run;
+        rt->total_passes = old_total_passes;
+        rt->forced_pass_table_idx = old_forced_pass_table_idx;
+    }
+    return rc;
 }
 
 int world_vulkan_runtime_seed_latent_rgba(
@@ -4065,11 +4088,23 @@ int world_vulkan_runtime_seed_latent_rgba(
         int *height_out,
         int *frames_out,
         float *seconds_out) {
+    int old_steps_to_run = rt ? rt->steps_to_run : 0;
+    int old_total_passes = rt ? rt->total_passes : 0;
+    int old_forced_pass_table_idx = rt ? rt->forced_pass_table_idx : -1;
     if (rt && latent && rt->model_slice_enabled && rt->latent_mapped) {
         memcpy(rt->latent_mapped, latent, rt->latent_elems * sizeof(float));
         rt->use_external_latent_once = 1;
+        rt->steps_to_run = 0;
+        rt->total_passes = 1;
+        rt->forced_pass_table_idx = old_steps_to_run;
     }
-    return world_vulkan_runtime_step_rgba(rt, control_input, rgba_out, width_out, height_out, frames_out, seconds_out);
+    int rc = world_vulkan_runtime_step_rgba(rt, control_input, rgba_out, width_out, height_out, frames_out, seconds_out);
+    if (rt) {
+        rt->steps_to_run = old_steps_to_run;
+        rt->total_passes = old_total_passes;
+        rt->forced_pass_table_idx = old_forced_pass_table_idx;
+    }
+    return rc;
 }
 
 static float probe_value(int i, float scale) {
@@ -6558,7 +6593,11 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     {
         const unsigned char *rgb = NULL;
         int rgb_w = 0, rgb_h = 0, rgb_frames = 0;
-        if (world_vulkan_runtime_seed_latent_rgb(rt, latent, control, &rgb, &rgb_w, &rgb_h, &rgb_frames, NULL)) {
+        if (rt->latent_mapped) {
+            memcpy(rt->latent_mapped, latent, latent_elems * sizeof(float));
+            rt->use_external_latent_once = 1;
+        }
+        if (world_vulkan_runtime_step_rgb(rt, control, &rgb, &rgb_w, &rgb_h, &rgb_frames, NULL)) {
             goto cleanup;
         }
     }
