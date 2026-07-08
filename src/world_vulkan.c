@@ -4758,10 +4758,17 @@ static int record_runtime_model_slice(
                         use_runtime_linear_wf16_coopmat(rt,
                                 out_proj_push.rows, out_proj_push.cols,
                                 out_proj_push.inner, out_proj_push.has_bias);
-                    VkPipeline out_proj_pipeline = use_attn_out_wf16 ?
-                        rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(out_proj_push);
-                    VkPipelineLayout out_proj_layout = use_attn_out_wf16 ?
-                        rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(out_proj_push);
+                    int use_attn_out_wf16_n32 =
+                        use_attn_out_wf16 &&
+                        use_runtime_linear_wf16_coopmat_n32(rt,
+                                out_proj_push.rows, out_proj_push.cols,
+                                out_proj_push.inner, out_proj_push.has_bias);
+                    VkPipeline out_proj_pipeline = use_attn_out_wf16_n32 ?
+                        rt->runtime_linear_wf16_coopmat_n32_pipeline :
+                        (use_attn_out_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(out_proj_push));
+                    VkPipelineLayout out_proj_layout = use_attn_out_wf16_n32 ?
+                        rt->runtime_linear_wf16_coopmat_n32_pipeline_layout :
+                        (use_attn_out_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(out_proj_push));
                     VkDescriptorSet out_proj_set = use_attn_out_wf16 ?
                         rt->attn_out_proj_wf16_descriptor_sets[layer_idx] : rt->attn_out_proj_descriptor_sets[layer_idx];
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, out_proj_pipeline);
@@ -4770,7 +4777,12 @@ static int record_runtime_model_slice(
                             &out_proj_set, 0, NULL);
                     vkCmdPushConstants(rt->command_buffer, out_proj_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
-                    if (use_attn_out_wf16) {
+                    if (use_attn_out_wf16_n32) {
+                        PROFILE_DISPATCH("linear.attn_out_wf16_n32",
+                                (out_proj_push.cols + 31u) / 32u,
+                                (out_proj_push.rows + 15u) / 16u,
+                                1);
+                    } else if (use_attn_out_wf16) {
                         PROFILE_DISPATCH("linear.attn_out_wf16",
                                 (out_proj_push.cols + 7u) / 8u,
                                 (out_proj_push.rows + 15u) / 16u,
