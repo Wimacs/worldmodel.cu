@@ -170,6 +170,11 @@ typedef struct {
     float scale;
 } WorldVulkanIndexedAttentionPush;
 
+typedef struct {
+    uint32_t T;
+    uint32_t D;
+} WorldVulkanGatedResidualPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -229,6 +234,7 @@ struct WorldVulkanRuntime {
     int layer_mod_enabled;
     int layer_qkv_enabled;
     int layer_attention_enabled;
+    int layer_attn_out_enabled;
     VkShaderModule runtime_linear_shader;
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
@@ -265,6 +271,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_indexed_attention_set_layout;
     VkPipelineLayout runtime_indexed_attention_pipeline_layout;
     VkPipeline runtime_indexed_attention_pipeline;
+    VkShaderModule runtime_gated_residual_shader;
+    VkDescriptorSetLayout runtime_gated_residual_set_layout;
+    VkPipelineLayout runtime_gated_residual_pipeline_layout;
+    VkPipeline runtime_gated_residual_pipeline;
     VkDescriptorPool ctrl_fc1_descriptor_pool;
     VkDescriptorSet ctrl_fc1_descriptor_set;
     VkDescriptorPool ctrl_silu_descriptor_pool;
@@ -299,6 +309,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSet cache_indices_descriptor_set;
     VkDescriptorPool indexed_attention_descriptor_pool;
     VkDescriptorSet indexed_attention_descriptor_set;
+    VkDescriptorPool attn_out_proj_descriptor_pool;
+    VkDescriptorSet attn_out_proj_descriptor_set;
+    VkDescriptorPool attn_residual_descriptor_pool;
+    VkDescriptorSet attn_residual_descriptor_set;
     VkShaderModule patchify_shader;
     VkDescriptorSetLayout patchify_set_layout;
     VkPipelineLayout patchify_pipeline_layout;
@@ -434,6 +448,15 @@ struct WorldVulkanRuntime {
     VkBuffer attn_buffer;
     VkDeviceMemory attn_memory;
     void *attn_mapped;
+    VkBuffer attn_out_proj_weight_buffer;
+    VkDeviceMemory attn_out_proj_weight_memory;
+    void *attn_out_proj_weight_mapped;
+    VkBuffer attn_proj_buffer;
+    VkDeviceMemory attn_proj_memory;
+    void *attn_proj_mapped;
+    VkBuffer tokens_after_attn_buffer;
+    VkDeviceMemory tokens_after_attn_memory;
+    void *tokens_after_attn_mapped;
     VkBuffer unpatch_weight_buffer;
     VkDeviceMemory unpatch_weight_memory;
     void *unpatch_weight_mapped;
@@ -1247,6 +1270,11 @@ static int create_runtime_model_slice(
         if (rt->layer_qkv_enabled && !rt->layer_attention_enabled) {
             fprintf(stderr, "warning: Vulkan runtime layer attention disabled; invalid cache config\n");
         }
+        if (rt->layer_attention_enabled && weights->layers[0].out_proj_weight) {
+            rt->layer_attn_out_enabled = 1;
+        } else if (rt->layer_attention_enabled) {
+            fprintf(stderr, "warning: Vulkan runtime attention out projection disabled; missing layer0 out_proj weight\n");
+        }
     }
 
     size_t latent_bytes = rt->latent_elems * sizeof(float);
@@ -1278,6 +1306,7 @@ static int create_runtime_model_slice(
     size_t inv_t_bytes = (size_t)rt->d_t * sizeof(float);
     size_t cache_kv_bytes = (size_t)rt->cfg.n_kv_heads * rt->cache_capacity * rt->d_head * sizeof(float);
     size_t cache_meta_bytes = (size_t)rt->cache_capacity * sizeof(uint32_t);
+    size_t attn_out_proj_weight_bytes = (size_t)rt->D * rt->D * sizeof(float);
 
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
@@ -1375,6 +1404,14 @@ static int create_runtime_model_slice(
                         &rt->cache_index_count_buffer, &rt->cache_index_count_memory, &rt->cache_index_count_mapped)) return 1;
             if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                         &rt->attn_buffer, &rt->attn_memory, &rt->attn_mapped)) return 1;
+            if (rt->layer_attn_out_enabled) {
+                if (create_host_buffer(rt, attn_out_proj_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            &rt->attn_out_proj_weight_buffer, &rt->attn_out_proj_weight_memory, &rt->attn_out_proj_weight_mapped)) return 1;
+                if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            &rt->attn_proj_buffer, &rt->attn_proj_memory, &rt->attn_proj_mapped)) return 1;
+                if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            &rt->tokens_after_attn_buffer, &rt->tokens_after_attn_memory, &rt->tokens_after_attn_mapped)) return 1;
+            }
         }
     }
     if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1456,6 +1493,11 @@ static int create_runtime_model_slice(
             for (int i = rt->cache_ring_length; i < rt->cache_capacity; ++i) {
                 written[i] = 1u;
             }
+            if (rt->layer_attn_out_enabled) {
+                memcpy(rt->attn_out_proj_weight_mapped, weights->layers[0].out_proj_weight, attn_out_proj_weight_bytes);
+                memset(rt->attn_proj_mapped, 0, token_bytes);
+                memset(rt->tokens_after_attn_mapped, 0, token_bytes);
+            }
         }
     }
     memset(rt->latent_out_mapped, 0, latent_bytes);
@@ -1491,6 +1533,11 @@ static int create_runtime_model_slice(
             if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 5, sizeof(WorldVulkanIndexedAttentionPush),
                         &rt->runtime_indexed_attention_shader, &rt->runtime_indexed_attention_set_layout,
                         &rt->runtime_indexed_attention_pipeline_layout, &rt->runtime_indexed_attention_pipeline)) return 1;
+            if (rt->layer_attn_out_enabled) {
+                if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
+                            &rt->runtime_gated_residual_shader, &rt->runtime_gated_residual_set_layout,
+                            &rt->runtime_gated_residual_pipeline_layout, &rt->runtime_gated_residual_pipeline)) return 1;
+            }
         }
     }
     if (create_storage_pipeline(rt, "patchify_f32.comp", 3, sizeof(WorldVulkanPatchifyPush),
@@ -1674,6 +1721,27 @@ static int create_runtime_model_slice(
                             &rt->indexed_attention_descriptor_pool,
                             &rt->indexed_attention_descriptor_set)) return 1;
             }
+            if (rt->layer_attn_out_enabled) {
+                {
+                    VkBuffer buffers[4] = {
+                        rt->attn_buffer, rt->attn_out_proj_weight_buffer, rt->dummy_bias_buffer, rt->attn_proj_buffer
+                    };
+                    VkDeviceSize sizes[4] = {token_bytes, attn_out_proj_weight_bytes, sizeof(float), token_bytes};
+                    if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, NULL,
+                                &rt->attn_out_proj_descriptor_pool,
+                                &rt->attn_out_proj_descriptor_set)) return 1;
+                }
+                {
+                    VkBuffer buffers[4] = {
+                        rt->tokens_buffer, rt->attn_proj_buffer, rt->layer_mod_table_buffer, rt->tokens_after_attn_buffer
+                    };
+                    VkDeviceSize sizes[4] = {token_bytes, token_bytes, ctrl_emb_bytes, token_bytes};
+                    VkDeviceSize offsets[4] = {0, 0, (VkDeviceSize)(2 * ctrl_emb_bytes), 0};
+                    if (create_storage_descriptor_set(rt, rt->runtime_gated_residual_set_layout, 4, buffers, sizes, offsets,
+                                &rt->attn_residual_descriptor_pool,
+                                &rt->attn_residual_descriptor_set)) return 1;
+                }
+            }
         }
     }
     {
@@ -1684,7 +1752,8 @@ static int create_runtime_model_slice(
     }
     {
         VkBuffer buffers[4] = {
-            rt->tokens_buffer, rt->unpatch_weight_buffer, rt->unpatch_bias_buffer, rt->latent_out_buffer
+            rt->layer_attn_out_enabled ? rt->tokens_after_attn_buffer : rt->tokens_buffer,
+            rt->unpatch_weight_buffer, rt->unpatch_bias_buffer, rt->latent_out_buffer
         };
         VkDeviceSize sizes[4] = {token_bytes, patch_weight_bytes, unpatch_bias_bytes, latent_bytes};
         if (create_storage_descriptor_set(rt, rt->unpatch_orig_set_layout, 4, buffers, sizes, NULL,
@@ -1703,9 +1772,10 @@ static int create_runtime_model_slice(
     if (precompute_runtime_out_mods(rt)) return 1;
     rt->model_slice_enabled = 1;
     fprintf(stderr,
-            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d qkv=%d attn=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
+            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d qkv=%d attn=%d attn_out=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
             rt->C, rt->H, rt->W, rt->T, rt->D, rt->layers_to_run,
-            rt->layer_qkv_enabled, rt->layer_attention_enabled, rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
+            rt->layer_qkv_enabled, rt->layer_attention_enabled, rt->layer_attn_out_enabled,
+            rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
             (double)latent_bytes / (1024.0 * 1024.0));
     return 0;
 }
@@ -1947,6 +2017,43 @@ static int record_runtime_model_slice(
                     (uint32_t)(rt->cfg.n_heads * rt->T),
                     1, 1);
             cmd_shader_barrier(rt->command_buffer);
+
+            if (rt->layer_attn_out_enabled) {
+                WorldVulkanLinearPush out_proj_push;
+                memset(&out_proj_push, 0, sizeof(out_proj_push));
+                out_proj_push.rows = (uint32_t)rt->T;
+                out_proj_push.cols = (uint32_t)rt->D;
+                out_proj_push.inner = (uint32_t)rt->D;
+                out_proj_push.has_bias = 0;
+
+                WorldVulkanGatedResidualPush residual_push;
+                memset(&residual_push, 0, sizeof(residual_push));
+                residual_push.T = (uint32_t)rt->T;
+                residual_push.D = (uint32_t)rt->D;
+
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_linear_pipeline_layout, 0, 1,
+                        &rt->attn_out_proj_descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)rt->D + 7u) / 8u,
+                        ((uint32_t)rt->T + 7u) / 8u,
+                        1);
+                cmd_shader_barrier(rt->command_buffer);
+
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->runtime_gated_residual_pipeline_layout, 0, 1,
+                        &rt->attn_residual_descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->runtime_gated_residual_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(residual_push), &residual_push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                        1, 1);
+                cmd_shader_barrier(rt->command_buffer);
+            }
         }
     }
 
@@ -3590,9 +3697,12 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float *q_w = NULL;
     float *k_w = NULL;
     float *v_w = NULL;
+    float *out_w = NULL;
     float *tokens_ref = NULL;
     float *norm_ref = NULL;
     float *qkv_ref = NULL;
+    float *attn_proj_ref = NULL;
+    float *tokens_after_attn_ref = NULL;
     WorldVulkanRuntime *rt = NULL;
     WorldLayerWeights layer;
     memset(&layer, 0, sizeof(layer));
@@ -3612,12 +3722,16 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     q_w = (float *)malloc(q_elems * sizeof(float));
     k_w = (float *)malloc(kv_elems * sizeof(float));
     v_w = (float *)malloc(kv_elems * sizeof(float));
+    out_w = (float *)malloc(q_elems * sizeof(float));
     tokens_ref = (float *)malloc((size_t)T * D * sizeof(float));
     norm_ref = (float *)malloc((size_t)T * D * sizeof(float));
     qkv_ref = (float *)malloc((size_t)T * qkv_dim * sizeof(float));
+    attn_proj_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    tokens_after_attn_ref = (float *)malloc((size_t)T * D * sizeof(float));
     if (!latent || !control || !patch || !ctrl_fc1 || !ctrl_fc2 || !denoise_fc1 ||
             !denoise_fc2 || !out_norm || !unpatch || !unpatch_bias || !cond_bias ||
-            !cond_proj || !q_w || !k_w || !v_w || !tokens_ref || !norm_ref || !qkv_ref) {
+            !cond_proj || !q_w || !k_w || !v_w || !out_w || !tokens_ref || !norm_ref ||
+            !qkv_ref || !attn_proj_ref || !tokens_after_attn_ref) {
         goto cleanup;
     }
 
@@ -3636,6 +3750,7 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     for (int i = 0; i < D; ++i) cond_bias[i] = probe_value(i + 701, 0.015625f);
     for (size_t i = 0; i < cond_proj_elems; ++i) cond_proj[i] = probe_value((int)i + 809, 0.0009765625f);
     for (size_t i = 0; i < q_elems; ++i) q_w[i] = probe_value((int)i + 907, 0.0029296875f);
+    for (size_t i = 0; i < q_elems; ++i) out_w[i] = probe_value((int)i + 1201, 0.00244140625f);
     for (size_t i = 0; i < kv_elems; ++i) {
         k_w[i] = probe_value((int)i + 1009, 0.0029296875f);
         v_w[i] = probe_value((int)i + 1103, 0.00390625f);
@@ -3651,6 +3766,7 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     layer.q_proj_weight = q_w;
     layer.k_proj_weight = k_w;
     layer.v_proj_weight = v_w;
+    layer.out_proj_weight = out_w;
 
     WorldModelProbeWeights weights;
     memset(&weights, 0, sizeof(weights));
@@ -3783,7 +3899,11 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     }
     float cache_max = 0.0f;
     float attn_max = 0.0f;
+    float attn_proj_max = 0.0f;
+    float tokens_after_attn_max = 0.0f;
     float attn_mean = 0.0f;
+    float attn_proj_mean = 0.0f;
+    float tokens_after_attn_mean = 0.0f;
     uint32_t cache_mismatches = 0;
     const float *cache_k = (const float *)rt->cache_k_mapped;
     const float *cache_v = (const float *)rt->cache_v_mapped;
@@ -3791,6 +3911,8 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     const uint32_t *indices = (const uint32_t *)rt->cache_indices_mapped;
     const uint32_t index_count = ((const uint32_t *)rt->cache_index_count_mapped)[0];
     const float *attn = (const float *)rt->attn_mapped;
+    const float *attn_proj = (const float *)rt->attn_proj_mapped;
+    const float *tokens_after_attn = (const float *)rt->tokens_after_attn_mapped;
     if (index_count != (uint32_t)T) {
         ++cache_mismatches;
     }
@@ -3857,16 +3979,40 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
             }
         }
     }
+    for (int t = 0; t < T; ++t) {
+        for (int o = 0; o < D; ++o) {
+            float ref = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                ref += attn[t * D + d] * out_w[o * D + d];
+            }
+            attn_proj_ref[t * D + o] = ref;
+            float diff = fabsf(attn_proj[t * D + o] - ref);
+            if (diff > attn_proj_max) attn_proj_max = diff;
+            attn_proj_mean += diff;
+        }
+    }
+    const float *gate = layer_mod + 2 * D;
+    for (int i = 0; i < T * D; ++i) {
+        int d = i % D;
+        float ref = tokens_ref[i] + attn_proj_ref[i] * gate[d];
+        tokens_after_attn_ref[i] = ref;
+        float diff = fabsf(tokens_after_attn[i] - ref);
+        if (diff > tokens_after_attn_max) tokens_after_attn_max = diff;
+        tokens_after_attn_mean += diff;
+    }
     norm_mean /= (float)(T * D);
     qkv_mean /= (float)(T * qkv_dim);
     rope_mean /= (float)rope_count;
     attn_mean /= (float)(T * D);
+    attn_proj_mean /= (float)(T * D);
+    tokens_after_attn_mean /= (float)(T * D);
     fprintf(stderr,
-            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g\n",
-            norm_max, qkv_max, rope_max, cache_max, attn_max, cache_mismatches,
-            norm_mean, qkv_mean, rope_mean, attn_mean);
+            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g attn_proj_max=%g tokens_after_attn_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g attn_proj_mean=%g tokens_after_attn_mean=%g\n",
+            norm_max, qkv_max, rope_max, cache_max, attn_max, attn_proj_max, tokens_after_attn_max,
+            cache_mismatches, norm_mean, qkv_mean, rope_mean, attn_mean, attn_proj_mean, tokens_after_attn_mean);
     if (norm_max > 4.0e-5f || qkv_max > 7.0e-5f || rope_max > 8.0e-5f ||
-            cache_max != 0.0f || cache_mismatches != 0 || attn_max > 8.0e-5f) goto cleanup;
+            cache_max != 0.0f || cache_mismatches != 0 || attn_max > 8.0e-5f ||
+            attn_proj_max > 9.0e-5f || tokens_after_attn_max > 9.0e-5f) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -3886,9 +4032,12 @@ cleanup:
     free(q_w);
     free(k_w);
     free(v_w);
+    free(out_w);
     free(tokens_ref);
     free(norm_ref);
     free(qkv_ref);
+    free(attn_proj_ref);
+    free(tokens_after_attn_ref);
     return rc;
 }
 
@@ -4030,6 +4179,97 @@ cleanup:
         destroy_host_buffer(rt, k_buffer, k_memory, k_mapped);
         destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
         destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
+        destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_gated_residual_add_f32_probe(void) {
+    enum { T = 7, D = 257, n = T * D };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer residual_buffer = VK_NULL_HANDLE;
+    VkBuffer update_buffer = VK_NULL_HANDLE;
+    VkBuffer gate_buffer = VK_NULL_HANDLE;
+    VkBuffer out_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory residual_memory = VK_NULL_HANDLE;
+    VkDeviceMemory update_memory = VK_NULL_HANDLE;
+    VkDeviceMemory gate_memory = VK_NULL_HANDLE;
+    VkDeviceMemory out_memory = VK_NULL_HANDLE;
+    void *residual_mapped = NULL;
+    void *update_mapped = NULL;
+    void *gate_mapped = NULL;
+    void *out_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)n * sizeof(float);
+    size_t gate_bytes = (size_t)D * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &residual_buffer, &residual_memory, &residual_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &update_buffer, &update_memory, &update_mapped)) goto cleanup;
+    if (create_host_buffer(rt, gate_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &gate_buffer, &gate_memory, &gate_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) goto cleanup;
+
+    float *residual = (float *)residual_mapped;
+    float *update = (float *)update_mapped;
+    float *gate = (float *)gate_mapped;
+    float *out = (float *)out_mapped;
+    for (int i = 0; i < n; ++i) {
+        residual[i] = probe_value(i + 1601, 0.03125f);
+        update[i] = probe_value(i + 1709, 0.02734375f);
+    }
+    for (int d = 0; d < D; ++d) gate[d] = probe_value(d + 1801, 0.01953125f);
+    memset(out, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[4] = {residual_buffer, update_buffer, gate_buffer, out_buffer};
+    VkDeviceSize sizes[4] = {x_bytes, x_bytes, gate_bytes, x_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 4, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanGatedResidualPush push;
+    push.T = T;
+    push.D = D;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (uint32_t)((n + 255) / 256), 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float ref = residual[i] + update[i] * gate[i % D];
+        float diff = fabsf(out[i] - ref);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
+    }
+    mean_abs /= (float)n;
+    fprintf(stderr, "vulkan gated_residual_add_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 2.0e-6f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, residual_buffer, residual_memory, residual_mapped);
+        destroy_host_buffer(rt, update_buffer, update_memory, update_mapped);
+        destroy_host_buffer(rt, gate_buffer, gate_memory, gate_mapped);
         destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
     }
     world_vulkan_runtime_destroy(rt);
@@ -4794,6 +5034,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->kv_upsert_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->kv_upsert_descriptor_pool, NULL);
     if (rt->cache_indices_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->cache_indices_descriptor_pool, NULL);
     if (rt->indexed_attention_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_descriptor_pool, NULL);
+    if (rt->attn_out_proj_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_descriptor_pool, NULL);
+    if (rt->attn_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_residual_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
@@ -4803,6 +5045,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_pipeline) vkDestroyPipeline(rt->device, rt->runtime_kv_upsert_pipeline, NULL);
     if (rt->runtime_cache_indices_pipeline) vkDestroyPipeline(rt->device, rt->runtime_cache_indices_pipeline, NULL);
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
+    if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
@@ -4815,6 +5058,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_kv_upsert_pipeline_layout, NULL);
     if (rt->runtime_cache_indices_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_cache_indices_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
+    if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
@@ -4827,6 +5071,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_kv_upsert_set_layout, NULL);
     if (rt->runtime_cache_indices_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_cache_indices_set_layout, NULL);
     if (rt->runtime_indexed_attention_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_indexed_attention_set_layout, NULL);
+    if (rt->runtime_gated_residual_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_gated_residual_set_layout, NULL);
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
@@ -4839,6 +5084,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_shader) vkDestroyShaderModule(rt->device, rt->runtime_kv_upsert_shader, NULL);
     if (rt->runtime_cache_indices_shader) vkDestroyShaderModule(rt->device, rt->runtime_cache_indices_shader, NULL);
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
+    if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
     if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
@@ -4881,6 +5127,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->cache_indices_buffer, rt->cache_indices_memory, rt->cache_indices_mapped);
     destroy_host_buffer(rt, rt->cache_index_count_buffer, rt->cache_index_count_memory, rt->cache_index_count_mapped);
     destroy_host_buffer(rt, rt->attn_buffer, rt->attn_memory, rt->attn_mapped);
+    destroy_host_buffer(rt, rt->attn_out_proj_weight_buffer, rt->attn_out_proj_weight_memory, rt->attn_out_proj_weight_mapped);
+    destroy_host_buffer(rt, rt->attn_proj_buffer, rt->attn_proj_memory, rt->attn_proj_mapped);
+    destroy_host_buffer(rt, rt->tokens_after_attn_buffer, rt->tokens_after_attn_memory, rt->tokens_after_attn_mapped);
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
     destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
     destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);

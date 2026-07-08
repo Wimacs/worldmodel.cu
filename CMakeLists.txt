@@ -95,6 +95,7 @@ if(WORLD_ENABLE_VULKAN)
     ada_rms_norm_f32.comp
     cache_frame_indices.comp
     fill_rgba.comp
+    gated_residual_add_f32.comp
     indexed_attention_f32.comp
     kv_cache_mask.comp
     kv_cache_upsert_copy_f32.comp
