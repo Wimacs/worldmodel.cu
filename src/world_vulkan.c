@@ -286,6 +286,9 @@ struct WorldVulkanRuntime {
     VkPhysicalDevice physical_device;
     VkDevice device;
     uint32_t queue_family;
+    int shader_float16_enabled;
+    int storage_16bit_enabled;
+    int cooperative_matrix_enabled;
     VkQueue queue;
     VkShaderModule fill_shader;
     VkDescriptorSetLayout descriptor_set_layout;
@@ -871,6 +874,25 @@ static int find_queue_family(VkPhysicalDevice dev, uint32_t *family_out) {
     }
     free(props);
     return found ? 0 : 1;
+}
+
+static int physical_device_has_extension(VkPhysicalDevice dev, const char *name) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(dev, NULL, &count, NULL) != VK_SUCCESS) return 0;
+    VkExtensionProperties *props =
+        (VkExtensionProperties *)calloc(count ? count : 1, sizeof(*props));
+    if (!props) return 0;
+    int found = 0;
+    if (vkEnumerateDeviceExtensionProperties(dev, NULL, &count, props) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (strcmp(props[i].extensionName, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(props);
+    return found;
 }
 
 static int pick_physical_device(WorldVulkanRuntime *rt) {
@@ -4256,11 +4278,88 @@ int world_vulkan_runtime_create(
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
 
+    int has_shader_f16_ext = physical_device_has_extension(rt->physical_device,
+            VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    int has_storage_16bit_ext = physical_device_has_extension(rt->physical_device,
+            VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+    int has_coop_matrix_ext = physical_device_has_extension(rt->physical_device,
+            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+
+    VkPhysicalDeviceShaderFloat16Int8Features shader_f16_avail;
+    memset(&shader_f16_avail, 0, sizeof(shader_f16_avail));
+    shader_f16_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    VkPhysicalDevice16BitStorageFeatures storage_16bit_avail;
+    memset(&storage_16bit_avail, 0, sizeof(storage_16bit_avail));
+    storage_16bit_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_matrix_avail;
+    memset(&coop_matrix_avail, 0, sizeof(coop_matrix_avail));
+    coop_matrix_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceFeatures2 avail_features;
+    memset(&avail_features, 0, sizeof(avail_features));
+    avail_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    void *avail_chain = NULL;
+    if (has_coop_matrix_ext) {
+        coop_matrix_avail.pNext = avail_chain;
+        avail_chain = &coop_matrix_avail;
+    }
+    storage_16bit_avail.pNext = avail_chain;
+    avail_chain = &storage_16bit_avail;
+    shader_f16_avail.pNext = avail_chain;
+    avail_chain = &shader_f16_avail;
+    avail_features.pNext = avail_chain;
+    vkGetPhysicalDeviceFeatures2(rt->physical_device, &avail_features);
+
+    const char *device_extensions[8];
+    uint32_t device_extension_count = 0;
+    VkPhysicalDeviceShaderFloat16Int8Features shader_f16_enable;
+    memset(&shader_f16_enable, 0, sizeof(shader_f16_enable));
+    shader_f16_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    VkPhysicalDevice16BitStorageFeatures storage_16bit_enable;
+    memset(&storage_16bit_enable, 0, sizeof(storage_16bit_enable));
+    storage_16bit_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_matrix_enable;
+    memset(&coop_matrix_enable, 0, sizeof(coop_matrix_enable));
+    coop_matrix_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    void *enable_chain = NULL;
+    if (has_shader_f16_ext && shader_f16_avail.shaderFloat16) {
+        shader_f16_enable.shaderFloat16 = VK_TRUE;
+        shader_f16_enable.pNext = enable_chain;
+        enable_chain = &shader_f16_enable;
+        device_extensions[device_extension_count++] = VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME;
+        rt->shader_float16_enabled = 1;
+    }
+    if (has_storage_16bit_ext && storage_16bit_avail.storageBuffer16BitAccess) {
+        storage_16bit_enable.storageBuffer16BitAccess = VK_TRUE;
+        storage_16bit_enable.uniformAndStorageBuffer16BitAccess =
+            storage_16bit_avail.uniformAndStorageBuffer16BitAccess;
+        storage_16bit_enable.pNext = enable_chain;
+        enable_chain = &storage_16bit_enable;
+        device_extensions[device_extension_count++] = VK_KHR_16BIT_STORAGE_EXTENSION_NAME;
+        rt->storage_16bit_enabled = 1;
+    }
+    if (has_coop_matrix_ext && coop_matrix_avail.cooperativeMatrix) {
+        coop_matrix_enable.cooperativeMatrix = VK_TRUE;
+        coop_matrix_enable.pNext = enable_chain;
+        enable_chain = &coop_matrix_enable;
+        device_extensions[device_extension_count++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+        rt->cooperative_matrix_enabled = 1;
+    }
+    VkPhysicalDeviceFeatures2 enabled_features;
+    memset(&enabled_features, 0, sizeof(enabled_features));
+    enabled_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    enabled_features.pNext = enable_chain;
+    fprintf(stderr,
+            "Vulkan optional compute features: shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
+            rt->shader_float16_enabled, rt->storage_16bit_enabled, rt->cooperative_matrix_enabled);
+
     VkDeviceCreateInfo device_info;
     memset(&device_info, 0, sizeof(device_info));
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    device_info.pNext = &enabled_features;
+    device_info.enabledExtensionCount = device_extension_count;
+    device_info.ppEnabledExtensionNames = device_extension_count ? device_extensions : NULL;
     VK_CALL(vkCreateDevice(rt->physical_device, &device_info, NULL, &rt->device));
     vkGetDeviceQueue(rt->device, rt->queue_family, 0, &rt->queue);
 
