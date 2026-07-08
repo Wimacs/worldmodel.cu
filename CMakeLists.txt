@@ -99,6 +99,7 @@ if(WORLD_ENABLE_VULKAN)
     fill_rgba.comp
     gated_residual_add_f32.comp
     indexed_attention_d64_flash24w_f32.comp
+    indexed_attention_d64_flash24w_k96_f32.comp
     indexed_attention_d64_flash32w_f32.comp
     indexed_attention_d64_flash96_f32.comp
     indexed_attention_d64_flash_kvf16_f32.comp
