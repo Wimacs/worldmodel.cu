@@ -64,15 +64,17 @@ At initialization it also precomputes the CUDA-style scheduler conditioning path
 passes. This wires the loaded control embedding, denoise/out-norm, layer
 conditioning, and patch/unpatch weights into the interactive runtime. The first
 layer's attention input side is also resident now:
-`ada_rms_norm_f32.comp -> linear_f32.comp(QKV) -> qkv_rms_rope_f32.comp`, with
-intermediate CPU parity probes. Full KV-cache attention, residual blocks, and
-VAE decode are still in progress. Without weights, it falls back to the simple
-`fill_rgba.comp` scaffold for lightweight probes.
+`ada_rms_norm_f32.comp -> linear_f32.comp(QKV) -> qkv_rms_rope_f32.comp ->
+kv_cache_upsert_copy_f32.comp -> cache_frame_indices.comp ->
+indexed_attention_f32.comp`, with intermediate CPU parity probes. Attention
+out-projection, residual blocks, and VAE decode are still in progress. Without
+weights, it falls back to the simple `fill_rgba.comp` scaffold for lightweight
+probes.
 
 `worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
 elementwise `silu_f32.comp`, fused `add_bias_silu_f32.comp`, rowwise
 `rms_norm_f32.comp`, fused control embedding, denoise/out-norm scheduler conditioning
-and layer modulation precompute, the runtime layer0 QKV/rope slice,
+and layer modulation precompute, the runtime layer0 QKV/cache/attention slice,
 `ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused `qkv_rms_rope_f32.comp`,
 `masked_attention_f32.comp`, the KV-cache helpers, `indexed_attention_f32.comp`,
 and the patch/unpatch latent-token boundary.

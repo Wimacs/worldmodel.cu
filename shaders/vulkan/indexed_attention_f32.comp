@@ -51,7 +51,7 @@ void main() {
     uint q_base = (((b * pc.Hq + hq) * pc.Tq + tq) * pc.D);
     uint k_base = ((b * pc.Hkv + hk) * pc.Tk * pc.D);
     uint v_base = k_base;
-    uint out_base = q_base;
+    uint out_base = (((b * pc.Tq + tq) * pc.Hq + hq) * pc.D);
 
     float acc = 0.0;
     float m = -3.4028234663852886e38;
