@@ -44,6 +44,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt);
 int world_vulkan_linear_f32_probe(void);
 int world_vulkan_silu_f32_probe(void);
 int world_vulkan_add_bias_silu_f32_probe(void);
+int world_vulkan_add_channel_silu_f32_probe(void);
+int world_vulkan_add_f32_probe(void);
 int world_vulkan_rms_norm_f32_probe(void);
 int world_vulkan_control_embedding_f32_probe(void);
 int world_vulkan_denoise_out_norm_f32_probe(void);

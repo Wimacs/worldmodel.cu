@@ -92,6 +92,8 @@ if(WORLD_ENABLE_VULKAN)
   set(WORLD_VULKAN_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/vulkan)
   set(WORLD_VULKAN_SHADER_SOURCES
     add_bias_silu_f32.comp
+    add_channel_silu_f32.comp
+    add_f32.comp
     ada_rms_norm_f32.comp
     cache_frame_indices.comp
     fill_rgba.comp

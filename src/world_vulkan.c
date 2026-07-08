@@ -175,6 +175,11 @@ typedef struct {
     uint32_t D;
 } WorldVulkanGatedResidualPush;
 
+typedef struct {
+    uint32_t rows;
+    uint32_t D;
+} WorldVulkanAddChannelSiluPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -235,6 +240,7 @@ struct WorldVulkanRuntime {
     int layer_qkv_enabled;
     int layer_attention_enabled;
     int layer_attn_out_enabled;
+    int layer_ctrl_enabled;
     VkShaderModule runtime_linear_shader;
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
@@ -275,6 +281,14 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_gated_residual_set_layout;
     VkPipelineLayout runtime_gated_residual_pipeline_layout;
     VkPipeline runtime_gated_residual_pipeline;
+    VkShaderModule runtime_add_channel_silu_shader;
+    VkDescriptorSetLayout runtime_add_channel_silu_set_layout;
+    VkPipelineLayout runtime_add_channel_silu_pipeline_layout;
+    VkPipeline runtime_add_channel_silu_pipeline;
+    VkShaderModule runtime_add_shader;
+    VkDescriptorSetLayout runtime_add_set_layout;
+    VkPipelineLayout runtime_add_pipeline_layout;
+    VkPipeline runtime_add_pipeline;
     VkDescriptorPool ctrl_fc1_descriptor_pool;
     VkDescriptorSet ctrl_fc1_descriptor_set;
     VkDescriptorPool ctrl_silu_descriptor_pool;
@@ -313,6 +327,18 @@ struct WorldVulkanRuntime {
     VkDescriptorSet attn_out_proj_descriptor_set;
     VkDescriptorPool attn_residual_descriptor_pool;
     VkDescriptorSet attn_residual_descriptor_set;
+    VkDescriptorPool ctrl_cond_descriptor_pool;
+    VkDescriptorSet ctrl_cond_descriptor_set;
+    VkDescriptorPool ctrl_norm_descriptor_pool;
+    VkDescriptorSet ctrl_norm_descriptor_set;
+    VkDescriptorPool ctrl_fc1_x_descriptor_pool;
+    VkDescriptorSet ctrl_fc1_x_descriptor_set;
+    VkDescriptorPool ctrl_add_silu_descriptor_pool;
+    VkDescriptorSet ctrl_add_silu_descriptor_set;
+    VkDescriptorPool ctrl_fc2_descriptor_pool_layer;
+    VkDescriptorSet ctrl_fc2_descriptor_set_layer;
+    VkDescriptorPool ctrl_add_descriptor_pool;
+    VkDescriptorSet ctrl_add_descriptor_set;
     VkShaderModule patchify_shader;
     VkDescriptorSetLayout patchify_set_layout;
     VkPipelineLayout patchify_pipeline_layout;
@@ -457,6 +483,30 @@ struct WorldVulkanRuntime {
     VkBuffer tokens_after_attn_buffer;
     VkDeviceMemory tokens_after_attn_memory;
     void *tokens_after_attn_mapped;
+    VkBuffer ctrl_fc1_c_weight_buffer;
+    VkDeviceMemory ctrl_fc1_c_weight_memory;
+    void *ctrl_fc1_c_weight_mapped;
+    VkBuffer ctrl_fc1_x_weight_buffer;
+    VkDeviceMemory ctrl_fc1_x_weight_memory;
+    void *ctrl_fc1_x_weight_mapped;
+    VkBuffer ctrl_fc2_weight_buffer_layer;
+    VkDeviceMemory ctrl_fc2_weight_memory_layer;
+    void *ctrl_fc2_weight_mapped_layer;
+    VkBuffer ctrl_cond_buffer;
+    VkDeviceMemory ctrl_cond_memory;
+    void *ctrl_cond_mapped;
+    VkBuffer ctrl_norm_buffer;
+    VkDeviceMemory ctrl_norm_memory;
+    void *ctrl_norm_mapped;
+    VkBuffer ctrl_hidden_layer_buffer;
+    VkDeviceMemory ctrl_hidden_layer_memory;
+    void *ctrl_hidden_layer_mapped;
+    VkBuffer ctrl_out_buffer;
+    VkDeviceMemory ctrl_out_memory;
+    void *ctrl_out_mapped;
+    VkBuffer tokens_after_ctrl_buffer;
+    VkDeviceMemory tokens_after_ctrl_memory;
+    void *tokens_after_ctrl_mapped;
     VkBuffer unpatch_weight_buffer;
     VkDeviceMemory unpatch_weight_memory;
     void *unpatch_weight_mapped;
@@ -1275,6 +1325,15 @@ static int create_runtime_model_slice(
         } else if (rt->layer_attention_enabled) {
             fprintf(stderr, "warning: Vulkan runtime attention out projection disabled; missing layer0 out_proj weight\n");
         }
+        if (rt->layer_attn_out_enabled &&
+                weights->layers[0].has_ctrl &&
+                weights->layers[0].ctrl_fc1_c_weight &&
+                weights->layers[0].ctrl_fc1_x_weight &&
+                weights->layers[0].ctrl_fc2_weight) {
+            rt->layer_ctrl_enabled = 1;
+        } else if (rt->layer_attn_out_enabled && weights->layers[0].has_ctrl) {
+            fprintf(stderr, "warning: Vulkan runtime control fusion disabled; incomplete layer0 ctrl weights\n");
+        }
     }
 
     size_t latent_bytes = rt->latent_elems * sizeof(float);
@@ -1307,6 +1366,7 @@ static int create_runtime_model_slice(
     size_t cache_kv_bytes = (size_t)rt->cfg.n_kv_heads * rt->cache_capacity * rt->d_head * sizeof(float);
     size_t cache_meta_bytes = (size_t)rt->cache_capacity * sizeof(uint32_t);
     size_t attn_out_proj_weight_bytes = (size_t)rt->D * rt->D * sizeof(float);
+    size_t ctrl_layer_weight_bytes = (size_t)rt->D * rt->D * sizeof(float);
 
     if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
@@ -1411,6 +1471,24 @@ static int create_runtime_model_slice(
                             &rt->attn_proj_buffer, &rt->attn_proj_memory, &rt->attn_proj_mapped)) return 1;
                 if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             &rt->tokens_after_attn_buffer, &rt->tokens_after_attn_memory, &rt->tokens_after_attn_mapped)) return 1;
+                if (rt->layer_ctrl_enabled) {
+                    if (create_host_buffer(rt, ctrl_layer_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_fc1_c_weight_buffer, &rt->ctrl_fc1_c_weight_memory, &rt->ctrl_fc1_c_weight_mapped)) return 1;
+                    if (create_host_buffer(rt, ctrl_layer_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_fc1_x_weight_buffer, &rt->ctrl_fc1_x_weight_memory, &rt->ctrl_fc1_x_weight_mapped)) return 1;
+                    if (create_host_buffer(rt, ctrl_layer_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_fc2_weight_buffer_layer, &rt->ctrl_fc2_weight_memory_layer, &rt->ctrl_fc2_weight_mapped_layer)) return 1;
+                    if (create_host_buffer(rt, ctrl_emb_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_cond_buffer, &rt->ctrl_cond_memory, &rt->ctrl_cond_mapped)) return 1;
+                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_norm_buffer, &rt->ctrl_norm_memory, &rt->ctrl_norm_mapped)) return 1;
+                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_hidden_layer_buffer, &rt->ctrl_hidden_layer_memory, &rt->ctrl_hidden_layer_mapped)) return 1;
+                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->ctrl_out_buffer, &rt->ctrl_out_memory, &rt->ctrl_out_mapped)) return 1;
+                    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                &rt->tokens_after_ctrl_buffer, &rt->tokens_after_ctrl_memory, &rt->tokens_after_ctrl_mapped)) return 1;
+                }
             }
         }
     }
@@ -1497,6 +1575,16 @@ static int create_runtime_model_slice(
                 memcpy(rt->attn_out_proj_weight_mapped, weights->layers[0].out_proj_weight, attn_out_proj_weight_bytes);
                 memset(rt->attn_proj_mapped, 0, token_bytes);
                 memset(rt->tokens_after_attn_mapped, 0, token_bytes);
+                if (rt->layer_ctrl_enabled) {
+                    memcpy(rt->ctrl_fc1_c_weight_mapped, weights->layers[0].ctrl_fc1_c_weight, ctrl_layer_weight_bytes);
+                    memcpy(rt->ctrl_fc1_x_weight_mapped, weights->layers[0].ctrl_fc1_x_weight, ctrl_layer_weight_bytes);
+                    memcpy(rt->ctrl_fc2_weight_mapped_layer, weights->layers[0].ctrl_fc2_weight, ctrl_layer_weight_bytes);
+                    memset(rt->ctrl_cond_mapped, 0, ctrl_emb_bytes);
+                    memset(rt->ctrl_norm_mapped, 0, token_bytes);
+                    memset(rt->ctrl_hidden_layer_mapped, 0, token_bytes);
+                    memset(rt->ctrl_out_mapped, 0, token_bytes);
+                    memset(rt->tokens_after_ctrl_mapped, 0, token_bytes);
+                }
             }
         }
     }
@@ -1537,6 +1625,14 @@ static int create_runtime_model_slice(
                 if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
                             &rt->runtime_gated_residual_shader, &rt->runtime_gated_residual_set_layout,
                             &rt->runtime_gated_residual_pipeline_layout, &rt->runtime_gated_residual_pipeline)) return 1;
+                if (rt->layer_ctrl_enabled) {
+                    if (create_storage_pipeline(rt, "add_channel_silu_f32.comp", 3, sizeof(WorldVulkanAddChannelSiluPush),
+                                &rt->runtime_add_channel_silu_shader, &rt->runtime_add_channel_silu_set_layout,
+                                &rt->runtime_add_channel_silu_pipeline_layout, &rt->runtime_add_channel_silu_pipeline)) return 1;
+                    if (create_storage_pipeline(rt, "add_f32.comp", 3, sizeof(WorldVulkanSiluPush),
+                                &rt->runtime_add_shader, &rt->runtime_add_set_layout,
+                                &rt->runtime_add_pipeline_layout, &rt->runtime_add_pipeline)) return 1;
+                }
             }
         }
     }
@@ -1741,6 +1837,56 @@ static int create_runtime_model_slice(
                                 &rt->attn_residual_descriptor_pool,
                                 &rt->attn_residual_descriptor_set)) return 1;
                 }
+                if (rt->layer_ctrl_enabled) {
+                    {
+                        VkBuffer buffers[4] = {
+                            rt->ctrl_emb_norm_buffer, rt->ctrl_fc1_c_weight_buffer, rt->dummy_bias_buffer, rt->ctrl_cond_buffer
+                        };
+                        VkDeviceSize sizes[4] = {ctrl_emb_bytes, ctrl_layer_weight_bytes, sizeof(float), ctrl_emb_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, NULL,
+                                    &rt->ctrl_cond_descriptor_pool,
+                                    &rt->ctrl_cond_descriptor_set)) return 1;
+                    }
+                    {
+                        VkBuffer buffers[3] = {rt->tokens_after_attn_buffer, rt->rms_weight_buffer, rt->ctrl_norm_buffer};
+                        VkDeviceSize sizes[3] = {token_bytes, ctrl_emb_bytes, token_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_rms_set_layout, 3, buffers, sizes, NULL,
+                                    &rt->ctrl_norm_descriptor_pool,
+                                    &rt->ctrl_norm_descriptor_set)) return 1;
+                    }
+                    {
+                        VkBuffer buffers[4] = {
+                            rt->ctrl_norm_buffer, rt->ctrl_fc1_x_weight_buffer, rt->dummy_bias_buffer, rt->ctrl_hidden_layer_buffer
+                        };
+                        VkDeviceSize sizes[4] = {token_bytes, ctrl_layer_weight_bytes, sizeof(float), token_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, NULL,
+                                    &rt->ctrl_fc1_x_descriptor_pool,
+                                    &rt->ctrl_fc1_x_descriptor_set)) return 1;
+                    }
+                    {
+                        VkBuffer buffers[3] = {rt->ctrl_hidden_layer_buffer, rt->ctrl_cond_buffer, rt->ctrl_hidden_layer_buffer};
+                        VkDeviceSize sizes[3] = {token_bytes, ctrl_emb_bytes, token_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_add_channel_silu_set_layout, 3, buffers, sizes, NULL,
+                                    &rt->ctrl_add_silu_descriptor_pool,
+                                    &rt->ctrl_add_silu_descriptor_set)) return 1;
+                    }
+                    {
+                        VkBuffer buffers[4] = {
+                            rt->ctrl_hidden_layer_buffer, rt->ctrl_fc2_weight_buffer_layer, rt->dummy_bias_buffer, rt->ctrl_out_buffer
+                        };
+                        VkDeviceSize sizes[4] = {token_bytes, ctrl_layer_weight_bytes, sizeof(float), token_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, NULL,
+                                    &rt->ctrl_fc2_descriptor_pool_layer,
+                                    &rt->ctrl_fc2_descriptor_set_layer)) return 1;
+                    }
+                    {
+                        VkBuffer buffers[3] = {rt->tokens_after_attn_buffer, rt->ctrl_out_buffer, rt->tokens_after_ctrl_buffer};
+                        VkDeviceSize sizes[3] = {token_bytes, token_bytes, token_bytes};
+                        if (create_storage_descriptor_set(rt, rt->runtime_add_set_layout, 3, buffers, sizes, NULL,
+                                    &rt->ctrl_add_descriptor_pool,
+                                    &rt->ctrl_add_descriptor_set)) return 1;
+                    }
+                }
             }
         }
     }
@@ -1752,7 +1898,8 @@ static int create_runtime_model_slice(
     }
     {
         VkBuffer buffers[4] = {
-            rt->layer_attn_out_enabled ? rt->tokens_after_attn_buffer : rt->tokens_buffer,
+            rt->layer_ctrl_enabled ? rt->tokens_after_ctrl_buffer :
+                (rt->layer_attn_out_enabled ? rt->tokens_after_attn_buffer : rt->tokens_buffer),
             rt->unpatch_weight_buffer, rt->unpatch_bias_buffer, rt->latent_out_buffer
         };
         VkDeviceSize sizes[4] = {token_bytes, patch_weight_bytes, unpatch_bias_bytes, latent_bytes};
@@ -1772,10 +1919,10 @@ static int create_runtime_model_slice(
     if (precompute_runtime_out_mods(rt)) return 1;
     rt->model_slice_enabled = 1;
     fprintf(stderr,
-            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d qkv=%d attn=%d attn_out=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
+            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d layers=%d qkv=%d attn=%d attn_out=%d ctrl=%d ctrl_dim=%d hidden=%d passes=%d bytes(latent)=%.2f MiB\n",
             rt->C, rt->H, rt->W, rt->T, rt->D, rt->layers_to_run,
             rt->layer_qkv_enabled, rt->layer_attention_enabled, rt->layer_attn_out_enabled,
-            rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
+            rt->layer_ctrl_enabled, rt->ctrl_dim, rt->mlp_hidden, rt->total_passes,
             (double)latent_bytes / (1024.0 * 1024.0));
     return 0;
 }
@@ -1839,6 +1986,24 @@ static int record_runtime_model_slice(
                 0, sizeof(rms_push), &rms_push);
         vkCmdDispatch(rt->command_buffer, 1, 1, 1);
         cmd_shader_barrier(rt->command_buffer);
+
+        if (rt->layer_ctrl_enabled) {
+            WorldVulkanLinearPush ctrl_cond_push;
+            memset(&ctrl_cond_push, 0, sizeof(ctrl_cond_push));
+            ctrl_cond_push.rows = 1;
+            ctrl_cond_push.cols = (uint32_t)rt->D;
+            ctrl_cond_push.inner = (uint32_t)rt->D;
+            ctrl_cond_push.has_bias = 0;
+
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+            vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    rt->runtime_linear_pipeline_layout, 0, 1,
+                    &rt->ctrl_cond_descriptor_set, 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_cond_push), &ctrl_cond_push);
+            vkCmdDispatch(rt->command_buffer, ((uint32_t)rt->D + 7u) / 8u, 1, 1);
+            cmd_shader_barrier(rt->command_buffer);
+        }
     }
 
     WorldVulkanPatchifyPush patch_push;
@@ -2053,6 +2218,85 @@ static int record_runtime_model_slice(
                         ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
                         1, 1);
                 cmd_shader_barrier(rt->command_buffer);
+
+                if (rt->layer_ctrl_enabled) {
+                    WorldVulkanRmsNormPush ctrl_norm_push;
+                    memset(&ctrl_norm_push, 0, sizeof(ctrl_norm_push));
+                    ctrl_norm_push.rows = (uint32_t)rt->T;
+                    ctrl_norm_push.cols = (uint32_t)rt->D;
+                    ctrl_norm_push.eps = rt->rms_eps;
+
+                    WorldVulkanLinearPush ctrl_fc_push;
+                    memset(&ctrl_fc_push, 0, sizeof(ctrl_fc_push));
+                    ctrl_fc_push.rows = (uint32_t)rt->T;
+                    ctrl_fc_push.cols = (uint32_t)rt->D;
+                    ctrl_fc_push.inner = (uint32_t)rt->D;
+                    ctrl_fc_push.has_bias = 0;
+
+                    WorldVulkanAddChannelSiluPush add_silu_push;
+                    memset(&add_silu_push, 0, sizeof(add_silu_push));
+                    add_silu_push.rows = (uint32_t)rt->T;
+                    add_silu_push.D = (uint32_t)rt->D;
+
+                    WorldVulkanSiluPush add_push;
+                    memset(&add_push, 0, sizeof(add_push));
+                    add_push.n = (uint32_t)(rt->T * rt->D);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_rms_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_rms_pipeline_layout, 0, 1,
+                            &rt->ctrl_norm_descriptor_set, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, rt->runtime_rms_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_norm_push), &ctrl_norm_push);
+                    vkCmdDispatch(rt->command_buffer, (uint32_t)rt->T, 1, 1);
+                    cmd_shader_barrier(rt->command_buffer);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_linear_pipeline_layout, 0, 1,
+                            &rt->ctrl_fc1_x_descriptor_set, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
+                    vkCmdDispatch(rt->command_buffer,
+                            ((uint32_t)rt->D + 7u) / 8u,
+                            ((uint32_t)rt->T + 7u) / 8u,
+                            1);
+                    cmd_shader_barrier(rt->command_buffer);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_channel_silu_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_add_channel_silu_pipeline_layout, 0, 1,
+                            &rt->ctrl_add_silu_descriptor_set, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, rt->runtime_add_channel_silu_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_silu_push), &add_silu_push);
+                    vkCmdDispatch(rt->command_buffer,
+                            ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                            1, 1);
+                    cmd_shader_barrier(rt->command_buffer);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_linear_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_linear_pipeline_layout, 0, 1,
+                            &rt->ctrl_fc2_descriptor_set_layer, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, rt->runtime_linear_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
+                    vkCmdDispatch(rt->command_buffer,
+                            ((uint32_t)rt->D + 7u) / 8u,
+                            ((uint32_t)rt->T + 7u) / 8u,
+                            1);
+                    cmd_shader_barrier(rt->command_buffer);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_add_pipeline_layout, 0, 1,
+                            &rt->ctrl_add_descriptor_set, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, rt->runtime_add_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(add_push), &add_push);
+                    vkCmdDispatch(rt->command_buffer,
+                            ((uint32_t)(rt->T * rt->D) + 255u) / 256u,
+                            1, 1);
+                    cmd_shader_barrier(rt->command_buffer);
+                }
             }
         }
     }
@@ -2684,6 +2928,169 @@ cleanup:
     if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
     if (rt) {
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_add_channel_silu_f32_probe(void) {
+    enum { rows = 9, D = 257, n = rows * D };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer bias_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory bias_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *bias_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t x_bytes = (size_t)n * sizeof(float);
+    size_t bias_bytes = (size_t)D * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &bias_buffer, &bias_memory, &bias_mapped)) goto cleanup;
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+    float *x = (float *)x_mapped;
+    float *bias = (float *)bias_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < n; ++i) x[i] = probe_value(i + 83, 0.0546875f);
+    for (int d = 0; d < D; ++d) bias[d] = probe_value(d + 131, 0.03125f);
+    memset(y, 0, x_bytes);
+
+    if (create_storage_pipeline(rt, "add_channel_silu_f32.comp", 3, sizeof(WorldVulkanAddChannelSiluPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {x_buffer, bias_buffer, y_buffer};
+    VkDeviceSize sizes[3] = {x_bytes, bias_bytes, x_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanAddChannelSiluPush push;
+    push.rows = rows;
+    push.D = D;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (uint32_t)((n + 255) / 256), 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float v = x[i] + bias[i % D];
+        float ref = v / (1.0f + expf(-v));
+        float diff = fabsf(y[i] - ref);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
+    }
+    mean_abs /= (float)n;
+    fprintf(stderr, "vulkan add_channel_silu_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 2.0e-6f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_add_f32_probe(void) {
+    enum { n = 4099 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer a_buffer = VK_NULL_HANDLE;
+    VkBuffer b_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory a_memory = VK_NULL_HANDLE;
+    VkDeviceMemory b_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *a_mapped = NULL;
+    void *b_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t bytes = (size_t)n * sizeof(float);
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &a_buffer, &a_memory, &a_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) goto cleanup;
+    if (create_host_buffer(rt, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+    float *a = (float *)a_mapped;
+    float *b = (float *)b_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < n; ++i) {
+        a[i] = probe_value(i + 193, 0.0625f);
+        b[i] = probe_value(i + 251, 0.046875f);
+    }
+    memset(y, 0, bytes);
+
+    if (create_storage_pipeline(rt, "add_f32.comp", 3, sizeof(WorldVulkanSiluPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {a_buffer, b_buffer, y_buffer};
+    VkDeviceSize sizes[3] = {bytes, bytes, bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanSiluPush push;
+    push.n = n;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                (uint32_t)((n + 255) / 256), 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        float ref = a[i] + b[i];
+        float diff = fabsf(y[i] - ref);
+        if (diff > max_abs) max_abs = diff;
+        mean_abs += diff;
+    }
+    mean_abs /= (float)n;
+    fprintf(stderr, "vulkan add_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs != 0.0f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, a_buffer, a_memory, a_mapped);
         destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
         destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
     }
@@ -3698,11 +4105,19 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float *k_w = NULL;
     float *v_w = NULL;
     float *out_w = NULL;
+    float *ctrl_fc1_c_w = NULL;
+    float *ctrl_fc1_x_w = NULL;
+    float *ctrl_fc2_w = NULL;
     float *tokens_ref = NULL;
     float *norm_ref = NULL;
     float *qkv_ref = NULL;
     float *attn_proj_ref = NULL;
     float *tokens_after_attn_ref = NULL;
+    float *ctrl_cond_ref = NULL;
+    float *ctrl_norm_ref = NULL;
+    float *ctrl_hidden_ref = NULL;
+    float *ctrl_out_ref = NULL;
+    float *tokens_after_ctrl_ref = NULL;
     WorldVulkanRuntime *rt = NULL;
     WorldLayerWeights layer;
     memset(&layer, 0, sizeof(layer));
@@ -3723,15 +4138,25 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     k_w = (float *)malloc(kv_elems * sizeof(float));
     v_w = (float *)malloc(kv_elems * sizeof(float));
     out_w = (float *)malloc(q_elems * sizeof(float));
+    ctrl_fc1_c_w = (float *)malloc(q_elems * sizeof(float));
+    ctrl_fc1_x_w = (float *)malloc(q_elems * sizeof(float));
+    ctrl_fc2_w = (float *)malloc(q_elems * sizeof(float));
     tokens_ref = (float *)malloc((size_t)T * D * sizeof(float));
     norm_ref = (float *)malloc((size_t)T * D * sizeof(float));
     qkv_ref = (float *)malloc((size_t)T * qkv_dim * sizeof(float));
     attn_proj_ref = (float *)malloc((size_t)T * D * sizeof(float));
     tokens_after_attn_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    ctrl_cond_ref = (float *)malloc((size_t)D * sizeof(float));
+    ctrl_norm_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    ctrl_hidden_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    ctrl_out_ref = (float *)malloc((size_t)T * D * sizeof(float));
+    tokens_after_ctrl_ref = (float *)malloc((size_t)T * D * sizeof(float));
     if (!latent || !control || !patch || !ctrl_fc1 || !ctrl_fc2 || !denoise_fc1 ||
             !denoise_fc2 || !out_norm || !unpatch || !unpatch_bias || !cond_bias ||
-            !cond_proj || !q_w || !k_w || !v_w || !out_w || !tokens_ref || !norm_ref ||
-            !qkv_ref || !attn_proj_ref || !tokens_after_attn_ref) {
+            !cond_proj || !q_w || !k_w || !v_w || !out_w || !ctrl_fc1_c_w ||
+            !ctrl_fc1_x_w || !ctrl_fc2_w || !tokens_ref || !norm_ref || !qkv_ref ||
+            !attn_proj_ref || !tokens_after_attn_ref || !ctrl_cond_ref || !ctrl_norm_ref ||
+            !ctrl_hidden_ref || !ctrl_out_ref || !tokens_after_ctrl_ref) {
         goto cleanup;
     }
 
@@ -3751,6 +4176,11 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     for (size_t i = 0; i < cond_proj_elems; ++i) cond_proj[i] = probe_value((int)i + 809, 0.0009765625f);
     for (size_t i = 0; i < q_elems; ++i) q_w[i] = probe_value((int)i + 907, 0.0029296875f);
     for (size_t i = 0; i < q_elems; ++i) out_w[i] = probe_value((int)i + 1201, 0.00244140625f);
+    for (size_t i = 0; i < q_elems; ++i) {
+        ctrl_fc1_c_w[i] = probe_value((int)i + 1301, 0.001953125f);
+        ctrl_fc1_x_w[i] = probe_value((int)i + 1409, 0.00244140625f);
+        ctrl_fc2_w[i] = probe_value((int)i + 1511, 0.00244140625f);
+    }
     for (size_t i = 0; i < kv_elems; ++i) {
         k_w[i] = probe_value((int)i + 1009, 0.0029296875f);
         v_w[i] = probe_value((int)i + 1103, 0.00390625f);
@@ -3767,6 +4197,10 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     layer.k_proj_weight = k_w;
     layer.v_proj_weight = v_w;
     layer.out_proj_weight = out_w;
+    layer.ctrl_fc1_c_weight = ctrl_fc1_c_w;
+    layer.ctrl_fc1_x_weight = ctrl_fc1_x_w;
+    layer.ctrl_fc2_weight = ctrl_fc2_w;
+    layer.has_ctrl = 1;
 
     WorldModelProbeWeights weights;
     memset(&weights, 0, sizeof(weights));
@@ -3901,9 +4335,15 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     float attn_max = 0.0f;
     float attn_proj_max = 0.0f;
     float tokens_after_attn_max = 0.0f;
+    float ctrl_cond_max = 0.0f;
+    float ctrl_norm_max = 0.0f;
+    float ctrl_hidden_max = 0.0f;
+    float ctrl_out_max = 0.0f;
+    float tokens_after_ctrl_max = 0.0f;
     float attn_mean = 0.0f;
     float attn_proj_mean = 0.0f;
     float tokens_after_attn_mean = 0.0f;
+    float tokens_after_ctrl_mean = 0.0f;
     uint32_t cache_mismatches = 0;
     const float *cache_k = (const float *)rt->cache_k_mapped;
     const float *cache_v = (const float *)rt->cache_v_mapped;
@@ -3913,6 +4353,11 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
     const float *attn = (const float *)rt->attn_mapped;
     const float *attn_proj = (const float *)rt->attn_proj_mapped;
     const float *tokens_after_attn = (const float *)rt->tokens_after_attn_mapped;
+    const float *ctrl_cond = (const float *)rt->ctrl_cond_mapped;
+    const float *ctrl_norm = (const float *)rt->ctrl_norm_mapped;
+    const float *ctrl_hidden = (const float *)rt->ctrl_hidden_layer_mapped;
+    const float *ctrl_out = (const float *)rt->ctrl_out_mapped;
+    const float *tokens_after_ctrl = (const float *)rt->tokens_after_ctrl_mapped;
     if (index_count != (uint32_t)T) {
         ++cache_mismatches;
     }
@@ -4000,19 +4445,80 @@ int world_vulkan_runtime_layer0_qkv_f32_probe(void) {
         if (diff > tokens_after_attn_max) tokens_after_attn_max = diff;
         tokens_after_attn_mean += diff;
     }
+    const float *ctrl_emb_norm = (const float *)rt->ctrl_emb_norm_mapped;
+    for (int o = 0; o < D; ++o) {
+        float ref = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            ref += ctrl_emb_norm[d] * ctrl_fc1_c_w[o * D + d];
+        }
+        ctrl_cond_ref[o] = ref;
+        float diff = fabsf(ctrl_cond[o] - ref);
+        if (diff > ctrl_cond_max) ctrl_cond_max = diff;
+    }
+    for (int t = 0; t < T; ++t) {
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            float v = tokens_after_attn_ref[t * D + d];
+            sum += v * v;
+        }
+        float inv = 1.0f / sqrtf(sum / (float)D + 1.0e-6f);
+        for (int d = 0; d < D; ++d) {
+            float ref = tokens_after_attn_ref[t * D + d] * inv;
+            ctrl_norm_ref[t * D + d] = ref;
+            float diff = fabsf(ctrl_norm[t * D + d] - ref);
+            if (diff > ctrl_norm_max) ctrl_norm_max = diff;
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        for (int o = 0; o < D; ++o) {
+            float ref = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                ref += ctrl_norm_ref[t * D + d] * ctrl_fc1_x_w[o * D + d];
+            }
+            ref += ctrl_cond_ref[o];
+            ref = ref / (1.0f + expf(-ref));
+            ctrl_hidden_ref[t * D + o] = ref;
+            float diff = fabsf(ctrl_hidden[t * D + o] - ref);
+            if (diff > ctrl_hidden_max) ctrl_hidden_max = diff;
+        }
+    }
+    for (int t = 0; t < T; ++t) {
+        for (int o = 0; o < D; ++o) {
+            float ref = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                ref += ctrl_hidden_ref[t * D + d] * ctrl_fc2_w[o * D + d];
+            }
+            ctrl_out_ref[t * D + o] = ref;
+            float diff = fabsf(ctrl_out[t * D + o] - ref);
+            if (diff > ctrl_out_max) ctrl_out_max = diff;
+        }
+    }
+    for (int i = 0; i < T * D; ++i) {
+        float ref = tokens_after_attn_ref[i] + ctrl_out_ref[i];
+        tokens_after_ctrl_ref[i] = ref;
+        float diff = fabsf(tokens_after_ctrl[i] - ref);
+        if (diff > tokens_after_ctrl_max) tokens_after_ctrl_max = diff;
+        tokens_after_ctrl_mean += diff;
+    }
     norm_mean /= (float)(T * D);
     qkv_mean /= (float)(T * qkv_dim);
     rope_mean /= (float)rope_count;
     attn_mean /= (float)(T * D);
     attn_proj_mean /= (float)(T * D);
     tokens_after_attn_mean /= (float)(T * D);
+    tokens_after_ctrl_mean /= (float)(T * D);
     fprintf(stderr,
-            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g attn_proj_max=%g tokens_after_attn_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g attn_proj_mean=%g tokens_after_attn_mean=%g\n",
+            "vulkan runtime_layer0_qkv_f32 probe: norm_max=%g qkv_max=%g rope_max=%g cache_max=%g attn_max=%g attn_proj_max=%g tokens_after_attn_max=%g ctrl_cond_max=%g ctrl_norm_max=%g ctrl_hidden_max=%g ctrl_out_max=%g tokens_after_ctrl_max=%g cache_mismatches=%u norm_mean=%g qkv_mean=%g rope_mean=%g attn_mean=%g attn_proj_mean=%g tokens_after_attn_mean=%g tokens_after_ctrl_mean=%g\n",
             norm_max, qkv_max, rope_max, cache_max, attn_max, attn_proj_max, tokens_after_attn_max,
-            cache_mismatches, norm_mean, qkv_mean, rope_mean, attn_mean, attn_proj_mean, tokens_after_attn_mean);
+            ctrl_cond_max, ctrl_norm_max, ctrl_hidden_max, ctrl_out_max, tokens_after_ctrl_max,
+            cache_mismatches, norm_mean, qkv_mean, rope_mean, attn_mean, attn_proj_mean,
+            tokens_after_attn_mean, tokens_after_ctrl_mean);
     if (norm_max > 4.0e-5f || qkv_max > 7.0e-5f || rope_max > 8.0e-5f ||
             cache_max != 0.0f || cache_mismatches != 0 || attn_max > 8.0e-5f ||
-            attn_proj_max > 9.0e-5f || tokens_after_attn_max > 9.0e-5f) goto cleanup;
+            attn_proj_max > 9.0e-5f || tokens_after_attn_max > 9.0e-5f ||
+            ctrl_cond_max > 8.0e-5f || ctrl_norm_max > 8.0e-5f ||
+            ctrl_hidden_max > 8.0e-5f || ctrl_out_max > 9.0e-5f ||
+            tokens_after_ctrl_max > 9.0e-5f) goto cleanup;
     rc = 0;
 
 cleanup:
@@ -4033,11 +4539,19 @@ cleanup:
     free(k_w);
     free(v_w);
     free(out_w);
+    free(ctrl_fc1_c_w);
+    free(ctrl_fc1_x_w);
+    free(ctrl_fc2_w);
     free(tokens_ref);
     free(norm_ref);
     free(qkv_ref);
     free(attn_proj_ref);
     free(tokens_after_attn_ref);
+    free(ctrl_cond_ref);
+    free(ctrl_norm_ref);
+    free(ctrl_hidden_ref);
+    free(ctrl_out_ref);
+    free(tokens_after_ctrl_ref);
     return rc;
 }
 
@@ -5036,6 +5550,12 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->indexed_attention_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_descriptor_pool, NULL);
     if (rt->attn_out_proj_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_descriptor_pool, NULL);
     if (rt->attn_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->attn_residual_descriptor_pool, NULL);
+    if (rt->ctrl_cond_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_cond_descriptor_pool, NULL);
+    if (rt->ctrl_norm_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_norm_descriptor_pool, NULL);
+    if (rt->ctrl_fc1_x_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_x_descriptor_pool, NULL);
+    if (rt->ctrl_add_silu_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_silu_descriptor_pool, NULL);
+    if (rt->ctrl_fc2_descriptor_pool_layer) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_descriptor_pool_layer, NULL);
+    if (rt->ctrl_add_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
@@ -5046,6 +5566,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_pipeline) vkDestroyPipeline(rt->device, rt->runtime_cache_indices_pipeline, NULL);
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
+    if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
+    if (rt->runtime_add_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_pipeline, NULL);
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
@@ -5059,6 +5581,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_cache_indices_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
+    if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
+    if (rt->runtime_add_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_pipeline_layout, NULL);
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
@@ -5072,6 +5596,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_cache_indices_set_layout, NULL);
     if (rt->runtime_indexed_attention_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_indexed_attention_set_layout, NULL);
     if (rt->runtime_gated_residual_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_gated_residual_set_layout, NULL);
+    if (rt->runtime_add_channel_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_channel_silu_set_layout, NULL);
+    if (rt->runtime_add_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_set_layout, NULL);
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
@@ -5085,6 +5611,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_shader) vkDestroyShaderModule(rt->device, rt->runtime_cache_indices_shader, NULL);
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
+    if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
+    if (rt->runtime_add_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_shader, NULL);
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
     if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
@@ -5130,6 +5658,14 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->attn_out_proj_weight_buffer, rt->attn_out_proj_weight_memory, rt->attn_out_proj_weight_mapped);
     destroy_host_buffer(rt, rt->attn_proj_buffer, rt->attn_proj_memory, rt->attn_proj_mapped);
     destroy_host_buffer(rt, rt->tokens_after_attn_buffer, rt->tokens_after_attn_memory, rt->tokens_after_attn_mapped);
+    destroy_host_buffer(rt, rt->ctrl_fc1_c_weight_buffer, rt->ctrl_fc1_c_weight_memory, rt->ctrl_fc1_c_weight_mapped);
+    destroy_host_buffer(rt, rt->ctrl_fc1_x_weight_buffer, rt->ctrl_fc1_x_weight_memory, rt->ctrl_fc1_x_weight_mapped);
+    destroy_host_buffer(rt, rt->ctrl_fc2_weight_buffer_layer, rt->ctrl_fc2_weight_memory_layer, rt->ctrl_fc2_weight_mapped_layer);
+    destroy_host_buffer(rt, rt->ctrl_cond_buffer, rt->ctrl_cond_memory, rt->ctrl_cond_mapped);
+    destroy_host_buffer(rt, rt->ctrl_norm_buffer, rt->ctrl_norm_memory, rt->ctrl_norm_mapped);
+    destroy_host_buffer(rt, rt->ctrl_hidden_layer_buffer, rt->ctrl_hidden_layer_memory, rt->ctrl_hidden_layer_mapped);
+    destroy_host_buffer(rt, rt->ctrl_out_buffer, rt->ctrl_out_memory, rt->ctrl_out_mapped);
+    destroy_host_buffer(rt, rt->tokens_after_ctrl_buffer, rt->tokens_after_ctrl_memory, rt->tokens_after_ctrl_mapped);
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
     destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
     destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);
