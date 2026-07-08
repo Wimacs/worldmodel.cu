@@ -18,6 +18,18 @@
 #endif
 
 #define WORLD_VULKAN_MAX_PASSES 32
+#define WORLD_VULKAN_MAX_VAE_OPS 128
+
+enum {
+    WORLD_VULKAN_VAE_REPEAT_CLAMP = 0,
+    WORLD_VULKAN_VAE_CONV,
+    WORLD_VULKAN_VAE_RELU,
+    WORLD_VULKAN_VAE_CONCAT_PAST,
+    WORLD_VULKAN_VAE_ADD_RELU,
+    WORLD_VULKAN_VAE_UPSAMPLE2,
+    WORLD_VULKAN_VAE_TGROW,
+    WORLD_VULKAN_VAE_PIXEL_SHUFFLE,
+};
 
 typedef struct {
     uint32_t width;
@@ -232,6 +244,22 @@ typedef struct {
     uint32_t H;
     uint32_t W;
 } WorldVulkanTaehvPixelShufflePush;
+
+typedef struct {
+    int kind;
+    int conv_idx;
+    int src;
+    int dst;
+    int aux;
+    int N;
+    int C;
+    int C_out;
+    int H;
+    int W;
+    int stride;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSet descriptor_set;
+} WorldVulkanVaeOp;
 
 struct WorldVulkanRuntime {
     WorldConfig cfg;
@@ -451,6 +479,60 @@ struct WorldVulkanRuntime {
     VkPipeline latent_rgba_pipeline;
     VkDescriptorPool latent_rgba_descriptor_pool;
     VkDescriptorSet latent_rgba_descriptor_set;
+    int vae_enabled;
+    int vae_op_count;
+    size_t vae_max_elems;
+    size_t vae_scratch_bytes;
+    WorldVulkanVaeOp vae_ops[WORLD_VULKAN_MAX_VAE_OPS];
+    VkShaderModule taehv_repeat_clamp_shader;
+    VkDescriptorSetLayout taehv_repeat_clamp_set_layout;
+    VkPipelineLayout taehv_repeat_clamp_pipeline_layout;
+    VkPipeline taehv_repeat_clamp_pipeline;
+    VkShaderModule taehv_conv_shader;
+    VkDescriptorSetLayout taehv_conv_set_layout;
+    VkPipelineLayout taehv_conv_pipeline_layout;
+    VkPipeline taehv_conv_pipeline;
+    VkShaderModule taehv_relu_shader;
+    VkDescriptorSetLayout taehv_relu_set_layout;
+    VkPipelineLayout taehv_relu_pipeline_layout;
+    VkPipeline taehv_relu_pipeline;
+    VkShaderModule taehv_concat_past_shader;
+    VkDescriptorSetLayout taehv_concat_past_set_layout;
+    VkPipelineLayout taehv_concat_past_pipeline_layout;
+    VkPipeline taehv_concat_past_pipeline;
+    VkShaderModule taehv_add_relu_shader;
+    VkDescriptorSetLayout taehv_add_relu_set_layout;
+    VkPipelineLayout taehv_add_relu_pipeline_layout;
+    VkPipeline taehv_add_relu_pipeline;
+    VkShaderModule taehv_upsample2_shader;
+    VkDescriptorSetLayout taehv_upsample2_set_layout;
+    VkPipelineLayout taehv_upsample2_pipeline_layout;
+    VkPipeline taehv_upsample2_pipeline;
+    VkShaderModule taehv_tgrow_shader;
+    VkDescriptorSetLayout taehv_tgrow_set_layout;
+    VkPipelineLayout taehv_tgrow_pipeline_layout;
+    VkPipeline taehv_tgrow_pipeline;
+    VkShaderModule taehv_pixel_shuffle_shader;
+    VkDescriptorSetLayout taehv_pixel_shuffle_set_layout;
+    VkPipelineLayout taehv_pixel_shuffle_pipeline_layout;
+    VkPipeline taehv_pixel_shuffle_pipeline;
+    VkBuffer vae_buf0_buffer;
+    VkDeviceMemory vae_buf0_memory;
+    void *vae_buf0_mapped;
+    VkBuffer vae_buf1_buffer;
+    VkDeviceMemory vae_buf1_memory;
+    void *vae_buf1_mapped;
+    VkBuffer vae_buf2_buffer;
+    VkDeviceMemory vae_buf2_memory;
+    void *vae_buf2_mapped;
+    VkBuffer vae_weight_buffer[WORLD_VAE_DECODER_CONV_COUNT];
+    VkDeviceMemory vae_weight_memory[WORLD_VAE_DECODER_CONV_COUNT];
+    void *vae_weight_mapped[WORLD_VAE_DECODER_CONV_COUNT];
+    size_t vae_weight_bytes[WORLD_VAE_DECODER_CONV_COUNT];
+    VkBuffer vae_bias_buffer[WORLD_VAE_DECODER_CONV_COUNT];
+    VkDeviceMemory vae_bias_memory[WORLD_VAE_DECODER_CONV_COUNT];
+    void *vae_bias_mapped[WORLD_VAE_DECODER_CONV_COUNT];
+    size_t vae_bias_bytes[WORLD_VAE_DECODER_CONV_COUNT];
     VkBuffer latent_buffer;
     VkDeviceMemory latent_memory;
     void *latent_mapped;
@@ -1354,6 +1436,445 @@ static int precompute_runtime_out_mods(WorldVulkanRuntime *rt) {
             rt->total_passes, rt->total_passes * 2 * rt->D,
             rt->layer_mod_enabled ? rt->total_passes * rt->layers_to_run * 6 * rt->D : 0);
     return 0;
+}
+
+static size_t vae_elems(int N, int C, int H, int W) {
+    return (size_t)N * (size_t)C * (size_t)H * (size_t)W;
+}
+
+static VkBuffer vae_scratch_buffer(WorldVulkanRuntime *rt, int idx) {
+    if (idx == 0) return rt->vae_buf0_buffer;
+    if (idx == 1) return rt->vae_buf1_buffer;
+    return rt->vae_buf2_buffer;
+}
+
+static void vae_pick_scratch(int cur, int *tmp, int *aux) {
+    int first = cur != 0 ? 0 : 1;
+    int second = -1;
+    if (cur != 0 && first != 0) second = 0;
+    if (second < 0 && cur != 1 && first != 1) second = 1;
+    if (second < 0 && cur != 2 && first != 2) second = 2;
+    if (second < 0) second = 2;
+    *tmp = first;
+    *aux = second;
+}
+
+static int vae_track_elems(WorldVulkanRuntime *rt, size_t elems) {
+    if (elems > UINT32_MAX) {
+        fprintf(stderr, "Vulkan VAE tensor too large: %zu elements\n", elems);
+        return 1;
+    }
+    if (elems > rt->vae_max_elems) rt->vae_max_elems = elems;
+    return 0;
+}
+
+static WorldVulkanVaeOp *vae_add_op(
+        WorldVulkanRuntime *rt,
+        int kind,
+        int conv_idx,
+        int src,
+        int dst,
+        int aux,
+        int N,
+        int C,
+        int C_out,
+        int H,
+        int W,
+        int stride) {
+    if (rt->vae_op_count >= WORLD_VULKAN_MAX_VAE_OPS) {
+        fprintf(stderr, "too many Vulkan VAE ops\n");
+        return NULL;
+    }
+    WorldVulkanVaeOp *op = &rt->vae_ops[rt->vae_op_count++];
+    memset(op, 0, sizeof(*op));
+    op->kind = kind;
+    op->conv_idx = conv_idx;
+    op->src = src;
+    op->dst = dst;
+    op->aux = aux;
+    op->N = N;
+    op->C = C;
+    op->C_out = C_out;
+    op->H = H;
+    op->W = W;
+    op->stride = stride;
+    return op;
+}
+
+static int vae_add_conv_op(WorldVulkanRuntime *rt, const WorldVaeDecoderWeights *vae,
+        int idx, int src, int dst, int N, int H, int W) {
+    const WorldVaeConvWeight *conv = &vae->convs[idx];
+    if (!conv->weight || conv->out_c <= 0 || conv->in_c <= 0 || conv->kernel <= 0) {
+        fprintf(stderr, "missing Vulkan VAE conv weight idx=%d\n", idx);
+        return 1;
+    }
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_CONV, idx, src, dst, -1,
+                N, conv->in_c, conv->out_c, H, W, conv->kernel)) return 1;
+    return vae_track_elems(rt, vae_elems(N, conv->out_c, H, W));
+}
+
+static int vae_add_relu_op(WorldVulkanRuntime *rt, int src, int N, int C, int H, int W) {
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_RELU, -1, src, src, -1, N, C, C, H, W, 1)) return 1;
+    return 0;
+}
+
+static int vae_add_memblock_ops(WorldVulkanRuntime *rt, const WorldVaeDecoderWeights *vae,
+        int *cur, int N, int C, int H, int W, int conv0, int conv2, int conv4) {
+    int tmp = 0;
+    int aux = 0;
+    vae_pick_scratch(*cur, &tmp, &aux);
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_CONCAT_PAST, -1, *cur, aux, -1,
+                N, C, C * 2, H, W, 1)) return 1;
+    if (vae_track_elems(rt, vae_elems(N, C * 2, H, W))) return 1;
+    if (vae_add_conv_op(rt, vae, conv0, aux, tmp, N, H, W)) return 1;
+    if (vae_add_relu_op(rt, tmp, N, C, H, W)) return 1;
+    if (vae_add_conv_op(rt, vae, conv2, tmp, aux, N, H, W)) return 1;
+    if (vae_add_relu_op(rt, aux, N, C, H, W)) return 1;
+    if (vae_add_conv_op(rt, vae, conv4, aux, tmp, N, H, W)) return 1;
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_ADD_RELU, -1, *cur, aux, tmp,
+                N, C, C, H, W, 1)) return 1;
+    if (vae_track_elems(rt, vae_elems(N, C, H, W))) return 1;
+    *cur = aux;
+    return 0;
+}
+
+static int build_runtime_vae_ops(WorldVulkanRuntime *rt, const WorldVaeDecoderWeights *vae) {
+    rt->vae_op_count = 0;
+    rt->vae_max_elems = 0;
+    int N = 4;
+    int C = rt->cfg.channels;
+    int H = rt->cfg.height * rt->cfg.patch_h;
+    int W = rt->cfg.width * rt->cfg.patch_w;
+    int cur = 0;
+    int tmp = 0;
+    int aux = 0;
+
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_REPEAT_CLAMP, -1, -1, cur, -1,
+                N, C, C, H, W, 1)) return 1;
+    if (vae_track_elems(rt, vae_elems(N, C, H, W))) return 1;
+
+#define VAE_CONV_TO(idx, out_c) do { \
+    vae_pick_scratch(cur, &tmp, &aux); \
+    if (vae_add_conv_op(rt, vae, (idx), cur, tmp, N, H, W)) return 1; \
+    cur = tmp; \
+    C = (out_c); \
+} while (0)
+#define VAE_RELU() do { \
+    if (vae_add_relu_op(rt, cur, N, C, H, W)) return 1; \
+} while (0)
+#define VAE_MEMBLOCK(a, b, c) do { \
+    if (vae_add_memblock_ops(rt, vae, &cur, N, C, H, W, (a), (b), (c))) return 1; \
+} while (0)
+#define VAE_UPSAMPLE2() do { \
+    vae_pick_scratch(cur, &tmp, &aux); \
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_UPSAMPLE2, -1, cur, tmp, -1, N, C, C, H, W, 1)) return 1; \
+    if (vae_track_elems(rt, vae_elems(N, C, H * 2, W * 2))) return 1; \
+    cur = tmp; \
+    H *= 2; \
+    W *= 2; \
+} while (0)
+#define VAE_TGROW(idx, stride_value) do { \
+    int _stride = (stride_value); \
+    vae_pick_scratch(cur, &tmp, &aux); \
+    if (vae_add_conv_op(rt, vae, (idx), cur, tmp, N, H, W)) return 1; \
+    if (_stride == 1) { \
+        cur = tmp; \
+    } else { \
+        if (!vae_add_op(rt, WORLD_VULKAN_VAE_TGROW, -1, tmp, cur, -1, N, C, C, H, W, _stride)) return 1; \
+        if (vae_track_elems(rt, vae_elems(N * _stride, C, H, W))) return 1; \
+        N *= _stride; \
+    } \
+} while (0)
+
+    VAE_CONV_TO(WORLD_VAE_DEC_CONV_IN, 256);
+    VAE_RELU();
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
+    VAE_UPSAMPLE2();
+    VAE_TGROW(WORLD_VAE_DEC_TGROW7, 1);
+
+    VAE_CONV_TO(WORLD_VAE_DEC_CONV8, 128);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
+    VAE_UPSAMPLE2();
+    VAE_TGROW(WORLD_VAE_DEC_TGROW13, 2);
+
+    VAE_CONV_TO(WORLD_VAE_DEC_CONV14, 64);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
+    VAE_MEMBLOCK(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
+    VAE_UPSAMPLE2();
+    VAE_TGROW(WORLD_VAE_DEC_TGROW19, 2);
+
+    VAE_CONV_TO(WORLD_VAE_DEC_CONV20, 64);
+    VAE_RELU();
+    VAE_CONV_TO(WORLD_VAE_DEC_CONV_OUT, 12);
+
+    if (!vae_add_op(rt, WORLD_VULKAN_VAE_PIXEL_SHUFFLE, -1, cur, -1, -1,
+                N, 12, 12, H, W, 1)) return 1;
+
+#undef VAE_CONV_TO
+#undef VAE_RELU
+#undef VAE_MEMBLOCK
+#undef VAE_UPSAMPLE2
+#undef VAE_TGROW
+
+    return 0;
+}
+
+static int create_runtime_vae_op_descriptor(WorldVulkanRuntime *rt, WorldVulkanVaeOp *op) {
+    VkBuffer buffers[4];
+    VkDeviceSize sizes[4];
+    memset(buffers, 0, sizeof(buffers));
+    memset(sizes, 0, sizeof(sizes));
+    switch (op->kind) {
+        case WORLD_VULKAN_VAE_REPEAT_CLAMP:
+            buffers[0] = rt->latent_buffer;
+            buffers[1] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->latent_elems * sizeof(float);
+            sizes[1] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_repeat_clamp_set_layout,
+                    2, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_CONV: {
+            const int idx = op->conv_idx;
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = rt->vae_weight_buffer[idx];
+            buffers[2] = rt->vae_bias_buffer[idx] ? rt->vae_bias_buffer[idx] : rt->dummy_bias_buffer;
+            buffers[3] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->vae_weight_bytes[idx];
+            sizes[2] = rt->vae_bias_buffer[idx] ? rt->vae_bias_bytes[idx] : sizeof(float);
+            sizes[3] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_conv_set_layout,
+                    4, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        }
+        case WORLD_VULKAN_VAE_RELU:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            sizes[0] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_relu_set_layout,
+                    1, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_CONCAT_PAST:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_concat_past_set_layout,
+                    2, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_ADD_RELU:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = vae_scratch_buffer(rt, op->aux);
+            buffers[2] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->vae_scratch_bytes;
+            sizes[2] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_add_relu_set_layout,
+                    3, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_UPSAMPLE2:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_upsample2_set_layout,
+                    2, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_TGROW:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = vae_scratch_buffer(rt, op->dst);
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->vae_scratch_bytes;
+            return create_storage_descriptor_set(rt, rt->taehv_tgrow_set_layout,
+                    2, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        case WORLD_VULKAN_VAE_PIXEL_SHUFFLE:
+            buffers[0] = vae_scratch_buffer(rt, op->src);
+            buffers[1] = rt->output_buffer;
+            sizes[0] = rt->vae_scratch_bytes;
+            sizes[1] = rt->pixel_count * sizeof(uint32_t);
+            return create_storage_descriptor_set(rt, rt->taehv_pixel_shuffle_set_layout,
+                    2, buffers, sizes, NULL, &op->descriptor_pool, &op->descriptor_set);
+        default:
+            return 1;
+    }
+}
+
+static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeights *vae) {
+    if (!vae || !rt->model_slice_enabled || !rt->latent_buffer || !rt->dummy_bias_buffer) return 0;
+    if (build_runtime_vae_ops(rt, vae)) return 1;
+    rt->vae_scratch_bytes = rt->vae_max_elems * sizeof(float);
+    if (rt->vae_scratch_bytes == 0) return 0;
+
+    if (create_host_buffer(rt, rt->vae_scratch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->vae_buf0_buffer, &rt->vae_buf0_memory, &rt->vae_buf0_mapped)) return 1;
+    if (create_host_buffer(rt, rt->vae_scratch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->vae_buf1_buffer, &rt->vae_buf1_memory, &rt->vae_buf1_mapped)) return 1;
+    if (create_host_buffer(rt, rt->vae_scratch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->vae_buf2_buffer, &rt->vae_buf2_memory, &rt->vae_buf2_mapped)) return 1;
+    memset(rt->vae_buf0_mapped, 0, rt->vae_scratch_bytes);
+    memset(rt->vae_buf1_mapped, 0, rt->vae_scratch_bytes);
+    memset(rt->vae_buf2_mapped, 0, rt->vae_scratch_bytes);
+
+    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+        const WorldVaeConvWeight *conv = &vae->convs[i];
+        if (!conv->weight || conv->out_c <= 0 || conv->in_c <= 0 || conv->kernel <= 0) {
+            fprintf(stderr, "missing Vulkan VAE weights for conv %d\n", i);
+            return 1;
+        }
+        rt->vae_weight_bytes[i] = (size_t)conv->out_c * conv->in_c *
+            (size_t)conv->kernel * conv->kernel * sizeof(float);
+        if (create_host_buffer(rt, rt->vae_weight_bytes[i], VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    &rt->vae_weight_buffer[i], &rt->vae_weight_memory[i], &rt->vae_weight_mapped[i])) return 1;
+        memcpy(rt->vae_weight_mapped[i], conv->weight, rt->vae_weight_bytes[i]);
+        if (conv->has_bias) {
+            if (!conv->bias) {
+                fprintf(stderr, "missing Vulkan VAE bias for conv %d\n", i);
+                return 1;
+            }
+            rt->vae_bias_bytes[i] = (size_t)conv->out_c * sizeof(float);
+            if (create_host_buffer(rt, rt->vae_bias_bytes[i], VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        &rt->vae_bias_buffer[i], &rt->vae_bias_memory[i], &rt->vae_bias_mapped[i])) return 1;
+            memcpy(rt->vae_bias_mapped[i], conv->bias, rt->vae_bias_bytes[i]);
+        }
+    }
+
+    if (create_storage_pipeline(rt, "taehv_repeat_clamp_f32.comp", 2, sizeof(WorldVulkanTaehvRepeatClampPush),
+                &rt->taehv_repeat_clamp_shader, &rt->taehv_repeat_clamp_set_layout,
+                &rt->taehv_repeat_clamp_pipeline_layout, &rt->taehv_repeat_clamp_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_conv2d_nchw_f32.comp", 4, sizeof(WorldVulkanTaehvConv2dPush),
+                &rt->taehv_conv_shader, &rt->taehv_conv_set_layout,
+                &rt->taehv_conv_pipeline_layout, &rt->taehv_conv_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_relu_f32.comp", 1, sizeof(WorldVulkanSiluPush),
+                &rt->taehv_relu_shader, &rt->taehv_relu_set_layout,
+                &rt->taehv_relu_pipeline_layout, &rt->taehv_relu_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_concat_past_nchw_f32.comp", 2, sizeof(WorldVulkanTaehvNchwPush),
+                &rt->taehv_concat_past_shader, &rt->taehv_concat_past_set_layout,
+                &rt->taehv_concat_past_pipeline_layout, &rt->taehv_concat_past_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_add_relu_f32.comp", 3, sizeof(WorldVulkanSiluPush),
+                &rt->taehv_add_relu_shader, &rt->taehv_add_relu_set_layout,
+                &rt->taehv_add_relu_pipeline_layout, &rt->taehv_add_relu_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_upsample2_nchw_f32.comp", 2, sizeof(WorldVulkanTaehvNchwPush),
+                &rt->taehv_upsample2_shader, &rt->taehv_upsample2_set_layout,
+                &rt->taehv_upsample2_pipeline_layout, &rt->taehv_upsample2_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_tgrow_reshape_nchw_f32.comp", 2, sizeof(WorldVulkanTaehvTgrowPush),
+                &rt->taehv_tgrow_shader, &rt->taehv_tgrow_set_layout,
+                &rt->taehv_tgrow_pipeline_layout, &rt->taehv_tgrow_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "taehv_pixel_shuffle_rgba_f32.comp", 2, sizeof(WorldVulkanTaehvPixelShufflePush),
+                &rt->taehv_pixel_shuffle_shader, &rt->taehv_pixel_shuffle_set_layout,
+                &rt->taehv_pixel_shuffle_pipeline_layout, &rt->taehv_pixel_shuffle_pipeline)) return 1;
+
+    for (int i = 0; i < rt->vae_op_count; ++i) {
+        if (create_runtime_vae_op_descriptor(rt, &rt->vae_ops[i])) return 1;
+    }
+
+    rt->vae_enabled = 1;
+    fprintf(stderr, "Vulkan VAE F32/NCHW decode enabled: ops=%d scratch=%.2f MiB RGB=%dx%d frames=%d\n",
+            rt->vae_op_count, (double)(3 * rt->vae_scratch_bytes) / (1024.0 * 1024.0),
+            rt->width, rt->height, rt->frames);
+    return 0;
+}
+
+static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
+    for (int i = 0; i < rt->vae_op_count; ++i) {
+        WorldVulkanVaeOp *op = &rt->vae_ops[i];
+        switch (op->kind) {
+            case WORLD_VULKAN_VAE_REPEAT_CLAMP: {
+                WorldVulkanTaehvRepeatClampPush push = {(uint32_t)op->C, (uint32_t)op->H, (uint32_t)op->W};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_repeat_clamp_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_repeat_clamp_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_repeat_clamp_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)vae_elems(op->N, op->C, op->H, op->W) + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_CONV: {
+                WorldVulkanTaehvConv2dPush push;
+                memset(&push, 0, sizeof(push));
+                push.N = (uint32_t)op->N;
+                push.C_in = (uint32_t)op->C;
+                push.C_out = (uint32_t)op->C_out;
+                push.H = (uint32_t)op->H;
+                push.W = (uint32_t)op->W;
+                push.K = (uint32_t)op->stride;
+                push.has_bias = rt->vae_bias_buffer[op->conv_idx] ? 1u : 0u;
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_conv_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_conv_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_conv_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)vae_elems(op->N, op->C_out, op->H, op->W) + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_RELU: {
+                WorldVulkanSiluPush push = {(uint32_t)vae_elems(op->N, op->C, op->H, op->W)};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_relu_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_relu_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_relu_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer, (push.n + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_CONCAT_PAST: {
+                WorldVulkanTaehvNchwPush push = {(uint32_t)op->N, (uint32_t)op->C, (uint32_t)op->H, (uint32_t)op->W};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_concat_past_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_concat_past_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_concat_past_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)vae_elems(op->N, op->C * 2, op->H, op->W) + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_ADD_RELU: {
+                WorldVulkanSiluPush push = {(uint32_t)vae_elems(op->N, op->C, op->H, op->W)};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_add_relu_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_add_relu_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_add_relu_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer, (push.n + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_UPSAMPLE2: {
+                WorldVulkanTaehvNchwPush push = {(uint32_t)op->N, (uint32_t)op->C, (uint32_t)op->H, (uint32_t)op->W};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_upsample2_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_upsample2_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_upsample2_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)vae_elems(op->N, op->C, op->H * 2, op->W * 2) + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_TGROW: {
+                WorldVulkanTaehvTgrowPush push = {
+                    (uint32_t)op->N, (uint32_t)op->C, (uint32_t)op->H, (uint32_t)op->W, (uint32_t)op->stride
+                };
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_tgrow_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_tgrow_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_tgrow_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)vae_elems(op->N * op->stride, op->C, op->H, op->W) + 255u) / 256u, 1, 1);
+                break;
+            }
+            case WORLD_VULKAN_VAE_PIXEL_SHUFFLE: {
+                WorldVulkanTaehvPixelShufflePush push = {(uint32_t)op->N, (uint32_t)op->H, (uint32_t)op->W};
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->taehv_pixel_shuffle_pipeline);
+                vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        rt->taehv_pixel_shuffle_pipeline_layout, 0, 1, &op->descriptor_set, 0, NULL);
+                vkCmdPushConstants(rt->command_buffer, rt->taehv_pixel_shuffle_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                vkCmdDispatch(rt->command_buffer,
+                        ((uint32_t)rt->pixel_count + 255u) / 256u, 1, 1);
+                break;
+            }
+        }
+        cmd_shader_barrier(rt->command_buffer);
+    }
 }
 
 static int create_runtime_model_slice(
@@ -2496,6 +3017,14 @@ static int record_runtime_model_slice(
         rgba_push.control_y = control_input[1];
     }
 
+    {
+        const char *vae_only = getenv("WORLD_VULKAN_VAE_ONLY");
+        if (rt->vae_enabled && vae_only && vae_only[0] && vae_only[0] != '0') {
+            record_runtime_vae_decode(rt);
+            return 0;
+        }
+    }
+
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
 
@@ -2904,15 +3433,19 @@ static int record_runtime_model_slice(
         }
     }
 
-    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->latent_rgba_pipeline);
-    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rt->latent_rgba_pipeline_layout, 0, 1, &rt->latent_rgba_descriptor_set, 0, NULL);
-    vkCmdPushConstants(rt->command_buffer, rt->latent_rgba_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(rgba_push), &rgba_push);
-    vkCmdDispatch(rt->command_buffer,
-            ((uint32_t)rt->width + 15u) / 16u,
-            ((uint32_t)rt->height + 15u) / 16u,
-            (uint32_t)rt->frames);
+    if (rt->vae_enabled) {
+        record_runtime_vae_decode(rt);
+    } else {
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->latent_rgba_pipeline);
+        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                rt->latent_rgba_pipeline_layout, 0, 1, &rt->latent_rgba_descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->latent_rgba_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(rgba_push), &rgba_push);
+        vkCmdDispatch(rt->command_buffer,
+                ((uint32_t)rt->width + 15u) / 16u,
+                ((uint32_t)rt->height + 15u) / 16u,
+                (uint32_t)rt->frames);
+    }
     return 0;
 }
 
@@ -2927,7 +3460,6 @@ int world_vulkan_runtime_create(
         int noise_mode,
         const WorldVaeDecoderWeights *vae) {
     (void)noise_mode;
-    (void)vae;
     if (!out || !cfg) return 1;
     *out = NULL;
 
@@ -3007,6 +3539,7 @@ int world_vulkan_runtime_create(
     if (create_descriptors(rt)) goto fail;
     if (create_commands(rt)) goto fail;
     if (create_runtime_model_slice(rt, weights)) goto fail;
+    if (create_runtime_vae(rt, vae)) goto fail;
 
     *out = rt;
     return 0;
@@ -6889,6 +7422,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->patchify_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->patchify_descriptor_pool, NULL);
     if (rt->unpatch_orig_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->unpatch_orig_descriptor_pool, NULL);
     if (rt->latent_rgba_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_rgba_descriptor_pool, NULL);
+    for (int i = 0; i < rt->vae_op_count; ++i) {
+        if (rt->vae_ops[i].descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->vae_ops[i].descriptor_pool, NULL);
+    }
     if (rt->ctrl_fc1_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_descriptor_pool, NULL);
     if (rt->ctrl_silu_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_silu_descriptor_pool, NULL);
     if (rt->ctrl_fc2_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_descriptor_pool, NULL);
@@ -6973,6 +7509,14 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
     if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
     if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
+    if (rt->taehv_repeat_clamp_pipeline) vkDestroyPipeline(rt->device, rt->taehv_repeat_clamp_pipeline, NULL);
+    if (rt->taehv_conv_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_pipeline, NULL);
+    if (rt->taehv_relu_pipeline) vkDestroyPipeline(rt->device, rt->taehv_relu_pipeline, NULL);
+    if (rt->taehv_concat_past_pipeline) vkDestroyPipeline(rt->device, rt->taehv_concat_past_pipeline, NULL);
+    if (rt->taehv_add_relu_pipeline) vkDestroyPipeline(rt->device, rt->taehv_add_relu_pipeline, NULL);
+    if (rt->taehv_upsample2_pipeline) vkDestroyPipeline(rt->device, rt->taehv_upsample2_pipeline, NULL);
+    if (rt->taehv_tgrow_pipeline) vkDestroyPipeline(rt->device, rt->taehv_tgrow_pipeline, NULL);
+    if (rt->taehv_pixel_shuffle_pipeline) vkDestroyPipeline(rt->device, rt->taehv_pixel_shuffle_pipeline, NULL);
     if (rt->runtime_linear_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
     if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
@@ -6991,6 +7535,14 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
     if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
     if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
+    if (rt->taehv_repeat_clamp_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_repeat_clamp_pipeline_layout, NULL);
+    if (rt->taehv_conv_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_pipeline_layout, NULL);
+    if (rt->taehv_relu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_relu_pipeline_layout, NULL);
+    if (rt->taehv_concat_past_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_concat_past_pipeline_layout, NULL);
+    if (rt->taehv_add_relu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_add_relu_pipeline_layout, NULL);
+    if (rt->taehv_upsample2_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_upsample2_pipeline_layout, NULL);
+    if (rt->taehv_tgrow_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_tgrow_pipeline_layout, NULL);
+    if (rt->taehv_pixel_shuffle_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_pixel_shuffle_pipeline_layout, NULL);
     if (rt->runtime_linear_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_linear_set_layout, NULL);
     if (rt->runtime_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_silu_set_layout, NULL);
     if (rt->runtime_add_bias_silu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->runtime_add_bias_silu_set_layout, NULL);
@@ -7009,6 +7561,14 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
     if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
     if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
+    if (rt->taehv_repeat_clamp_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_repeat_clamp_set_layout, NULL);
+    if (rt->taehv_conv_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_set_layout, NULL);
+    if (rt->taehv_relu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_relu_set_layout, NULL);
+    if (rt->taehv_concat_past_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_concat_past_set_layout, NULL);
+    if (rt->taehv_add_relu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_add_relu_set_layout, NULL);
+    if (rt->taehv_upsample2_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_upsample2_set_layout, NULL);
+    if (rt->taehv_tgrow_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_tgrow_set_layout, NULL);
+    if (rt->taehv_pixel_shuffle_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_pixel_shuffle_set_layout, NULL);
     if (rt->runtime_linear_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
     if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
@@ -7027,6 +7587,21 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
     if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
     if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
+    if (rt->taehv_repeat_clamp_shader) vkDestroyShaderModule(rt->device, rt->taehv_repeat_clamp_shader, NULL);
+    if (rt->taehv_conv_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_shader, NULL);
+    if (rt->taehv_relu_shader) vkDestroyShaderModule(rt->device, rt->taehv_relu_shader, NULL);
+    if (rt->taehv_concat_past_shader) vkDestroyShaderModule(rt->device, rt->taehv_concat_past_shader, NULL);
+    if (rt->taehv_add_relu_shader) vkDestroyShaderModule(rt->device, rt->taehv_add_relu_shader, NULL);
+    if (rt->taehv_upsample2_shader) vkDestroyShaderModule(rt->device, rt->taehv_upsample2_shader, NULL);
+    if (rt->taehv_tgrow_shader) vkDestroyShaderModule(rt->device, rt->taehv_tgrow_shader, NULL);
+    if (rt->taehv_pixel_shuffle_shader) vkDestroyShaderModule(rt->device, rt->taehv_pixel_shuffle_shader, NULL);
+    destroy_host_buffer(rt, rt->vae_buf0_buffer, rt->vae_buf0_memory, rt->vae_buf0_mapped);
+    destroy_host_buffer(rt, rt->vae_buf1_buffer, rt->vae_buf1_memory, rt->vae_buf1_mapped);
+    destroy_host_buffer(rt, rt->vae_buf2_buffer, rt->vae_buf2_memory, rt->vae_buf2_mapped);
+    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+        destroy_host_buffer(rt, rt->vae_weight_buffer[i], rt->vae_weight_memory[i], rt->vae_weight_mapped[i]);
+        destroy_host_buffer(rt, rt->vae_bias_buffer[i], rt->vae_bias_memory[i], rt->vae_bias_mapped[i]);
+    }
     destroy_host_buffer(rt, rt->latent_buffer, rt->latent_memory, rt->latent_mapped);
     destroy_host_buffer(rt, rt->control_buffer, rt->control_memory, rt->control_mapped);
     destroy_host_buffer(rt, rt->ctrl_fc1_weight_buffer, rt->ctrl_fc1_weight_memory, rt->ctrl_fc1_weight_mapped);
