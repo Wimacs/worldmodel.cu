@@ -132,6 +132,17 @@ typedef struct {
     uint32_t out_dim;
 } WorldVulkanUnpatchifyPush;
 
+typedef struct {
+    uint32_t B;
+    uint32_t Hq;
+    uint32_t Hkv;
+    uint32_t Tq;
+    uint32_t Nkv;
+    uint32_t Tk;
+    uint32_t D;
+    float scale;
+} WorldVulkanIndexedAttentionPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -2379,6 +2390,141 @@ cleanup:
         destroy_host_buffer(rt, weight_buffer, weight_memory, weight_mapped);
         destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_indexed_attention_f32_probe(void) {
+    enum { B = 1, Hq = 8, Hkv = 2, Tq = 9, Tk = 17, D = 64, Nkv = 5 };
+    const float scale = 1.0f / sqrtf((float)D);
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer q_buffer = VK_NULL_HANDLE;
+    VkBuffer k_buffer = VK_NULL_HANDLE;
+    VkBuffer v_buffer = VK_NULL_HANDLE;
+    VkBuffer indices_buffer = VK_NULL_HANDLE;
+    VkBuffer out_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory q_memory = VK_NULL_HANDLE;
+    VkDeviceMemory k_memory = VK_NULL_HANDLE;
+    VkDeviceMemory v_memory = VK_NULL_HANDLE;
+    VkDeviceMemory indices_memory = VK_NULL_HANDLE;
+    VkDeviceMemory out_memory = VK_NULL_HANDLE;
+    void *q_mapped = NULL;
+    void *k_mapped = NULL;
+    void *v_mapped = NULL;
+    void *indices_mapped = NULL;
+    void *out_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t q_bytes = (size_t)B * Hq * Tq * D * sizeof(float);
+    size_t kv_bytes = (size_t)B * Hkv * Tk * D * sizeof(float);
+    size_t indices_bytes = (size_t)Nkv * sizeof(uint32_t);
+    if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &q_buffer, &q_memory, &q_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &k_buffer, &k_memory, &k_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &v_buffer, &v_memory, &v_mapped)) goto cleanup;
+    if (create_host_buffer(rt, indices_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &indices_buffer, &indices_memory, &indices_mapped)) goto cleanup;
+    if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &out_buffer, &out_memory, &out_mapped)) goto cleanup;
+
+    float *q = (float *)q_mapped;
+    float *k = (float *)k_mapped;
+    float *v = (float *)v_mapped;
+    uint32_t *indices = (uint32_t *)indices_mapped;
+    float *out = (float *)out_mapped;
+    for (int i = 0; i < B * Hq * Tq * D; ++i) q[i] = probe_value(i + 2309, 0.021484375f);
+    for (int i = 0; i < B * Hkv * Tk * D; ++i) {
+        k[i] = probe_value(i + 2411, 0.01953125f);
+        v[i] = probe_value(i + 2503, 0.02734375f);
+    }
+    const uint32_t indices_ref[Nkv] = {0u, 3u, 4u, 9u, 16u};
+    memcpy(indices, indices_ref, indices_bytes);
+    memset(out, 0, q_bytes);
+
+    if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 5, sizeof(WorldVulkanIndexedAttentionPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[5] = {q_buffer, k_buffer, v_buffer, indices_buffer, out_buffer};
+    VkDeviceSize sizes[5] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, q_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 5, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+    WorldVulkanIndexedAttentionPush push;
+    push.B = B;
+    push.Hq = Hq;
+    push.Hkv = Hkv;
+    push.Tq = Tq;
+    push.Nkv = Nkv;
+    push.Tk = Tk;
+    push.D = D;
+    push.scale = scale;
+    if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                B * Hq * Tq, 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    int group = Hq / Hkv;
+    for (int b = 0; b < B; ++b) {
+        for (int hq = 0; hq < Hq; ++hq) {
+            int hk = hq / group;
+            for (int tq = 0; tq < Tq; ++tq) {
+                const float *qrow = q + ((b * Hq + hq) * Tq + tq) * D;
+                const float *kbase = k + (b * Hkv + hk) * Tk * D;
+                const float *vbase = v + (b * Hkv + hk) * Tk * D;
+                float scores[Nkv];
+                float max_score = -INFINITY;
+                for (int n = 0; n < Nkv; ++n) {
+                    int tk = (int)indices[n];
+                    float dot = 0.0f;
+                    for (int d = 0; d < D; ++d) dot += qrow[d] * kbase[tk * D + d];
+                    scores[n] = dot * scale;
+                    if (scores[n] > max_score) max_score = scores[n];
+                }
+                float denom = 0.0f;
+                for (int n = 0; n < Nkv; ++n) denom += expf(scores[n] - max_score);
+                for (int d = 0; d < D; ++d) {
+                    float ref = 0.0f;
+                    for (int n = 0; n < Nkv; ++n) {
+                        int tk = (int)indices[n];
+                        ref += expf(scores[n] - max_score) * vbase[tk * D + d];
+                    }
+                    ref /= denom;
+                    size_t idx = (size_t)(((b * Hq + hq) * Tq + tq) * D + d);
+                    float diff = fabsf(out[idx] - ref);
+                    if (diff > max_abs) max_abs = diff;
+                    mean_abs += diff;
+                }
+            }
+        }
+    }
+    mean_abs /= (float)(B * Hq * Tq * D);
+    fprintf(stderr, "vulkan indexed_attention_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 4.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, q_buffer, q_memory, q_mapped);
+        destroy_host_buffer(rt, k_buffer, k_memory, k_mapped);
+        destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
+        destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
+        destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
