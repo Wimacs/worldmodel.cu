@@ -98,6 +98,7 @@ if(WORLD_ENABLE_VULKAN)
     cache_frame_indices.comp
     fill_rgba.comp
     gated_residual_add_f32.comp
+    indexed_attention_d64_flash_f32.comp
     indexed_attention_d64_warp_f32.comp
     indexed_attention_f32.comp
     kv_cache_mask.comp

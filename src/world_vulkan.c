@@ -410,6 +410,10 @@ struct WorldVulkanRuntime {
     VkShaderModule runtime_indexed_attention_d64_shader;
     VkPipelineLayout runtime_indexed_attention_d64_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_pipeline;
+    VkShaderModule runtime_indexed_attention_d64_flash_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_flash_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_flash_pipeline;
+    int runtime_indexed_attention_d64_flash_enabled;
     VkShaderModule runtime_gated_residual_shader;
     VkDescriptorSetLayout runtime_gated_residual_set_layout;
     VkPipelineLayout runtime_gated_residual_pipeline_layout;
@@ -3105,6 +3109,16 @@ static int create_runtime_model_slice(
                             &rt->runtime_indexed_attention_d64_shader,
                             &rt->runtime_indexed_attention_d64_pipeline_layout,
                             &rt->runtime_indexed_attention_d64_pipeline)) return 1;
+                const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
+                if (!flash_env || flash_env[0] != '0') {
+                    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
+                                rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                &rt->runtime_indexed_attention_d64_flash_shader,
+                                &rt->runtime_indexed_attention_d64_flash_pipeline_layout,
+                                &rt->runtime_indexed_attention_d64_flash_pipeline)) return 1;
+                    rt->runtime_indexed_attention_d64_flash_enabled = 1;
+                    fprintf(stderr, "Vulkan d64 flash-style attention enabled; set WORLD_VULKAN_FLASH_ATTN=0 to disable\n");
+                }
             }
             if (rt->layer_attn_out_enabled) {
                 if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
@@ -3881,11 +3895,29 @@ static int record_runtime_model_slice(
 
                 VkPipeline attn_pipeline = rt->runtime_indexed_attention_pipeline;
                 VkPipelineLayout attn_pipeline_layout = rt->runtime_indexed_attention_pipeline_layout;
+                const char *attn_label = "attention.generic";
+                uint32_t attn_dispatch_x = (uint32_t)(rt->cfg.n_heads * rt->T);
                 const char *disable_d64_attn = getenv("WORLD_VULKAN_DISABLE_D64_ATTENTION");
-                if (rt->d_head == 64 && rt->runtime_indexed_attention_d64_pipeline &&
-                        !(disable_d64_attn && disable_d64_attn[0] && disable_d64_attn[0] != '0')) {
-                    attn_pipeline = rt->runtime_indexed_attention_d64_pipeline;
-                    attn_pipeline_layout = rt->runtime_indexed_attention_d64_pipeline_layout;
+                int d64_allowed = !(disable_d64_attn && disable_d64_attn[0] && disable_d64_attn[0] != '0');
+                if (rt->d_head == 64 && d64_allowed) {
+                    uint32_t group = rt->cfg.n_kv_heads > 0 ?
+                        (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
+                    if (rt->runtime_indexed_attention_d64_flash_enabled &&
+                            rt->runtime_indexed_attention_d64_flash_pipeline &&
+                            group > 0u && group <= 16u &&
+                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+                        uint32_t q_per_h = 16u / group;
+                        if (q_per_h == 0u) q_per_h = 1u;
+                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+                        attn_pipeline = rt->runtime_indexed_attention_d64_flash_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash_pipeline_layout;
+                        attn_label = "attention.d64_flash";
+                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+                    } else if (rt->runtime_indexed_attention_d64_pipeline) {
+                        attn_pipeline = rt->runtime_indexed_attention_d64_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_pipeline_layout;
+                        attn_label = "attention.d64";
+                    }
                 }
                 vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, attn_pipeline);
                 vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3893,10 +3925,7 @@ static int record_runtime_model_slice(
                         &rt->indexed_attention_descriptor_sets[layer_idx], 0, NULL);
                 vkCmdPushConstants(rt->command_buffer, attn_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(attn_push), &attn_push);
-                PROFILE_DISPATCH(attn_pipeline == rt->runtime_indexed_attention_d64_pipeline ?
-                        "attention.d64" : "attention.generic",
-                        (uint32_t)(rt->cfg.n_heads * rt->T),
-                        1, 1);
+                PROFILE_DISPATCH(attn_label, attn_dispatch_x, 1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
                 if (rt->layer_attn_out_enabled) {
@@ -8300,6 +8329,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkShaderModule d64_shader = VK_NULL_HANDLE;
     VkPipelineLayout d64_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline d64_pipeline = VK_NULL_HANDLE;
+    VkShaderModule flash_shader = VK_NULL_HANDLE;
+    VkPipelineLayout flash_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline flash_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkBuffer q_buffer = VK_NULL_HANDLE;
@@ -8416,11 +8448,24 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     if (submit_compute(rt, d64_pipeline, d64_pipeline_layout, descriptor_set, &push, sizeof(push),
                 B * Hq * Tq, 1, 1)) goto cleanup;
     CHECK_INDEXED_ATTENTION("indexed_attention_d64_warp_f32");
+
+    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
+                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                &flash_shader, &flash_pipeline_layout, &flash_pipeline)) goto cleanup;
+    int q_per_h = 16 / group;
+    if (q_per_h < 1) q_per_h = 1;
+    int q_blocks = (Tq + q_per_h - 1) / q_per_h;
+    if (submit_compute(rt, flash_pipeline, flash_pipeline_layout, descriptor_set, &push, sizeof(push),
+                Hkv * q_blocks, 1, 1)) goto cleanup;
+    CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_f32");
 #undef CHECK_INDEXED_ATTENTION
     rc = 0;
 
 cleanup:
     if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (flash_pipeline) vkDestroyPipeline(rt->device, flash_pipeline, NULL);
+    if (flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash_pipeline_layout, NULL);
+    if (flash_shader) vkDestroyShaderModule(rt->device, flash_shader, NULL);
     if (d64_pipeline) vkDestroyPipeline(rt->device, d64_pipeline, NULL);
     if (d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, d64_pipeline_layout, NULL);
     if (d64_shader) vkDestroyShaderModule(rt->device, d64_shader, NULL);
@@ -8530,6 +8575,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_pipeline) vkDestroyPipeline(rt->device, rt->runtime_cache_indices_pipeline, NULL);
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
     if (rt->runtime_add_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_pipeline, NULL);
@@ -8561,6 +8607,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_cache_indices_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
     if (rt->runtime_add_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_pipeline_layout, NULL);
@@ -8621,6 +8668,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_cache_indices_shader) vkDestroyShaderModule(rt->device, rt->runtime_cache_indices_shader, NULL);
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
     if (rt->runtime_indexed_attention_d64_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_flash_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
     if (rt->runtime_add_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_shader, NULL);
