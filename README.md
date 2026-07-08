@@ -51,20 +51,20 @@ cmake --build build -j
 ```
 
 The Vulkan target currently builds `worldmodel_raylib_vulkan` and compiles
-the GLSL files in `shaders/vulkan/` to SPIR-V. This is the first backend slice:
-it creates a Vulkan device, compute pipelines, dispatches shaders, and returns
-RGB frames through the same raylib/headless path. `worldmodel_vulkan_probe`
-currently runs a CPU parity check for the first model-relevant Vulkan op,
-`linear_f32.comp`, plus elementwise `silu_f32.comp` and rowwise
-`rms_norm_f32.comp`, plus the fused modulation op `ada_rms_norm_f32.comp`.
-It also checks `ortho_rope_f32.comp` against the current WorldModel RoPE
-formula, and `qkv_rms_rope_f32.comp` for fused Q/K/V split, Q/K RMSNorm, and
-Q/K RoPE. `masked_attention_f32.comp` checks the written-mask GQA attention
-path. The KV cache path is covered by `kv_cache_mask.comp`,
-`kv_cache_upsert_copy_f32.comp`, and `cache_frame_indices.comp`.
-`indexed_attention_f32.comp` covers cache-indexed GQA attention.
-`patchify_f32.comp` and `unpatchify_f32.comp` cover the latent/token boundary.
-The actual transformer/VAE runtime kernels are still being ported from CUDA.
+the GLSL files in `shaders/vulkan/` to SPIR-V. The runtime creates a Vulkan
+device, resident compute pipelines, and returns RGB frames through the same
+raylib/headless path. When real model weights are supplied, the Vulkan raylib
+path now runs a resident latent visualization slice every frame:
+`patchify_f32.comp -> unpatchify_orig_f32.comp -> latent_to_rgba.comp`.
+This wires the loaded patch/unpatch weights into the interactive runtime while
+the full transformer/VAE port is still in progress. Without weights, it falls
+back to the simple `fill_rgba.comp` scaffold for lightweight probes.
+
+`worldmodel_vulkan_probe` currently runs CPU parity checks for `linear_f32.comp`,
+elementwise `silu_f32.comp`, rowwise `rms_norm_f32.comp`, fused
+`ada_rms_norm_f32.comp`, `ortho_rope_f32.comp`, fused
+`qkv_rms_rope_f32.comp`, `masked_attention_f32.comp`, the KV-cache helpers,
+`indexed_attention_f32.comp`, and the patch/unpatch latent-token boundary.
 
 ```sh
 ./build/worldmodel_raylib_vulkan \

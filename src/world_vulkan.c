@@ -133,6 +133,30 @@ typedef struct {
 } WorldVulkanUnpatchifyPush;
 
 typedef struct {
+    uint32_t T;
+    uint32_t D;
+    uint32_t C;
+    uint32_t H;
+    uint32_t W;
+    uint32_t ph;
+    uint32_t pw;
+    uint32_t Wp;
+    uint32_t out_dim;
+} WorldVulkanUnpatchifyOrigPush;
+
+typedef struct {
+    uint32_t out_width;
+    uint32_t out_height;
+    uint32_t frames;
+    uint32_t latent_c;
+    uint32_t latent_h;
+    uint32_t latent_w;
+    uint32_t frame_ordinal;
+    float control_x;
+    float control_y;
+} WorldVulkanLatentRgbaPush;
+
+typedef struct {
     uint32_t B;
     uint32_t Hq;
     uint32_t Hkv;
@@ -169,6 +193,55 @@ struct WorldVulkanRuntime {
     int height;
     int frames;
     int frame_ordinal;
+    unsigned int seed;
+    int model_slice_enabled;
+    int C;
+    int H;
+    int W;
+    int D;
+    int ph;
+    int pw;
+    int T;
+    int out_dim;
+    size_t latent_elems;
+    size_t token_elems;
+    int use_external_latent_once;
+    VkShaderModule patchify_shader;
+    VkDescriptorSetLayout patchify_set_layout;
+    VkPipelineLayout patchify_pipeline_layout;
+    VkPipeline patchify_pipeline;
+    VkDescriptorPool patchify_descriptor_pool;
+    VkDescriptorSet patchify_descriptor_set;
+    VkShaderModule unpatch_orig_shader;
+    VkDescriptorSetLayout unpatch_orig_set_layout;
+    VkPipelineLayout unpatch_orig_pipeline_layout;
+    VkPipeline unpatch_orig_pipeline;
+    VkDescriptorPool unpatch_orig_descriptor_pool;
+    VkDescriptorSet unpatch_orig_descriptor_set;
+    VkShaderModule latent_rgba_shader;
+    VkDescriptorSetLayout latent_rgba_set_layout;
+    VkPipelineLayout latent_rgba_pipeline_layout;
+    VkPipeline latent_rgba_pipeline;
+    VkDescriptorPool latent_rgba_descriptor_pool;
+    VkDescriptorSet latent_rgba_descriptor_set;
+    VkBuffer latent_buffer;
+    VkDeviceMemory latent_memory;
+    void *latent_mapped;
+    VkBuffer patch_weight_buffer;
+    VkDeviceMemory patch_weight_memory;
+    void *patch_weight_mapped;
+    VkBuffer tokens_buffer;
+    VkDeviceMemory tokens_memory;
+    void *tokens_mapped;
+    VkBuffer unpatch_weight_buffer;
+    VkDeviceMemory unpatch_weight_memory;
+    void *unpatch_weight_mapped;
+    VkBuffer unpatch_bias_buffer;
+    VkDeviceMemory unpatch_bias_memory;
+    void *unpatch_bias_mapped;
+    VkBuffer latent_out_buffer;
+    VkDeviceMemory latent_out_memory;
+    void *latent_out_mapped;
 };
 
 static double now_seconds(void) {
@@ -664,6 +737,189 @@ static int submit_compute(
     return 0;
 }
 
+static void fill_runtime_latent(WorldVulkanRuntime *rt, const float *control_input) {
+    float *latent = (float *)rt->latent_mapped;
+    float cx = control_input ? control_input[0] : 0.0f;
+    float cy = control_input ? control_input[1] : 0.0f;
+    float frame = (float)rt->frame_ordinal;
+    for (int c = 0; c < rt->C; ++c) {
+        for (int y = 0; y < rt->H; ++y) {
+            for (int x = 0; x < rt->W; ++x) {
+                float fx = ((float)x + 0.5f) / (float)rt->W;
+                float fy = ((float)y + 0.5f) / (float)rt->H;
+                float fc = (float)(c + 1);
+                float v = sinf(17.0f * fx + 11.0f * fy + 0.07f * frame + 0.13f * fc);
+                v += 0.35f * cosf(9.0f * fx * fc + 0.19f * frame + 0.2f * cx);
+                v += 0.25f * sinf(8.0f * fy + 0.15f * cy + 0.03f * (float)rt->seed);
+                latent[((c * rt->H + y) * rt->W + x)] = v;
+            }
+        }
+    }
+}
+
+static void cmd_shader_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier barrier;
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+static int create_runtime_model_slice(
+        WorldVulkanRuntime *rt,
+        const WorldModelProbeWeights *weights) {
+    if (!weights || !weights->patchify_weight || !weights->unpatchify_weight || !weights->unpatchify_bias) {
+        return 0;
+    }
+
+    rt->C = rt->cfg.channels;
+    rt->H = rt->cfg.height * rt->cfg.patch_h;
+    rt->W = rt->cfg.width * rt->cfg.patch_w;
+    rt->D = rt->cfg.d_model;
+    rt->ph = rt->cfg.patch_h;
+    rt->pw = rt->cfg.patch_w;
+    rt->T = rt->cfg.height * rt->cfg.width;
+    rt->out_dim = rt->C * rt->ph * rt->pw;
+    rt->latent_elems = (size_t)rt->C * rt->H * rt->W;
+    rt->token_elems = (size_t)rt->T * rt->D;
+
+    size_t latent_bytes = rt->latent_elems * sizeof(float);
+    size_t token_bytes = rt->token_elems * sizeof(float);
+    size_t patch_weight_bytes = (size_t)rt->D * rt->C * rt->ph * rt->pw * sizeof(float);
+    size_t unpatch_bias_bytes = (size_t)rt->C * sizeof(float);
+
+    if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->latent_buffer, &rt->latent_memory, &rt->latent_mapped)) return 1;
+    if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->patch_weight_buffer, &rt->patch_weight_memory, &rt->patch_weight_mapped)) return 1;
+    if (create_host_buffer(rt, token_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->tokens_buffer, &rt->tokens_memory, &rt->tokens_mapped)) return 1;
+    if (create_host_buffer(rt, patch_weight_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->unpatch_weight_buffer, &rt->unpatch_weight_memory, &rt->unpatch_weight_mapped)) return 1;
+    if (create_host_buffer(rt, unpatch_bias_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->unpatch_bias_buffer, &rt->unpatch_bias_memory, &rt->unpatch_bias_mapped)) return 1;
+    if (create_host_buffer(rt, latent_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &rt->latent_out_buffer, &rt->latent_out_memory, &rt->latent_out_mapped)) return 1;
+
+    memcpy(rt->patch_weight_mapped, weights->patchify_weight, patch_weight_bytes);
+    memcpy(rt->unpatch_weight_mapped, weights->unpatchify_weight, patch_weight_bytes);
+    memcpy(rt->unpatch_bias_mapped, weights->unpatchify_bias, unpatch_bias_bytes);
+    memset(rt->latent_mapped, 0, latent_bytes);
+    memset(rt->tokens_mapped, 0, token_bytes);
+    memset(rt->latent_out_mapped, 0, latent_bytes);
+
+    if (create_storage_pipeline(rt, "patchify_f32.comp", 3, sizeof(WorldVulkanPatchifyPush),
+                &rt->patchify_shader, &rt->patchify_set_layout,
+                &rt->patchify_pipeline_layout, &rt->patchify_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "unpatchify_orig_f32.comp", 4, sizeof(WorldVulkanUnpatchifyOrigPush),
+                &rt->unpatch_orig_shader, &rt->unpatch_orig_set_layout,
+                &rt->unpatch_orig_pipeline_layout, &rt->unpatch_orig_pipeline)) return 1;
+    if (create_storage_pipeline(rt, "latent_to_rgba.comp", 2, sizeof(WorldVulkanLatentRgbaPush),
+                &rt->latent_rgba_shader, &rt->latent_rgba_set_layout,
+                &rt->latent_rgba_pipeline_layout, &rt->latent_rgba_pipeline)) return 1;
+
+    {
+        VkBuffer buffers[3] = {rt->latent_buffer, rt->patch_weight_buffer, rt->tokens_buffer};
+        VkDeviceSize sizes[3] = {latent_bytes, patch_weight_bytes, token_bytes};
+        if (create_storage_descriptor_set(rt, rt->patchify_set_layout, 3, buffers, sizes,
+                    &rt->patchify_descriptor_pool, &rt->patchify_descriptor_set)) return 1;
+    }
+    {
+        VkBuffer buffers[4] = {
+            rt->tokens_buffer, rt->unpatch_weight_buffer, rt->unpatch_bias_buffer, rt->latent_out_buffer
+        };
+        VkDeviceSize sizes[4] = {token_bytes, patch_weight_bytes, unpatch_bias_bytes, latent_bytes};
+        if (create_storage_descriptor_set(rt, rt->unpatch_orig_set_layout, 4, buffers, sizes,
+                    &rt->unpatch_orig_descriptor_pool, &rt->unpatch_orig_descriptor_set)) return 1;
+    }
+    {
+        VkBuffer buffers[2] = {rt->latent_out_buffer, rt->output_buffer};
+        VkDeviceSize sizes[2] = {latent_bytes, rt->pixel_count * sizeof(uint32_t)};
+        if (create_storage_descriptor_set(rt, rt->latent_rgba_set_layout, 2, buffers, sizes,
+                    &rt->latent_rgba_descriptor_pool, &rt->latent_rgba_descriptor_set)) return 1;
+    }
+
+    rt->model_slice_enabled = 1;
+    fprintf(stderr,
+            "Vulkan resident latent slice enabled: C=%d H=%d W=%d T=%d D=%d bytes(latent)=%.2f MiB\n",
+            rt->C, rt->H, rt->W, rt->T, rt->D,
+            (double)latent_bytes / (1024.0 * 1024.0));
+    return 0;
+}
+
+static int record_runtime_model_slice(
+        WorldVulkanRuntime *rt,
+        const float *control_input) {
+    WorldVulkanPatchifyPush patch_push;
+    memset(&patch_push, 0, sizeof(patch_push));
+    patch_push.B = 1;
+    patch_push.C = (uint32_t)rt->C;
+    patch_push.H = (uint32_t)rt->H;
+    patch_push.W = (uint32_t)rt->W;
+    patch_push.D = (uint32_t)rt->D;
+    patch_push.ph = (uint32_t)rt->ph;
+    patch_push.pw = (uint32_t)rt->pw;
+    patch_push.Hp = (uint32_t)rt->cfg.height;
+    patch_push.Wp = (uint32_t)rt->cfg.width;
+
+    WorldVulkanUnpatchifyOrigPush unpatch_push;
+    memset(&unpatch_push, 0, sizeof(unpatch_push));
+    unpatch_push.T = (uint32_t)rt->T;
+    unpatch_push.D = (uint32_t)rt->D;
+    unpatch_push.C = (uint32_t)rt->C;
+    unpatch_push.H = (uint32_t)rt->H;
+    unpatch_push.W = (uint32_t)rt->W;
+    unpatch_push.ph = (uint32_t)rt->ph;
+    unpatch_push.pw = (uint32_t)rt->pw;
+    unpatch_push.Wp = (uint32_t)rt->cfg.width;
+    unpatch_push.out_dim = (uint32_t)rt->out_dim;
+
+    WorldVulkanLatentRgbaPush rgba_push;
+    memset(&rgba_push, 0, sizeof(rgba_push));
+    rgba_push.out_width = (uint32_t)rt->width;
+    rgba_push.out_height = (uint32_t)rt->height;
+    rgba_push.frames = (uint32_t)rt->frames;
+    rgba_push.latent_c = (uint32_t)rt->C;
+    rgba_push.latent_h = (uint32_t)rt->H;
+    rgba_push.latent_w = (uint32_t)rt->W;
+    rgba_push.frame_ordinal = (uint32_t)rt->frame_ordinal;
+    if (control_input) {
+        rgba_push.control_x = control_input[0];
+        rgba_push.control_y = control_input[1];
+    }
+
+    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->patchify_pipeline);
+    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            rt->patchify_pipeline_layout, 0, 1, &rt->patchify_descriptor_set, 0, NULL);
+    vkCmdPushConstants(rt->command_buffer, rt->patchify_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(patch_push), &patch_push);
+    vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->D), 1, 1);
+    cmd_shader_barrier(rt->command_buffer);
+
+    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->unpatch_orig_pipeline);
+    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            rt->unpatch_orig_pipeline_layout, 0, 1, &rt->unpatch_orig_descriptor_set, 0, NULL);
+    vkCmdPushConstants(rt->command_buffer, rt->unpatch_orig_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(unpatch_push), &unpatch_push);
+    vkCmdDispatch(rt->command_buffer, (uint32_t)(rt->T * rt->out_dim), 1, 1);
+    cmd_shader_barrier(rt->command_buffer);
+
+    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->latent_rgba_pipeline);
+    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            rt->latent_rgba_pipeline_layout, 0, 1, &rt->latent_rgba_descriptor_set, 0, NULL);
+    vkCmdPushConstants(rt->command_buffer, rt->latent_rgba_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(rgba_push), &rgba_push);
+    vkCmdDispatch(rt->command_buffer,
+            ((uint32_t)rt->width + 15u) / 16u,
+            ((uint32_t)rt->height + 15u) / 16u,
+            (uint32_t)rt->frames);
+    return 0;
+}
+
 int world_vulkan_runtime_create(
         WorldVulkanRuntime **out,
         const WorldConfig *cfg,
@@ -674,10 +930,8 @@ int world_vulkan_runtime_create(
         unsigned int seed,
         int noise_mode,
         const WorldVaeDecoderWeights *vae) {
-    (void)weights;
     (void)layers_to_run;
     (void)steps_to_run;
-    (void)seed;
     (void)noise_mode;
     (void)vae;
     if (!out || !cfg) return 1;
@@ -690,6 +944,7 @@ int world_vulkan_runtime_create(
     rt->height = cfg->height * cfg->patch_h * 16;
     rt->frames = 4;
     rt->frame_ordinal = frame_idx;
+    rt->seed = seed;
     rt->pixel_count = (size_t)rt->width * (size_t)rt->height * (size_t)rt->frames;
     rt->rgb_bytes = rt->pixel_count * 3;
     rt->rgb_host = (unsigned char *)malloc(rt->rgb_bytes);
@@ -699,7 +954,7 @@ int world_vulkan_runtime_create(
             "creating resident Vulkan runtime scaffold: RGB %dx%d frames=%d shader_dir=%s\n",
             rt->width, rt->height, rt->frames, WORLD_VULKAN_SHADER_DIR);
     fprintf(stderr,
-            "warning: Vulkan backend currently runs the compute-pipeline scaffold; model kernels are being ported incrementally\n");
+            "warning: Vulkan backend is partial; transformer/VAE kernels are being ported incrementally\n");
 
     VkApplicationInfo app_info;
     memset(&app_info, 0, sizeof(app_info));
@@ -737,6 +992,7 @@ int world_vulkan_runtime_create(
     if (create_output_buffer(rt)) goto fail;
     if (create_fill_pipeline(rt)) goto fail;
     if (create_descriptors(rt)) goto fail;
+    if (create_runtime_model_slice(rt, weights)) goto fail;
     if (create_commands(rt)) goto fail;
 
     *out = rt;
@@ -768,6 +1024,14 @@ int world_vulkan_runtime_step_rgb(
         float *seconds_out) {
     if (!rt || !rgb_out || !width_out || !height_out || !frames_out) return 1;
     double t0 = now_seconds();
+    if (rt->model_slice_enabled) {
+        if (rt->use_external_latent_once) {
+            rt->use_external_latent_once = 0;
+        } else {
+            fill_runtime_latent(rt, control_input);
+        }
+    }
+
     WorldVulkanFillPush push;
     memset(&push, 0, sizeof(push));
     push.width = (uint32_t)rt->width;
@@ -787,15 +1051,19 @@ int world_vulkan_runtime_step_rgb(
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CALL_RET(vkBeginCommandBuffer(rt->command_buffer, &begin_info));
-    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->fill_pipeline);
-    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            rt->pipeline_layout, 0, 1, &rt->descriptor_set, 0, NULL);
-    vkCmdPushConstants(rt->command_buffer, rt->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(push), &push);
-    vkCmdDispatch(rt->command_buffer,
-            ((uint32_t)rt->width + 15u) / 16u,
-            ((uint32_t)rt->height + 15u) / 16u,
-            (uint32_t)rt->frames);
+    if (rt->model_slice_enabled) {
+        if (record_runtime_model_slice(rt, control_input)) return 1;
+    } else {
+        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->fill_pipeline);
+        vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                rt->pipeline_layout, 0, 1, &rt->descriptor_set, 0, NULL);
+        vkCmdPushConstants(rt->command_buffer, rt->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(push), &push);
+        vkCmdDispatch(rt->command_buffer,
+                ((uint32_t)rt->width + 15u) / 16u,
+                ((uint32_t)rt->height + 15u) / 16u,
+                (uint32_t)rt->frames);
+    }
     VK_CALL_RET(vkEndCommandBuffer(rt->command_buffer));
 
     VkSubmitInfo submit_info;
@@ -814,7 +1082,8 @@ int world_vulkan_runtime_step_rgb(
     *height_out = rt->height;
     *frames_out = rt->frames;
     if (seconds_out) *seconds_out = (float)(now_seconds() - t0);
-    fprintf(stderr, "Vulkan scaffold timing: total=%.3fms rgb_fps=%.3f\n",
+    fprintf(stderr, "Vulkan %s timing: total=%.3fms rgb_fps=%.3f\n",
+            rt->model_slice_enabled ? "resident-slice" : "scaffold",
             (now_seconds() - t0) * 1000.0,
             (double)rt->frames / (now_seconds() - t0));
     return 0;
@@ -829,7 +1098,10 @@ int world_vulkan_runtime_seed_latent_rgb(
         int *height_out,
         int *frames_out,
         float *seconds_out) {
-    (void)latent;
+    if (rt && latent && rt->model_slice_enabled && rt->latent_mapped) {
+        memcpy(rt->latent_mapped, latent, rt->latent_elems * sizeof(float));
+        rt->use_external_latent_once = 1;
+    }
     return world_vulkan_runtime_step_rgb(rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
 }
 
@@ -2533,6 +2805,27 @@ cleanup:
 void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (!rt) return;
     if (rt->device) vkDeviceWaitIdle(rt->device);
+    if (rt->patchify_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->patchify_descriptor_pool, NULL);
+    if (rt->unpatch_orig_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->unpatch_orig_descriptor_pool, NULL);
+    if (rt->latent_rgba_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_rgba_descriptor_pool, NULL);
+    if (rt->patchify_pipeline) vkDestroyPipeline(rt->device, rt->patchify_pipeline, NULL);
+    if (rt->unpatch_orig_pipeline) vkDestroyPipeline(rt->device, rt->unpatch_orig_pipeline, NULL);
+    if (rt->latent_rgba_pipeline) vkDestroyPipeline(rt->device, rt->latent_rgba_pipeline, NULL);
+    if (rt->patchify_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->patchify_pipeline_layout, NULL);
+    if (rt->unpatch_orig_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->unpatch_orig_pipeline_layout, NULL);
+    if (rt->latent_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->latent_rgba_pipeline_layout, NULL);
+    if (rt->patchify_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->patchify_set_layout, NULL);
+    if (rt->unpatch_orig_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->unpatch_orig_set_layout, NULL);
+    if (rt->latent_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->latent_rgba_set_layout, NULL);
+    if (rt->patchify_shader) vkDestroyShaderModule(rt->device, rt->patchify_shader, NULL);
+    if (rt->unpatch_orig_shader) vkDestroyShaderModule(rt->device, rt->unpatch_orig_shader, NULL);
+    if (rt->latent_rgba_shader) vkDestroyShaderModule(rt->device, rt->latent_rgba_shader, NULL);
+    destroy_host_buffer(rt, rt->latent_buffer, rt->latent_memory, rt->latent_mapped);
+    destroy_host_buffer(rt, rt->patch_weight_buffer, rt->patch_weight_memory, rt->patch_weight_mapped);
+    destroy_host_buffer(rt, rt->tokens_buffer, rt->tokens_memory, rt->tokens_mapped);
+    destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
+    destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
+    destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);
     if (rt->output_mapped) vkUnmapMemory(rt->device, rt->output_memory);
     if (rt->fence) vkDestroyFence(rt->device, rt->fence, NULL);
     if (rt->command_pool) vkDestroyCommandPool(rt->device, rt->command_pool, NULL);

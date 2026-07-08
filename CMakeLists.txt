@@ -98,6 +98,7 @@ if(WORLD_ENABLE_VULKAN)
     kv_cache_mask.comp
     kv_cache_upsert_copy_f32.comp
     linear_f32.comp
+    latent_to_rgba.comp
     masked_attention_f32.comp
     ortho_rope_f32.comp
     patchify_f32.comp
@@ -105,6 +106,7 @@ if(WORLD_ENABLE_VULKAN)
     rms_norm_f32.comp
     silu_f32.comp
     unpatchify_f32.comp
+    unpatchify_orig_f32.comp
   )
   set(WORLD_VULKAN_SHADER_SPV)
   foreach(shader_name IN LISTS WORLD_VULKAN_SHADER_SOURCES)
@@ -195,6 +197,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
       raylib
       Vulkan::Vulkan
       Threads::Threads
+      m
     )
   endif()
 endif()
