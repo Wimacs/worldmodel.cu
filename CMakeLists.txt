@@ -111,6 +111,7 @@ if(WORLD_ENABLE_VULKAN)
     kv_cache_upsert_copy_f32.comp
     lerp_inplace_f32.comp
     linear_f16_coopmat.comp
+    linear_f16x_wf16_gated_residual.comp
     linear_f16x_wf16_coopmat.comp
     linear_f32_coopmat.comp
     linear_f32_wf16_silu_f16_n32.comp
