@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,13 @@ typedef struct {
     float control_x;
     float control_y;
 } WorldVulkanFillPush;
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t inner;
+    uint32_t has_bias;
+} WorldVulkanLinearPush;
 
 struct WorldVulkanRuntime {
     WorldConfig cfg;
@@ -194,17 +202,27 @@ static int find_memory_type(WorldVulkanRuntime *rt, uint32_t type_bits, VkMemory
     return 1;
 }
 
-static int create_output_buffer(WorldVulkanRuntime *rt) {
+static int create_host_buffer(
+        WorldVulkanRuntime *rt,
+        VkDeviceSize size,
+        VkBufferUsageFlags usage,
+        VkBuffer *buffer,
+        VkDeviceMemory *memory,
+        void **mapped) {
+    *buffer = VK_NULL_HANDLE;
+    *memory = VK_NULL_HANDLE;
+    *mapped = NULL;
+
     VkBufferCreateInfo buffer_info;
     memset(&buffer_info, 0, sizeof(buffer_info));
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = rt->pixel_count * sizeof(uint32_t);
-    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CALL_RET(vkCreateBuffer(rt->device, &buffer_info, NULL, &rt->output_buffer));
+    VK_CALL_RET(vkCreateBuffer(rt->device, &buffer_info, NULL, buffer));
 
     VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(rt->device, rt->output_buffer, &req);
+    vkGetBufferMemoryRequirements(rt->device, *buffer, &req);
     uint32_t type_index = 0;
     if (find_memory_type(rt, req.memoryTypeBits,
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -218,15 +236,31 @@ static int create_output_buffer(WorldVulkanRuntime *rt) {
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_info.allocationSize = req.size;
     alloc_info.memoryTypeIndex = type_index;
-    VK_CALL_RET(vkAllocateMemory(rt->device, &alloc_info, NULL, &rt->output_memory));
-    VK_CALL_RET(vkBindBufferMemory(rt->device, rt->output_buffer, rt->output_memory, 0));
-    VK_CALL_RET(vkMapMemory(rt->device, rt->output_memory, 0, buffer_info.size, 0, &rt->output_mapped));
+    VK_CALL_RET(vkAllocateMemory(rt->device, &alloc_info, NULL, memory));
+    VK_CALL_RET(vkBindBufferMemory(rt->device, *buffer, *memory, 0));
+    VK_CALL_RET(vkMapMemory(rt->device, *memory, 0, size, 0, mapped));
     return 0;
 }
 
-static int create_fill_pipeline(WorldVulkanRuntime *rt) {
+static void destroy_host_buffer(WorldVulkanRuntime *rt, VkBuffer buffer, VkDeviceMemory memory, void *mapped) {
+    if (mapped) vkUnmapMemory(rt->device, memory);
+    if (buffer) vkDestroyBuffer(rt->device, buffer, NULL);
+    if (memory) vkFreeMemory(rt->device, memory, NULL);
+}
+
+static int create_output_buffer(WorldVulkanRuntime *rt) {
+    return create_host_buffer(rt,
+            rt->pixel_count * sizeof(uint32_t),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            &rt->output_buffer,
+            &rt->output_memory,
+            &rt->output_mapped);
+}
+
+static int create_shader_module_from_name(WorldVulkanRuntime *rt, const char *shader_name, VkShaderModule *module_out) {
+    *module_out = VK_NULL_HANDLE;
     char path[4096];
-    int n = snprintf(path, sizeof(path), "%s/fill_rgba.comp.spv", WORLD_VULKAN_SHADER_DIR);
+    int n = snprintf(path, sizeof(path), "%s/%s.spv", WORLD_VULKAN_SHADER_DIR, shader_name);
     if (n < 0 || (size_t)n >= sizeof(path)) {
         fprintf(stderr, "Vulkan shader path too long\n");
         return 1;
@@ -241,9 +275,14 @@ static int create_fill_pipeline(WorldVulkanRuntime *rt) {
     shader_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_info.codeSize = spv_bytes;
     shader_info.pCode = (const uint32_t *)spv;
-    VkResult shader_result = vkCreateShaderModule(rt->device, &shader_info, NULL, &rt->fill_shader);
+    VkResult shader_result = vkCreateShaderModule(rt->device, &shader_info, NULL, module_out);
     free(spv);
     if (vk_check(shader_result, "vkCreateShaderModule", __FILE__, __LINE__)) return 1;
+    return 0;
+}
+
+static int create_fill_pipeline(WorldVulkanRuntime *rt) {
+    if (create_shader_module_from_name(rt, "fill_rgba.comp", &rt->fill_shader)) return 1;
 
     VkDescriptorSetLayoutBinding binding;
     memset(&binding, 0, sizeof(binding));
@@ -520,6 +559,221 @@ int world_vulkan_runtime_seed_latent_rgb(
         float *seconds_out) {
     (void)latent;
     return world_vulkan_runtime_step_rgb(rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
+}
+
+static float probe_value(int i, float scale) {
+    int v = (i * 37 + 17) % 29;
+    return ((float)v - 14.0f) * scale;
+}
+
+int world_vulkan_linear_f32_probe(void) {
+    enum { rows = 7, cols = 11, inner = 13 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer w_buffer = VK_NULL_HANDLE;
+    VkBuffer b_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory w_memory = VK_NULL_HANDLE;
+    VkDeviceMemory b_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *w_mapped = NULL;
+    void *b_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+
+    size_t x_bytes = (size_t)rows * inner * sizeof(float);
+    size_t w_bytes = (size_t)cols * inner * sizeof(float);
+    size_t b_bytes = (size_t)cols * sizeof(float);
+    size_t y_bytes = (size_t)rows * cols * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, w_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &w_buffer, &w_memory, &w_mapped)) goto cleanup;
+    if (create_host_buffer(rt, b_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) goto cleanup;
+    if (create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+
+    float *x = (float *)x_mapped;
+    float *w = (float *)w_mapped;
+    float *b = (float *)b_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < rows * inner; ++i) x[i] = probe_value(i, 0.03125f);
+    for (int i = 0; i < cols * inner; ++i) w[i] = probe_value(i + 101, 0.0234375f);
+    for (int i = 0; i < cols; ++i) b[i] = probe_value(i + 211, 0.015625f);
+    memset(y, 0, y_bytes);
+
+    if (create_shader_module_from_name(rt, "linear_f32.comp", &shader)) goto cleanup;
+
+    VkDescriptorSetLayoutBinding bindings[4];
+    memset(bindings, 0, sizeof(bindings));
+    for (uint32_t i = 0; i < 4; ++i) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo set_info;
+    memset(&set_info, 0, sizeof(set_info));
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_info.bindingCount = 4;
+    set_info.pBindings = bindings;
+    VK_CALL(vkCreateDescriptorSetLayout(rt->device, &set_info, NULL, &set_layout));
+
+    VkPushConstantRange push_range;
+    memset(&push_range, 0, sizeof(push_range));
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(WorldVulkanLinearPush);
+
+    VkPipelineLayoutCreateInfo layout_info;
+    memset(&layout_info, 0, sizeof(layout_info));
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    VK_CALL(vkCreatePipelineLayout(rt->device, &layout_info, NULL, &pipeline_layout));
+
+    VkPipelineShaderStageCreateInfo stage_info;
+    memset(&stage_info, 0, sizeof(stage_info));
+    stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage_info.module = shader;
+    stage_info.pName = "main";
+
+    VkComputePipelineCreateInfo pipeline_info;
+    memset(&pipeline_info, 0, sizeof(pipeline_info));
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage = stage_info;
+    pipeline_info.layout = pipeline_layout;
+    VK_CALL(vkCreateComputePipelines(rt->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipeline));
+
+    VkDescriptorPoolSize pool_size;
+    memset(&pool_size, 0, sizeof(pool_size));
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pool_size.descriptorCount = 4;
+
+    VkDescriptorPoolCreateInfo pool_info;
+    memset(&pool_info, 0, sizeof(pool_info));
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+    VK_CALL(vkCreateDescriptorPool(rt->device, &pool_info, NULL, &descriptor_pool));
+
+    VkDescriptorSetAllocateInfo alloc_info;
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc_info.descriptorPool = descriptor_pool;
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.pSetLayouts = &set_layout;
+    VK_CALL(vkAllocateDescriptorSets(rt->device, &alloc_info, &descriptor_set));
+
+    VkDescriptorBufferInfo buffer_infos[4];
+    memset(buffer_infos, 0, sizeof(buffer_infos));
+    buffer_infos[0].buffer = x_buffer;
+    buffer_infos[0].range = x_bytes;
+    buffer_infos[1].buffer = w_buffer;
+    buffer_infos[1].range = w_bytes;
+    buffer_infos[2].buffer = b_buffer;
+    buffer_infos[2].range = b_bytes;
+    buffer_infos[3].buffer = y_buffer;
+    buffer_infos[3].range = y_bytes;
+
+    VkWriteDescriptorSet writes[4];
+    memset(writes, 0, sizeof(writes));
+    for (uint32_t i = 0; i < 4; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptor_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+    }
+    vkUpdateDescriptorSets(rt->device, 4, writes, 0, NULL);
+
+    WorldVulkanLinearPush push;
+    push.rows = rows;
+    push.cols = cols;
+    push.inner = inner;
+    push.has_bias = 1;
+
+    VK_CALL(vkResetFences(rt->device, 1, &rt->fence));
+    VK_CALL(vkResetCommandBuffer(rt->command_buffer, 0));
+    VkCommandBufferBeginInfo begin_info;
+    memset(&begin_info, 0, sizeof(begin_info));
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CALL(vkBeginCommandBuffer(rt->command_buffer, &begin_info));
+    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline_layout, 0, 1, &descriptor_set, 0, NULL);
+    vkCmdPushConstants(rt->command_buffer, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(push), &push);
+    vkCmdDispatch(rt->command_buffer, (cols + 7) / 8, (rows + 7) / 8, 1);
+    VK_CALL(vkEndCommandBuffer(rt->command_buffer));
+
+    VkSubmitInfo submit_info;
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &rt->command_buffer;
+    VK_CALL(vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence));
+    VK_CALL(vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX));
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            float ref = b[c];
+            for (int k = 0; k < inner; ++k) {
+                ref += x[r * inner + k] * w[c * inner + k];
+            }
+            float diff = fabsf(y[r * cols + c] - ref);
+            if (diff > max_abs) max_abs = diff;
+            mean_abs += diff;
+        }
+    }
+    mean_abs /= (float)(rows * cols);
+    fprintf(stderr, "vulkan linear_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 1.0e-5f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+
+fail:
+    rc = 1;
+    goto cleanup;
 }
 
 void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {

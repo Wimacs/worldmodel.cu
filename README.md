@@ -51,10 +51,12 @@ cmake --build build -j
 ```
 
 The Vulkan target currently builds `worldmodel_raylib_vulkan` and compiles
-`shaders/vulkan/fill_rgba.comp` to SPIR-V. This is the first backend slice: it
-creates a Vulkan device, a compute pipeline, dispatches the shader, and returns
-RGB frames through the same raylib/headless path. The actual transformer/VAE
-kernels are still being ported from CUDA.
+the GLSL files in `shaders/vulkan/` to SPIR-V. This is the first backend slice:
+it creates a Vulkan device, compute pipelines, dispatches shaders, and returns
+RGB frames through the same raylib/headless path. `worldmodel_vulkan_probe`
+currently runs a CPU parity check for the first model-relevant Vulkan op,
+`linear_f32.comp`. The actual transformer/VAE runtime kernels are still being
+ported from CUDA.
 
 ```sh
 ./build/worldmodel_raylib_vulkan \
@@ -64,6 +66,10 @@ kernels are still being ported from CUDA.
   --steps 4 \
   --cache-window 8 \
   --headless-smoke
+```
+
+```sh
+./build/worldmodel_vulkan_probe
 ```
 
 If `3rd/raylib` is present, the build also produces `worldmodel_raylib`, a

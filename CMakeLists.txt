@@ -90,16 +90,41 @@ if(WORLD_ENABLE_VULKAN)
   find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
   set(WORLD_VULKAN_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/vulkan)
-  set(WORLD_VULKAN_FILL_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/fill_rgba.comp)
-  set(WORLD_VULKAN_FILL_SHADER_SPV ${WORLD_VULKAN_SHADER_OUTPUT_DIR}/fill_rgba.comp.spv)
-  add_custom_command(
-    OUTPUT ${WORLD_VULKAN_FILL_SHADER_SPV}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${WORLD_VULKAN_SHADER_OUTPUT_DIR}
-    COMMAND ${GLSLC_EXECUTABLE} -O ${WORLD_VULKAN_FILL_SHADER} -o ${WORLD_VULKAN_FILL_SHADER_SPV}
-    DEPENDS ${WORLD_VULKAN_FILL_SHADER}
-    VERBATIM
+  set(WORLD_VULKAN_SHADER_SOURCES
+    fill_rgba.comp
+    linear_f32.comp
   )
-  add_custom_target(worldmodel_vulkan_shaders DEPENDS ${WORLD_VULKAN_FILL_SHADER_SPV})
+  set(WORLD_VULKAN_SHADER_SPV)
+  foreach(shader_name IN LISTS WORLD_VULKAN_SHADER_SOURCES)
+    set(shader_src ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/${shader_name})
+    set(shader_spv ${WORLD_VULKAN_SHADER_OUTPUT_DIR}/${shader_name}.spv)
+    add_custom_command(
+      OUTPUT ${shader_spv}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${WORLD_VULKAN_SHADER_OUTPUT_DIR}
+      COMMAND ${GLSLC_EXECUTABLE} -O ${shader_src} -o ${shader_spv}
+      DEPENDS ${shader_src}
+      VERBATIM
+    )
+    list(APPEND WORLD_VULKAN_SHADER_SPV ${shader_spv})
+  endforeach()
+  add_custom_target(worldmodel_vulkan_shaders DEPENDS ${WORLD_VULKAN_SHADER_SPV})
+
+  add_executable(worldmodel_vulkan_probe
+    src/world_vulkan_probe.c
+    src/world_config.c
+    src/world_vulkan.c
+  )
+  add_dependencies(worldmodel_vulkan_probe worldmodel_vulkan_shaders)
+  target_include_directories(worldmodel_vulkan_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_compile_definitions(worldmodel_vulkan_probe PRIVATE
+    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
+  )
+  target_link_libraries(worldmodel_vulkan_probe PRIVATE
+    Vulkan::Vulkan
+    m
+  )
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
