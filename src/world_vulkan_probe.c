@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 int world_vulkan_linear_f32_probe(void);
+int world_vulkan_linear_f16_coopmat_probe(void);
 int world_vulkan_silu_f32_probe(void);
 int world_vulkan_add_bias_silu_f32_probe(void);
 int world_vulkan_add_channel_silu_f32_probe(void);
@@ -32,6 +33,11 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_linear_f32_probe: ok\n");
+    if (world_vulkan_linear_f16_coopmat_probe()) {
+        fprintf(stderr, "world_vulkan_linear_f16_coopmat_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_linear_f16_coopmat_probe: ok\n");
     if (world_vulkan_silu_f32_probe()) {
         fprintf(stderr, "world_vulkan_silu_f32_probe: failed\n");
         return 1;
