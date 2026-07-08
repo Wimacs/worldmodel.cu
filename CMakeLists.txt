@@ -92,7 +92,10 @@ if(WORLD_ENABLE_VULKAN)
   set(WORLD_VULKAN_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/vulkan)
   set(WORLD_VULKAN_SHADER_SOURCES
     ada_rms_norm_f32.comp
+    cache_frame_indices.comp
     fill_rgba.comp
+    kv_cache_mask.comp
+    kv_cache_upsert_copy_f32.comp
     linear_f32.comp
     masked_attention_f32.comp
     ortho_rope_f32.comp

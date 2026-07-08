@@ -81,6 +81,31 @@ typedef struct {
     float scale;
 } WorldVulkanMaskedAttentionPush;
 
+typedef struct {
+    uint32_t capacity;
+    uint32_t T;
+    uint32_t base;
+    uint32_t write_step;
+} WorldVulkanKvCacheMaskPush;
+
+typedef struct {
+    uint32_t B;
+    uint32_t H;
+    uint32_t T;
+    uint32_t D;
+    uint32_t L;
+    uint32_t base;
+    uint32_t write_step;
+    uint32_t frozen;
+} WorldVulkanKvCacheUpsertPush;
+
+typedef struct {
+    uint32_t capacity;
+    uint32_t T;
+    uint32_t base;
+    uint32_t write_step;
+} WorldVulkanCacheFrameIndicesPush;
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -1754,6 +1779,352 @@ cleanup:
         destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
         destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
         destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+static int run_kv_cache_upsert_probe_case(
+        WorldVulkanRuntime *rt,
+        VkDescriptorSetLayout mask_set_layout,
+        VkPipelineLayout mask_pipeline_layout,
+        VkPipeline mask_pipeline,
+        VkDescriptorSetLayout upsert_set_layout,
+        VkPipelineLayout upsert_pipeline_layout,
+        VkPipeline upsert_pipeline,
+        const char *name,
+        uint32_t B,
+        uint32_t H,
+        uint32_t T,
+        uint32_t D,
+        uint32_t L,
+        uint32_t frame_idx,
+        uint32_t pinned_dilation,
+        uint32_t frozen) {
+    int rc = 1;
+    uint32_t capacity = L + T;
+    uint32_t bucket = (frame_idx + pinned_dilation - 1u) / pinned_dilation;
+    uint32_t num_buckets = (L / T) / pinned_dilation;
+    uint32_t base = (bucket % num_buckets) * T;
+    uint32_t write_step = (frame_idx % pinned_dilation) == 0u ? 1u : 0u;
+    size_t cache_values = (size_t)B * H * capacity * D;
+    size_t kv_values = (size_t)B * H * T * D;
+    size_t cache_bytes = cache_values * sizeof(float);
+    size_t kv_bytes = kv_values * sizeof(float);
+    size_t written_bytes = (size_t)capacity * sizeof(uint32_t);
+
+    VkDescriptorPool mask_descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet mask_descriptor_set = VK_NULL_HANDLE;
+    VkDescriptorPool upsert_descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet upsert_descriptor_set = VK_NULL_HANDLE;
+    VkBuffer cache_k_buffer = VK_NULL_HANDLE;
+    VkBuffer cache_v_buffer = VK_NULL_HANDLE;
+    VkBuffer k_buffer = VK_NULL_HANDLE;
+    VkBuffer v_buffer = VK_NULL_HANDLE;
+    VkBuffer written_buffer = VK_NULL_HANDLE;
+    VkBuffer mask_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory cache_k_memory = VK_NULL_HANDLE;
+    VkDeviceMemory cache_v_memory = VK_NULL_HANDLE;
+    VkDeviceMemory k_memory = VK_NULL_HANDLE;
+    VkDeviceMemory v_memory = VK_NULL_HANDLE;
+    VkDeviceMemory written_memory = VK_NULL_HANDLE;
+    VkDeviceMemory mask_memory = VK_NULL_HANDLE;
+    void *cache_k_mapped = NULL;
+    void *cache_v_mapped = NULL;
+    void *k_mapped = NULL;
+    void *v_mapped = NULL;
+    void *written_mapped = NULL;
+    void *mask_mapped = NULL;
+    float *ref_cache_k = NULL;
+    float *ref_cache_v = NULL;
+    uint32_t *ref_written = NULL;
+    uint32_t *ref_mask = NULL;
+
+    if (create_host_buffer(rt, cache_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &cache_k_buffer, &cache_k_memory, &cache_k_mapped)) goto cleanup;
+    if (create_host_buffer(rt, cache_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &cache_v_buffer, &cache_v_memory, &cache_v_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &k_buffer, &k_memory, &k_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &v_buffer, &v_memory, &v_mapped)) goto cleanup;
+    if (create_host_buffer(rt, written_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &written_buffer, &written_memory, &written_mapped)) goto cleanup;
+    if (create_host_buffer(rt, written_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &mask_buffer, &mask_memory, &mask_mapped)) goto cleanup;
+
+    float *cache_k = (float *)cache_k_mapped;
+    float *cache_v = (float *)cache_v_mapped;
+    float *k = (float *)k_mapped;
+    float *v = (float *)v_mapped;
+    uint32_t *written = (uint32_t *)written_mapped;
+    uint32_t *mask = (uint32_t *)mask_mapped;
+
+    for (size_t i = 0; i < cache_values; ++i) {
+        cache_k[i] = frozen ? probe_value((int)i + 1009, 0.017578125f) : 0.0f;
+        cache_v[i] = frozen ? probe_value((int)i + 1201, 0.01953125f) : 0.0f;
+    }
+    for (size_t i = 0; i < kv_values; ++i) {
+        k[i] = probe_value((int)i + 1409, 0.025390625f);
+        v[i] = probe_value((int)i + 1601, 0.029296875f);
+    }
+    memset(written, 0, written_bytes);
+    uint32_t initially_written = frozen ? T : 2u * T;
+    for (uint32_t i = 0; i < initially_written && i < capacity; ++i) written[i] = 1u;
+    for (uint32_t i = L; i < capacity; ++i) written[i] = 1u;
+    memset(mask, 0, written_bytes);
+
+    ref_cache_k = (float *)malloc(cache_bytes);
+    ref_cache_v = (float *)malloc(cache_bytes);
+    ref_written = (uint32_t *)malloc(written_bytes);
+    ref_mask = (uint32_t *)malloc(written_bytes);
+    if (!ref_cache_k || !ref_cache_v || !ref_written || !ref_mask) goto cleanup;
+    memcpy(ref_cache_k, cache_k, cache_bytes);
+    memcpy(ref_cache_v, cache_v, cache_bytes);
+    memcpy(ref_written, written, written_bytes);
+    memcpy(ref_mask, written, written_bytes);
+
+    if (write_step) {
+        for (uint32_t t = 0; t < T; ++t) ref_mask[base + t] = 0u;
+    }
+    for (uint32_t b = 0; b < B; ++b) {
+        for (uint32_t h = 0; h < H; ++h) {
+            for (uint32_t t = 0; t < T; ++t) {
+                uint32_t tail_idx = L + t;
+                uint32_t ring_idx = base + t;
+                uint32_t dst_idx = (!frozen && write_step) ? ring_idx : tail_idx;
+                for (uint32_t d = 0; d < D; ++d) {
+                    size_t src = (size_t)(((b * H + h) * T + t) * D + d);
+                    size_t tail = (size_t)(((b * H + h) * capacity + tail_idx) * D + d);
+                    size_t dst = (size_t)(((b * H + h) * capacity + dst_idx) * D + d);
+                    ref_cache_k[tail] = k[src];
+                    ref_cache_v[tail] = v[src];
+                    if (!frozen) {
+                        ref_cache_k[dst] = k[src];
+                        ref_cache_v[dst] = v[src];
+                    }
+                }
+            }
+        }
+    }
+    for (uint32_t t = 0; t < T; ++t) {
+        uint32_t tail_idx = L + t;
+        uint32_t dst_idx = (!frozen && write_step) ? base + t : tail_idx;
+        ref_written[tail_idx] = 1u;
+        if (!frozen) ref_written[dst_idx] = 1u;
+    }
+
+    VkBuffer mask_buffers[2] = {written_buffer, mask_buffer};
+    VkDeviceSize mask_sizes[2] = {written_bytes, written_bytes};
+    if (create_storage_descriptor_set(rt, mask_set_layout, 2, mask_buffers, mask_sizes,
+                &mask_descriptor_pool, &mask_descriptor_set)) goto cleanup;
+    WorldVulkanKvCacheMaskPush mask_push;
+    mask_push.capacity = capacity;
+    mask_push.T = T;
+    mask_push.base = base;
+    mask_push.write_step = write_step;
+    if (submit_compute(rt, mask_pipeline, mask_pipeline_layout, mask_descriptor_set,
+                &mask_push, sizeof(mask_push), (capacity + 255u) / 256u, 1, 1)) goto cleanup;
+
+    VkBuffer upsert_buffers[5] = {cache_k_buffer, cache_v_buffer, k_buffer, v_buffer, written_buffer};
+    VkDeviceSize upsert_sizes[5] = {cache_bytes, cache_bytes, kv_bytes, kv_bytes, written_bytes};
+    if (create_storage_descriptor_set(rt, upsert_set_layout, 5, upsert_buffers, upsert_sizes,
+                &upsert_descriptor_pool, &upsert_descriptor_set)) goto cleanup;
+    WorldVulkanKvCacheUpsertPush upsert_push;
+    upsert_push.B = B;
+    upsert_push.H = H;
+    upsert_push.T = T;
+    upsert_push.D = D;
+    upsert_push.L = L;
+    upsert_push.base = base;
+    upsert_push.write_step = write_step;
+    upsert_push.frozen = frozen;
+    if (submit_compute(rt, upsert_pipeline, upsert_pipeline_layout, upsert_descriptor_set,
+                &upsert_push, sizeof(upsert_push), (uint32_t)((kv_values + 255u) / 256u), 1, 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    uint32_t mismatches = 0;
+    for (size_t i = 0; i < cache_values; ++i) {
+        float dk = fabsf(cache_k[i] - ref_cache_k[i]);
+        float dv = fabsf(cache_v[i] - ref_cache_v[i]);
+        if (dk > max_abs) max_abs = dk;
+        if (dv > max_abs) max_abs = dv;
+        if (dk != 0.0f || dv != 0.0f) ++mismatches;
+    }
+    for (uint32_t i = 0; i < capacity; ++i) {
+        if (written[i] != ref_written[i]) ++mismatches;
+        if (mask[i] != ref_mask[i]) ++mismatches;
+    }
+    fprintf(stderr, "vulkan kv_cache_upsert_f32 probe (%s): max_abs=%g mismatches=%u\n",
+            name, max_abs, mismatches);
+    if (mismatches != 0 || max_abs != 0.0f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (mask_descriptor_pool) vkDestroyDescriptorPool(rt->device, mask_descriptor_pool, NULL);
+    if (upsert_descriptor_pool) vkDestroyDescriptorPool(rt->device, upsert_descriptor_pool, NULL);
+    destroy_host_buffer(rt, cache_k_buffer, cache_k_memory, cache_k_mapped);
+    destroy_host_buffer(rt, cache_v_buffer, cache_v_memory, cache_v_mapped);
+    destroy_host_buffer(rt, k_buffer, k_memory, k_mapped);
+    destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
+    destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
+    destroy_host_buffer(rt, mask_buffer, mask_memory, mask_mapped);
+    free(ref_cache_k);
+    free(ref_cache_v);
+    free(ref_written);
+    free(ref_mask);
+    return rc;
+}
+
+int world_vulkan_kv_cache_upsert_f32_probe(void) {
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule mask_shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout mask_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout mask_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline mask_pipeline = VK_NULL_HANDLE;
+    VkShaderModule upsert_shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout upsert_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout upsert_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline upsert_pipeline = VK_NULL_HANDLE;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    if (create_storage_pipeline(rt, "kv_cache_mask.comp", 2, sizeof(WorldVulkanKvCacheMaskPush),
+                &mask_shader, &mask_set_layout, &mask_pipeline_layout, &mask_pipeline)) goto cleanup;
+    if (create_storage_pipeline(rt, "kv_cache_upsert_copy_f32.comp", 5, sizeof(WorldVulkanKvCacheUpsertPush),
+                &upsert_shader, &upsert_set_layout, &upsert_pipeline_layout, &upsert_pipeline)) goto cleanup;
+
+    if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
+                upsert_set_layout, upsert_pipeline_layout, upsert_pipeline,
+                "frozen_write_step", 1, 2, 4, 8, 16, 4, 1, 1)) goto cleanup;
+    if (run_kv_cache_upsert_probe_case(rt, mask_set_layout, mask_pipeline_layout, mask_pipeline,
+                upsert_set_layout, upsert_pipeline_layout, upsert_pipeline,
+                "unfrozen_pinned_dilation", 1, 3, 4, 16, 32, 5, 2, 0)) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (mask_pipeline) vkDestroyPipeline(rt->device, mask_pipeline, NULL);
+    if (mask_pipeline_layout) vkDestroyPipelineLayout(rt->device, mask_pipeline_layout, NULL);
+    if (mask_set_layout) vkDestroyDescriptorSetLayout(rt->device, mask_set_layout, NULL);
+    if (mask_shader) vkDestroyShaderModule(rt->device, mask_shader, NULL);
+    if (upsert_pipeline) vkDestroyPipeline(rt->device, upsert_pipeline, NULL);
+    if (upsert_pipeline_layout) vkDestroyPipelineLayout(rt->device, upsert_pipeline_layout, NULL);
+    if (upsert_set_layout) vkDestroyDescriptorSetLayout(rt->device, upsert_set_layout, NULL);
+    if (upsert_shader) vkDestroyShaderModule(rt->device, upsert_shader, NULL);
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_cache_frame_indices_probe(void) {
+    enum { T = 4, slots = 9, capacity = T * slots };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkBuffer written_buffer = VK_NULL_HANDLE;
+    VkBuffer indices_buffer = VK_NULL_HANDLE;
+    VkBuffer count_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory written_memory = VK_NULL_HANDLE;
+    VkDeviceMemory indices_memory = VK_NULL_HANDLE;
+    VkDeviceMemory count_memory = VK_NULL_HANDLE;
+    void *written_mapped = NULL;
+    void *indices_mapped = NULL;
+    void *count_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    size_t written_bytes = (size_t)capacity * sizeof(uint32_t);
+    size_t indices_bytes = (size_t)capacity * sizeof(uint32_t);
+    size_t count_bytes = sizeof(uint32_t);
+    if (create_host_buffer(rt, written_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &written_buffer, &written_memory, &written_mapped)) goto cleanup;
+    if (create_host_buffer(rt, indices_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &indices_buffer, &indices_memory, &indices_mapped)) goto cleanup;
+    if (create_host_buffer(rt, count_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &count_buffer, &count_memory, &count_mapped)) goto cleanup;
+
+    uint32_t *written = (uint32_t *)written_mapped;
+    uint32_t *indices = (uint32_t *)indices_mapped;
+    uint32_t *count = (uint32_t *)count_mapped;
+    memset(written, 0, written_bytes);
+    const uint32_t written_slots[4] = {0u, 2u, 5u, 8u};
+    for (uint32_t s = 0; s < 4u; ++s) {
+        uint32_t slot = written_slots[s];
+        for (uint32_t t = 0; t < T; ++t) written[slot * T + t] = 1u;
+    }
+
+    if (create_storage_pipeline(rt, "cache_frame_indices.comp", 3, sizeof(WorldVulkanCacheFrameIndicesPush),
+                &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
+    VkBuffer buffers[3] = {written_buffer, indices_buffer, count_buffer};
+    VkDeviceSize sizes[3] = {written_bytes, indices_bytes, count_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, &descriptor_pool, &descriptor_set)) goto cleanup;
+
+    for (uint32_t case_id = 0; case_id < 2u; ++case_id) {
+        uint32_t base = case_id == 0u ? 2u * T : 0u;
+        uint32_t write_step = case_id == 0u ? 1u : 0u;
+        for (uint32_t i = 0; i < capacity; ++i) indices[i] = 0xffffffffu;
+        count[0] = 0u;
+
+        WorldVulkanCacheFrameIndicesPush push;
+        push.capacity = capacity;
+        push.T = T;
+        push.base = base;
+        push.write_step = write_step;
+        if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
+                    slots, 1, 1)) goto cleanup;
+
+        uint32_t ref_indices[capacity];
+        uint32_t ref_count = 0u;
+        for (uint32_t slot = 0; slot < slots; ++slot) {
+            uint32_t slot_base = slot * T;
+            uint32_t slot_written = written[slot_base] && !(write_step && slot_base == base);
+            if (slot_written) {
+                for (uint32_t t = 0; t < T; ++t) ref_indices[ref_count++] = slot_base + t;
+            }
+        }
+
+        uint32_t mismatches = count[0] == ref_count ? 0u : 1u;
+        for (uint32_t i = 0; i < ref_count; ++i) {
+            if (indices[i] != ref_indices[i]) ++mismatches;
+        }
+        fprintf(stderr, "vulkan cache_frame_indices probe (%s): count=%u mismatches=%u\n",
+                write_step ? "write_step" : "read_step", count[0], mismatches);
+        if (mismatches != 0u) goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
+    if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
+    if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
+    if (set_layout) vkDestroyDescriptorSetLayout(rt->device, set_layout, NULL);
+    if (shader) vkDestroyShaderModule(rt->device, shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
+        destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
+        destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
