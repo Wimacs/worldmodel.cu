@@ -390,6 +390,7 @@ struct WorldVulkanRuntime {
     VkShaderModule runtime_linear_wf16_coopmat_n32_shader;
     VkPipelineLayout runtime_linear_wf16_coopmat_n32_pipeline_layout;
     VkPipeline runtime_linear_wf16_coopmat_n32_pipeline;
+    int runtime_qkv_wf16_n32_enabled;
     VkShaderModule runtime_linear_f16x_wf16_coopmat_shader;
     VkPipelineLayout runtime_linear_f16x_wf16_coopmat_pipeline_layout;
     VkPipeline runtime_linear_f16x_wf16_coopmat_pipeline;
@@ -2868,6 +2869,12 @@ static int create_runtime_model_slice(
         if (wf16_env && wf16_env[0] == '1') {
             if (rt->shader_float16_enabled && rt->storage_16bit_enabled && rt->cooperative_matrix_enabled) {
                 rt->runtime_linear_wf16_coopmat_enabled = 1;
+                {
+                    const char *qkv_n32_env = getenv("WORLD_VULKAN_QKV_WF16_N32");
+                    if (!qkv_n32_env || qkv_n32_env[0] != '0') {
+                        rt->runtime_qkv_wf16_n32_enabled = 1;
+                    }
+                }
             } else {
                 fprintf(stderr,
                         "warning: WORLD_VULKAN_LINEAR_WF16_COOPMAT=1 ignored; shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
@@ -4421,17 +4428,30 @@ static int record_runtime_model_slice(
                 use_runtime_linear_wf16_coopmat(rt,
                         qkv_push.rows, qkv_push.cols,
                         qkv_push.inner, qkv_push.has_bias);
+            int use_qkv_wf16_n32 =
+                use_qkv_wf16 &&
+                rt->runtime_qkv_wf16_n32_enabled &&
+                use_runtime_linear_wf16_coopmat_n32(rt,
+                        qkv_push.rows, qkv_push.cols,
+                        qkv_push.inner, qkv_push.has_bias);
             int use_qkv_wf16_n16 =
                 use_qkv_wf16 &&
+                !use_qkv_wf16_n32 &&
                 use_runtime_linear_wf16_coopmat_n16(rt,
                         qkv_push.rows, qkv_push.cols,
                         qkv_push.inner, qkv_push.has_bias);
-            VkPipeline qkv_pipeline = use_qkv_wf16_n16 ?
-                rt->runtime_linear_wf16_coopmat_n16_pipeline :
-                (use_qkv_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(qkv_push));
-            VkPipelineLayout qkv_layout = use_qkv_wf16_n16 ?
-                rt->runtime_linear_wf16_coopmat_n16_pipeline_layout :
-                (use_qkv_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(qkv_push));
+            VkPipeline qkv_pipeline = LINEAR_PIPELINE(qkv_push);
+            VkPipelineLayout qkv_layout = LINEAR_LAYOUT(qkv_push);
+            if (use_qkv_wf16_n32) {
+                qkv_pipeline = rt->runtime_linear_wf16_coopmat_n32_pipeline;
+                qkv_layout = rt->runtime_linear_wf16_coopmat_n32_pipeline_layout;
+            } else if (use_qkv_wf16_n16) {
+                qkv_pipeline = rt->runtime_linear_wf16_coopmat_n16_pipeline;
+                qkv_layout = rt->runtime_linear_wf16_coopmat_n16_pipeline_layout;
+            } else if (use_qkv_wf16) {
+                qkv_pipeline = rt->runtime_linear_wf16_coopmat_pipeline;
+                qkv_layout = rt->runtime_linear_wf16_coopmat_pipeline_layout;
+            }
             VkDescriptorSet qkv_set = use_qkv_wf16 ?
                 rt->qkv_proj_wf16_descriptor_sets[layer_idx] : rt->qkv_proj_descriptor_sets[layer_idx];
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, qkv_pipeline);
@@ -4440,7 +4460,12 @@ static int record_runtime_model_slice(
                     &qkv_set, 0, NULL);
             vkCmdPushConstants(rt->command_buffer, qkv_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
-            if (use_qkv_wf16_n16) {
+            if (use_qkv_wf16_n32) {
+                PROFILE_DISPATCH("linear.qkv_wf16_n32",
+                        (qkv_push.cols + 31u) / 32u,
+                        (qkv_push.rows + 15u) / 16u,
+                        1);
+            } else if (use_qkv_wf16_n16) {
                 PROFILE_DISPATCH("linear.qkv_wf16_n16",
                         (qkv_push.cols + 15u) / 16u,
                         (qkv_push.rows + 15u) / 16u,
@@ -4860,12 +4885,15 @@ static int record_runtime_model_slice(
                             use_runtime_linear_wf16_coopmat(rt,
                                     mlp_fc2_push.rows, mlp_fc2_push.cols,
                                     mlp_fc2_push.inner, mlp_fc2_push.has_bias);
-                        VkPipeline mlp_fc2_pipeline = use_mlp_fc2_f16x ?
-                            rt->runtime_linear_f16x_wf16_coopmat_pipeline :
-                            (use_mlp_fc2_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(mlp_fc2_push));
-                        VkPipelineLayout mlp_fc2_layout = use_mlp_fc2_f16x ?
-                            rt->runtime_linear_f16x_wf16_coopmat_pipeline_layout :
-                            (use_mlp_fc2_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(mlp_fc2_push));
+                        VkPipeline mlp_fc2_pipeline = LINEAR_PIPELINE(mlp_fc2_push);
+                        VkPipelineLayout mlp_fc2_layout = LINEAR_LAYOUT(mlp_fc2_push);
+                        if (use_mlp_fc2_f16x) {
+                            mlp_fc2_pipeline = rt->runtime_linear_f16x_wf16_coopmat_pipeline;
+                            mlp_fc2_layout = rt->runtime_linear_f16x_wf16_coopmat_pipeline_layout;
+                        } else if (use_mlp_fc2_wf16) {
+                            mlp_fc2_pipeline = rt->runtime_linear_wf16_coopmat_pipeline;
+                            mlp_fc2_layout = rt->runtime_linear_wf16_coopmat_pipeline_layout;
+                        }
                         VkDescriptorSet mlp_fc2_set = use_mlp_fc2_f16x ?
                             rt->mlp_fc2_f16x_descriptor_sets[layer_idx] :
                             (use_mlp_fc2_wf16 ? rt->mlp_fc2_wf16_descriptor_sets[layer_idx] : rt->mlp_fc2_descriptor_sets[layer_idx]);
@@ -6050,7 +6078,8 @@ int world_vulkan_linear_f16x_wf16_coopmat_probe(void) {
         }
     }
     mean_abs /= (float)(rows * cols);
-    fprintf(stderr, "vulkan linear_f16x_wf16_coopmat probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    fprintf(stderr, "vulkan linear_f16x_wf16_coopmat probe: max_abs=%g mean_abs=%g\n",
+            max_abs, mean_abs);
     if (max_abs > 2.0e-4f) goto cleanup;
     rc = 0;
 
