@@ -63,6 +63,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt);
 int world_vulkan_linear_f32_probe(void);
 int world_vulkan_linear_f16_coopmat_probe(void);
 int world_vulkan_linear_f32_coopmat_probe(void);
+int world_vulkan_linear_f32_wf16_coopmat_probe(void);
 int world_vulkan_silu_f32_probe(void);
 int world_vulkan_add_bias_silu_f32_probe(void);
 int world_vulkan_add_channel_silu_f32_probe(void);

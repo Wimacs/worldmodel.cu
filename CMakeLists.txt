@@ -98,6 +98,7 @@ if(WORLD_ENABLE_VULKAN)
     cache_frame_indices.comp
     fill_rgba.comp
     gated_residual_add_f32.comp
+    indexed_attention_d64_flash96_f32.comp
     indexed_attention_d64_flash_f32.comp
     indexed_attention_d64_warp_f32.comp
     indexed_attention_f32.comp
@@ -106,6 +107,8 @@ if(WORLD_ENABLE_VULKAN)
     lerp_inplace_f32.comp
     linear_f16_coopmat.comp
     linear_f32_coopmat.comp
+    linear_f32_wf16_coopmat.comp
+    linear_f32_wf16_coopmat_n16.comp
     linear_f32.comp
     linear_f32_tile64.comp
     latent_to_rgba.comp

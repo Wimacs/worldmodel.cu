@@ -289,6 +289,7 @@ struct WorldVulkanRuntime {
     int shader_float16_enabled;
     int storage_16bit_enabled;
     int cooperative_matrix_enabled;
+    uint32_t max_compute_shared_memory_size;
     VkQueue queue;
     VkShaderModule fill_shader;
     VkDescriptorSetLayout descriptor_set_layout;
@@ -378,6 +379,13 @@ struct WorldVulkanRuntime {
     VkPipelineLayout runtime_linear_coopmat_pipeline_layout;
     VkPipeline runtime_linear_coopmat_pipeline;
     int runtime_linear_coopmat_enabled;
+    VkShaderModule runtime_linear_wf16_coopmat_shader;
+    VkPipelineLayout runtime_linear_wf16_coopmat_pipeline_layout;
+    VkPipeline runtime_linear_wf16_coopmat_pipeline;
+    VkShaderModule runtime_linear_wf16_coopmat_n16_shader;
+    VkPipelineLayout runtime_linear_wf16_coopmat_n16_pipeline_layout;
+    VkPipeline runtime_linear_wf16_coopmat_n16_pipeline;
+    int runtime_linear_wf16_coopmat_enabled;
     VkShaderModule runtime_linear_tile64_shader;
     VkPipelineLayout runtime_linear_tile64_pipeline_layout;
     VkPipeline runtime_linear_tile64_pipeline;
@@ -421,6 +429,10 @@ struct WorldVulkanRuntime {
     VkPipelineLayout runtime_indexed_attention_d64_flash_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_flash_pipeline;
     int runtime_indexed_attention_d64_flash_enabled;
+    VkShaderModule runtime_indexed_attention_d64_flash96_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_flash96_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_flash96_pipeline;
+    int runtime_indexed_attention_d64_flash96_enabled;
     VkShaderModule runtime_gated_residual_shader;
     VkDescriptorSetLayout runtime_gated_residual_set_layout;
     VkPipelineLayout runtime_gated_residual_pipeline_layout;
@@ -471,6 +483,8 @@ struct WorldVulkanRuntime {
     VkDescriptorSet *attn_ada_descriptor_sets;
     VkDescriptorPool *qkv_proj_descriptor_pools;
     VkDescriptorSet *qkv_proj_descriptor_sets;
+    VkDescriptorPool *qkv_proj_wf16_descriptor_pools;
+    VkDescriptorSet *qkv_proj_wf16_descriptor_sets;
     VkDescriptorPool qkv_rms_rope_descriptor_pool;
     VkDescriptorSet qkv_rms_rope_descriptor_set;
     VkDescriptorPool qkv_rms_rope_first_descriptor_pool;
@@ -483,6 +497,8 @@ struct WorldVulkanRuntime {
     VkDescriptorSet *indexed_attention_descriptor_sets;
     VkDescriptorPool *attn_out_proj_descriptor_pools;
     VkDescriptorSet *attn_out_proj_descriptor_sets;
+    VkDescriptorPool *attn_out_proj_wf16_descriptor_pools;
+    VkDescriptorSet *attn_out_proj_wf16_descriptor_sets;
     VkDescriptorPool *attn_residual_descriptor_pools;
     VkDescriptorSet *attn_residual_descriptor_sets;
     VkDescriptorPool *ctrl_cond_descriptor_pools;
@@ -501,10 +517,14 @@ struct WorldVulkanRuntime {
     VkDescriptorSet *mlp_ada_descriptor_sets;
     VkDescriptorPool *mlp_fc1_descriptor_pools;
     VkDescriptorSet *mlp_fc1_descriptor_sets;
+    VkDescriptorPool *mlp_fc1_wf16_descriptor_pools;
+    VkDescriptorSet *mlp_fc1_wf16_descriptor_sets;
     VkDescriptorPool mlp_silu_descriptor_pool;
     VkDescriptorSet mlp_silu_descriptor_set;
     VkDescriptorPool *mlp_fc2_descriptor_pools;
     VkDescriptorSet *mlp_fc2_descriptor_sets;
+    VkDescriptorPool *mlp_fc2_wf16_descriptor_pools;
+    VkDescriptorSet *mlp_fc2_wf16_descriptor_sets;
     VkDescriptorPool *mlp_residual_descriptor_pools;
     VkDescriptorSet *mlp_residual_descriptor_sets;
     VkDescriptorPool out_norm_silu_descriptor_pool[WORLD_VULKAN_MAX_PASSES];
@@ -660,6 +680,8 @@ struct WorldVulkanRuntime {
     VkBuffer qkv_proj_weight_buffer;
     VkDeviceMemory qkv_proj_weight_memory;
     void *qkv_proj_weight_mapped;
+    VkBuffer qkv_proj_weight_f16_buffer;
+    VkDeviceMemory qkv_proj_weight_f16_memory;
     VkBuffer patch_weight_buffer;
     VkDeviceMemory patch_weight_memory;
     void *patch_weight_mapped;
@@ -720,6 +742,8 @@ struct WorldVulkanRuntime {
     VkBuffer attn_out_proj_weight_buffer;
     VkDeviceMemory attn_out_proj_weight_memory;
     void *attn_out_proj_weight_mapped;
+    VkBuffer attn_out_proj_weight_f16_buffer;
+    VkDeviceMemory attn_out_proj_weight_f16_memory;
     VkBuffer attn_proj_buffer;
     VkDeviceMemory attn_proj_memory;
     void *attn_proj_mapped;
@@ -753,9 +777,13 @@ struct WorldVulkanRuntime {
     VkBuffer dit_mlp_fc1_weight_buffer;
     VkDeviceMemory dit_mlp_fc1_weight_memory;
     void *dit_mlp_fc1_weight_mapped;
+    VkBuffer dit_mlp_fc1_weight_f16_buffer;
+    VkDeviceMemory dit_mlp_fc1_weight_f16_memory;
     VkBuffer dit_mlp_fc2_weight_buffer;
     VkDeviceMemory dit_mlp_fc2_weight_memory;
     void *dit_mlp_fc2_weight_mapped;
+    VkBuffer dit_mlp_fc2_weight_f16_buffer;
+    VkDeviceMemory dit_mlp_fc2_weight_f16_memory;
     VkBuffer mlp_in_buffer;
     VkDeviceMemory mlp_in_memory;
     void *mlp_in_mapped;
@@ -934,6 +962,7 @@ static int pick_physical_device(WorldVulkanRuntime *rt) {
     rt->queue_family = best_family;
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(rt->physical_device, &props);
+    rt->max_compute_shared_memory_size = props.limits.maxComputeSharedMemorySize;
     fprintf(stderr, "Vulkan device: %s queue_family=%u\n", props.deviceName, rt->queue_family);
     free(devices);
     return 0;
@@ -1032,7 +1061,30 @@ static void destroy_host_buffer(WorldVulkanRuntime *rt, VkBuffer buffer, VkDevic
     if (memory) vkFreeMemory(rt->device, memory, NULL);
 }
 
-static int copy_buffer_to_device(WorldVulkanRuntime *rt, VkBuffer src, VkBuffer dst, VkDeviceSize bytes) {
+static uint16_t runtime_f32_to_f16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int exp = (int)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant = (mant | 0x800000u) >> (uint32_t)(1 - exp);
+        return (uint16_t)(sign | ((mant + 0x1000u) >> 13));
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7c00u);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | ((mant + 0x1000u) >> 13));
+}
+
+static int copy_buffer_region_to_device(
+        WorldVulkanRuntime *rt,
+        VkBuffer src,
+        VkBuffer dst,
+        VkDeviceSize src_offset,
+        VkDeviceSize dst_offset,
+        VkDeviceSize bytes) {
     int rc = 1;
     if (vkResetFences(rt->device, 1, &rt->fence) != VK_SUCCESS) goto cleanup;
     if (vkResetCommandBuffer(rt->command_buffer, 0) != VK_SUCCESS) goto cleanup;
@@ -1043,6 +1095,8 @@ static int copy_buffer_to_device(WorldVulkanRuntime *rt, VkBuffer src, VkBuffer 
     if (vkBeginCommandBuffer(rt->command_buffer, &begin_info) != VK_SUCCESS) goto cleanup;
     VkBufferCopy copy_region;
     memset(&copy_region, 0, sizeof(copy_region));
+    copy_region.srcOffset = src_offset;
+    copy_region.dstOffset = dst_offset;
     copy_region.size = bytes;
     vkCmdCopyBuffer(rt->command_buffer, src, dst, 1, &copy_region);
     if (vkEndCommandBuffer(rt->command_buffer) != VK_SUCCESS) goto cleanup;
@@ -1060,6 +1114,10 @@ cleanup:
     return rc;
 }
 
+static int copy_buffer_to_device(WorldVulkanRuntime *rt, VkBuffer src, VkBuffer dst, VkDeviceSize bytes) {
+    return copy_buffer_region_to_device(rt, src, dst, 0, 0, bytes);
+}
+
 static int upload_to_device_buffer(WorldVulkanRuntime *rt, VkBuffer dst, const void *src, VkDeviceSize bytes) {
     if (!src || bytes == 0) return 0;
     VkBuffer staging_buffer = VK_NULL_HANDLE;
@@ -1069,6 +1127,41 @@ static int upload_to_device_buffer(WorldVulkanRuntime *rt, VkBuffer dst, const v
                 &staging_buffer, &staging_memory, &staging_mapped)) return 1;
     memcpy(staging_mapped, src, (size_t)bytes);
     int rc = copy_buffer_to_device(rt, staging_buffer, dst, bytes);
+    destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
+    return rc;
+}
+
+static int upload_f32_as_f16_to_device_buffer(
+        WorldVulkanRuntime *rt,
+        VkBuffer dst,
+        VkDeviceSize dst_offset,
+        const float *src,
+        size_t elems) {
+    if (!src || elems == 0) return 0;
+    const size_t chunk_elems = 16u * 1024u * 1024u;
+    VkDeviceSize staging_bytes = (VkDeviceSize)(chunk_elems * sizeof(uint16_t));
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    void *staging_mapped = NULL;
+    if (create_host_buffer(rt, staging_bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                &staging_buffer, &staging_memory, &staging_mapped)) return 1;
+    int rc = 0;
+    size_t offset = 0;
+    while (offset < elems) {
+        size_t n = elems - offset;
+        if (n > chunk_elems) n = chunk_elems;
+        uint16_t *dst16 = (uint16_t *)staging_mapped;
+        for (size_t i = 0; i < n; ++i) {
+            dst16[i] = runtime_f32_to_f16(src[offset + i]);
+        }
+        VkDeviceSize bytes = (VkDeviceSize)(n * sizeof(uint16_t));
+        if (copy_buffer_region_to_device(rt, staging_buffer, dst, 0,
+                    dst_offset + (VkDeviceSize)(offset * sizeof(uint16_t)), bytes)) {
+            rc = 1;
+            break;
+        }
+        offset += n;
+    }
     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
     return rc;
 }
@@ -1772,6 +1865,40 @@ static int use_runtime_linear_coopmat(
         uint32_t has_bias) {
     return rt->runtime_linear_coopmat_enabled &&
         rt->runtime_linear_coopmat_pipeline &&
+        !has_bias &&
+        rows >= 16u &&
+        cols >= 8u &&
+        inner >= 16u &&
+        (rows % 16u) == 0u &&
+        (cols % 8u) == 0u &&
+        (inner % 16u) == 0u;
+}
+
+static int use_runtime_linear_wf16_coopmat_n16(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner,
+        uint32_t has_bias) {
+    return rt->runtime_linear_wf16_coopmat_enabled &&
+        rt->runtime_linear_wf16_coopmat_n16_pipeline &&
+        !has_bias &&
+        rows >= 16u &&
+        cols >= 16u &&
+        inner >= 16u &&
+        (rows % 16u) == 0u &&
+        (cols % 16u) == 0u &&
+        (inner % 16u) == 0u;
+}
+
+static int use_runtime_linear_wf16_coopmat(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner,
+        uint32_t has_bias) {
+    return rt->runtime_linear_wf16_coopmat_enabled &&
+        rt->runtime_linear_wf16_coopmat_pipeline &&
         !has_bias &&
         rows >= 16u &&
         cols >= 8u &&
@@ -2667,6 +2794,19 @@ static int create_runtime_model_slice(
         }
     }
 
+    {
+        const char *wf16_env = getenv("WORLD_VULKAN_LINEAR_WF16_COOPMAT");
+        if (wf16_env && wf16_env[0] == '1') {
+            if (rt->shader_float16_enabled && rt->storage_16bit_enabled && rt->cooperative_matrix_enabled) {
+                rt->runtime_linear_wf16_coopmat_enabled = 1;
+            } else {
+                fprintf(stderr,
+                        "warning: WORLD_VULKAN_LINEAR_WF16_COOPMAT=1 ignored; shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
+                        rt->shader_float16_enabled, rt->storage_16bit_enabled, rt->cooperative_matrix_enabled);
+            }
+        }
+    }
+
     size_t latent_bytes = rt->latent_elems * sizeof(float);
     size_t token_bytes = rt->token_elems * sizeof(float);
     size_t patch_weight_bytes = (size_t)rt->D * rt->C * rt->ph * rt->pw * sizeof(float);
@@ -2688,6 +2828,8 @@ static int create_runtime_model_slice(
     size_t layer_mod_table_bytes = (size_t)rt->total_passes * rt->layers_to_run * layer_mod_pass_layer_bytes;
     size_t qkv_proj_weight_layer_bytes = (size_t)rt->qkv_dim * rt->D * sizeof(float);
     size_t qkv_proj_weight_bytes = (size_t)rt->layers_to_run * qkv_proj_weight_layer_bytes;
+    size_t qkv_proj_weight_layer_f16_bytes = (size_t)rt->qkv_dim * rt->D * sizeof(uint16_t);
+    size_t qkv_proj_weight_f16_bytes = (size_t)rt->layers_to_run * qkv_proj_weight_layer_f16_bytes;
     size_t qkv_raw_bytes = (size_t)rt->T * rt->qkv_dim * sizeof(float);
     size_t q_rope_bytes = (size_t)rt->T * rt->D * sizeof(float);
     size_t kv_rope_bytes = (size_t)rt->T * rt->kv_dim * sizeof(float);
@@ -2699,6 +2841,8 @@ static int create_runtime_model_slice(
     size_t cache_count_bytes = (size_t)rt->layers_to_run * sizeof(uint32_t);
     size_t attn_out_proj_weight_layer_bytes = (size_t)rt->D * rt->D * sizeof(float);
     size_t attn_out_proj_weight_bytes = (size_t)rt->layers_to_run * attn_out_proj_weight_layer_bytes;
+    size_t attn_out_proj_weight_layer_f16_bytes = (size_t)rt->D * rt->D * sizeof(uint16_t);
+    size_t attn_out_proj_weight_f16_bytes = (size_t)rt->layers_to_run * attn_out_proj_weight_layer_f16_bytes;
     size_t ctrl_layer_weight_bytes = (size_t)rt->D * rt->D * sizeof(float);
     size_t ctrl_layer_weight_table_bytes = (size_t)rt->layers_to_run * ctrl_layer_weight_bytes;
     size_t ctrl_cond_table_bytes = (size_t)rt->layers_to_run * ctrl_emb_bytes;
@@ -2706,6 +2850,10 @@ static int create_runtime_model_slice(
     size_t dit_mlp_fc2_weight_layer_bytes = (size_t)rt->D * rt->mlp_hidden * sizeof(float);
     size_t dit_mlp_fc1_weight_bytes = (size_t)rt->layers_to_run * dit_mlp_fc1_weight_layer_bytes;
     size_t dit_mlp_fc2_weight_bytes = (size_t)rt->layers_to_run * dit_mlp_fc2_weight_layer_bytes;
+    size_t dit_mlp_fc1_weight_layer_f16_bytes = (size_t)rt->mlp_hidden * rt->D * sizeof(uint16_t);
+    size_t dit_mlp_fc2_weight_layer_f16_bytes = (size_t)rt->D * rt->mlp_hidden * sizeof(uint16_t);
+    size_t dit_mlp_fc1_weight_f16_bytes = (size_t)rt->layers_to_run * dit_mlp_fc1_weight_layer_f16_bytes;
+    size_t dit_mlp_fc2_weight_f16_bytes = (size_t)rt->layers_to_run * dit_mlp_fc2_weight_layer_f16_bytes;
     size_t mlp_hidden_token_bytes = (size_t)rt->T * rt->mlp_hidden * sizeof(float);
     size_t pass_layer_count = (size_t)rt->total_passes * (size_t)rt->layers_to_run;
 
@@ -2761,12 +2909,24 @@ static int create_runtime_model_slice(
             if (create_device_buffer(rt, (VkDeviceSize)qkv_proj_weight_bytes,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         &rt->qkv_proj_weight_buffer, &rt->qkv_proj_weight_memory)) return 1;
+            if (rt->runtime_linear_wf16_coopmat_enabled) {
+                if (create_device_buffer(rt, (VkDeviceSize)qkv_proj_weight_f16_bytes,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            &rt->qkv_proj_weight_f16_buffer,
+                            &rt->qkv_proj_weight_f16_memory)) return 1;
+            }
             rt->attn_ada_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorPool));
             rt->attn_ada_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->total_passes * rt->layers_to_run, sizeof(VkDescriptorSet));
             rt->qkv_proj_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
             rt->qkv_proj_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+            if (rt->runtime_linear_wf16_coopmat_enabled) {
+                rt->qkv_proj_wf16_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                rt->qkv_proj_wf16_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+            }
             if (!rt->attn_ada_descriptor_pools || !rt->attn_ada_descriptor_sets ||
-                    !rt->qkv_proj_descriptor_pools || !rt->qkv_proj_descriptor_sets) return 1;
+                    !rt->qkv_proj_descriptor_pools || !rt->qkv_proj_descriptor_sets ||
+                    (rt->runtime_linear_wf16_coopmat_enabled &&
+                     (!rt->qkv_proj_wf16_descriptor_pools || !rt->qkv_proj_wf16_descriptor_sets))) return 1;
         }
     }
     if (create_weight_buffer_from_data(rt, (VkDeviceSize)patch_weight_bytes, weights->patchify_weight,
@@ -2830,6 +2990,16 @@ static int create_runtime_model_slice(
                 if (create_device_buffer(rt, (VkDeviceSize)attn_out_proj_weight_bytes,
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             &rt->attn_out_proj_weight_buffer, &rt->attn_out_proj_weight_memory)) return 1;
+                if (rt->runtime_linear_wf16_coopmat_enabled) {
+                    rt->attn_out_proj_wf16_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                    rt->attn_out_proj_wf16_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                    if (!rt->attn_out_proj_wf16_descriptor_pools ||
+                            !rt->attn_out_proj_wf16_descriptor_sets) return 1;
+                    if (create_device_buffer(rt, (VkDeviceSize)attn_out_proj_weight_f16_bytes,
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                &rt->attn_out_proj_weight_f16_buffer,
+                                &rt->attn_out_proj_weight_f16_memory)) return 1;
+                }
                 if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
                             &rt->attn_proj_buffer, &rt->attn_proj_memory)) return 1;
                 if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
@@ -2876,16 +3046,35 @@ static int create_runtime_model_slice(
                     rt->mlp_fc2_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
                     rt->mlp_residual_descriptor_pools = (VkDescriptorPool *)calloc(pass_layer_count, sizeof(VkDescriptorPool));
                     rt->mlp_residual_descriptor_sets = (VkDescriptorSet *)calloc(pass_layer_count, sizeof(VkDescriptorSet));
+                    if (rt->runtime_linear_wf16_coopmat_enabled) {
+                        rt->mlp_fc1_wf16_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                        rt->mlp_fc1_wf16_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                        rt->mlp_fc2_wf16_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                        rt->mlp_fc2_wf16_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                    }
                     if (!rt->mlp_ada_descriptor_pools || !rt->mlp_ada_descriptor_sets ||
                             !rt->mlp_fc1_descriptor_pools || !rt->mlp_fc1_descriptor_sets ||
                             !rt->mlp_fc2_descriptor_pools || !rt->mlp_fc2_descriptor_sets ||
-                            !rt->mlp_residual_descriptor_pools || !rt->mlp_residual_descriptor_sets) return 1;
+                            !rt->mlp_residual_descriptor_pools || !rt->mlp_residual_descriptor_sets ||
+                            (rt->runtime_linear_wf16_coopmat_enabled &&
+                             (!rt->mlp_fc1_wf16_descriptor_pools || !rt->mlp_fc1_wf16_descriptor_sets ||
+                              !rt->mlp_fc2_wf16_descriptor_pools || !rt->mlp_fc2_wf16_descriptor_sets))) return 1;
                     if (create_device_buffer(rt, (VkDeviceSize)dit_mlp_fc1_weight_bytes,
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 &rt->dit_mlp_fc1_weight_buffer, &rt->dit_mlp_fc1_weight_memory)) return 1;
                     if (create_device_buffer(rt, (VkDeviceSize)dit_mlp_fc2_weight_bytes,
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 &rt->dit_mlp_fc2_weight_buffer, &rt->dit_mlp_fc2_weight_memory)) return 1;
+                    if (rt->runtime_linear_wf16_coopmat_enabled) {
+                        if (create_device_buffer(rt, (VkDeviceSize)dit_mlp_fc1_weight_f16_bytes,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    &rt->dit_mlp_fc1_weight_f16_buffer,
+                                    &rt->dit_mlp_fc1_weight_f16_memory)) return 1;
+                        if (create_device_buffer(rt, (VkDeviceSize)dit_mlp_fc2_weight_f16_bytes,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    &rt->dit_mlp_fc2_weight_f16_buffer,
+                                    &rt->dit_mlp_fc2_weight_f16_memory)) return 1;
+                    }
                     if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
                                 &rt->mlp_in_buffer, &rt->mlp_in_memory)) return 1;
                     if (create_device_storage_buffer(rt, (VkDeviceSize)mlp_hidden_token_bytes,
@@ -2971,6 +3160,21 @@ static int create_runtime_model_slice(
                 (VkDeviceSize)qkv_proj_weight_bytes);
         destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
         if (copy_failed) return 1;
+        if (rt->runtime_linear_wf16_coopmat_enabled && rt->qkv_proj_weight_f16_buffer) {
+            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                const WorldLayerWeights *lw = &weights->layers[layer_idx];
+                VkDeviceSize layer_base = (VkDeviceSize)((size_t)layer_idx *
+                        qkv_proj_weight_layer_f16_bytes);
+                if (upload_f32_as_f16_to_device_buffer(rt, rt->qkv_proj_weight_f16_buffer,
+                            layer_base, lw->q_proj_weight, q_elems)) return 1;
+                if (upload_f32_as_f16_to_device_buffer(rt, rt->qkv_proj_weight_f16_buffer,
+                            layer_base + (VkDeviceSize)(q_elems * sizeof(uint16_t)),
+                            lw->k_proj_weight, kv_elems)) return 1;
+                if (upload_f32_as_f16_to_device_buffer(rt, rt->qkv_proj_weight_f16_buffer,
+                            layer_base + (VkDeviceSize)((q_elems + kv_elems) * sizeof(uint16_t)),
+                            lw->v_proj_weight, kv_elems)) return 1;
+            }
+        }
         if (clear_device_buffer(rt, rt->norm_buffer, (VkDeviceSize)token_bytes)) return 1;
         if (clear_device_buffer(rt, rt->qkv_raw_buffer, (VkDeviceSize)qkv_raw_bytes)) return 1;
         if (clear_device_buffer(rt, rt->q_buffer, (VkDeviceSize)q_rope_bytes)) return 1;
@@ -3021,6 +3225,19 @@ static int create_runtime_model_slice(
                             (VkDeviceSize)attn_out_proj_weight_bytes);
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
+                }
+                if (rt->runtime_linear_wf16_coopmat_enabled &&
+                        rt->attn_out_proj_weight_f16_buffer) {
+                    size_t out_layer_elems = (size_t)rt->D * rt->D;
+                    for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                        VkDeviceSize dst_offset = (VkDeviceSize)((size_t)layer_idx *
+                                attn_out_proj_weight_layer_f16_bytes);
+                        if (upload_f32_as_f16_to_device_buffer(rt,
+                                    rt->attn_out_proj_weight_f16_buffer,
+                                    dst_offset,
+                                    weights->layers[layer_idx].out_proj_weight,
+                                    out_layer_elems)) return 1;
+                    }
                 }
                 if (clear_device_buffer(rt, rt->attn_proj_buffer, (VkDeviceSize)token_bytes)) return 1;
                 if (clear_device_buffer(rt, rt->tokens_after_attn_buffer, (VkDeviceSize)token_bytes)) return 1;
@@ -3112,6 +3329,30 @@ static int create_runtime_model_slice(
                             (VkDeviceSize)dit_mlp_fc2_weight_bytes);
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
+                    if (rt->runtime_linear_wf16_coopmat_enabled &&
+                            rt->dit_mlp_fc1_weight_f16_buffer &&
+                            rt->dit_mlp_fc2_weight_f16_buffer) {
+                        size_t fc1_layer_elems = (size_t)rt->mlp_hidden * rt->D;
+                        size_t fc2_layer_elems = (size_t)rt->D * rt->mlp_hidden;
+                        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                            VkDeviceSize dst_offset = (VkDeviceSize)((size_t)layer_idx *
+                                    dit_mlp_fc1_weight_layer_f16_bytes);
+                            if (upload_f32_as_f16_to_device_buffer(rt,
+                                        rt->dit_mlp_fc1_weight_f16_buffer,
+                                        dst_offset,
+                                        weights->layers[layer_idx].dit_mlp_fc1_weight,
+                                        fc1_layer_elems)) return 1;
+                        }
+                        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                            VkDeviceSize dst_offset = (VkDeviceSize)((size_t)layer_idx *
+                                    dit_mlp_fc2_weight_layer_f16_bytes);
+                            if (upload_f32_as_f16_to_device_buffer(rt,
+                                        rt->dit_mlp_fc2_weight_f16_buffer,
+                                        dst_offset,
+                                        weights->layers[layer_idx].dit_mlp_fc2_weight,
+                                        fc2_layer_elems)) return 1;
+                        }
+                    }
                     if (clear_device_buffer(rt, rt->mlp_in_buffer, (VkDeviceSize)token_bytes)) return 1;
                     if (clear_device_buffer(rt, rt->mlp_hidden_buffer, (VkDeviceSize)mlp_hidden_token_bytes)) return 1;
                     if (clear_device_buffer(rt, rt->mlp_out_buffer, (VkDeviceSize)token_bytes)) return 1;
@@ -3142,6 +3383,19 @@ static int create_runtime_model_slice(
                         rt->shader_float16_enabled, rt->cooperative_matrix_enabled);
             }
         }
+    }
+    if (rt->runtime_linear_wf16_coopmat_enabled) {
+        if (create_storage_pipeline_with_set_layout(rt, "linear_f32_wf16_coopmat.comp",
+                    rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
+                    &rt->runtime_linear_wf16_coopmat_shader,
+                    &rt->runtime_linear_wf16_coopmat_pipeline_layout,
+                    &rt->runtime_linear_wf16_coopmat_pipeline)) return 1;
+        if (create_storage_pipeline_with_set_layout(rt, "linear_f32_wf16_coopmat_n16.comp",
+                    rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
+                    &rt->runtime_linear_wf16_coopmat_n16_shader,
+                    &rt->runtime_linear_wf16_coopmat_n16_pipeline_layout,
+                    &rt->runtime_linear_wf16_coopmat_n16_pipeline)) return 1;
+        fprintf(stderr, "Vulkan linear f32 input + f16 weight cooperative-matrix path enabled for qkv/attn_out/MLP (WORLD_VULKAN_LINEAR_WF16_COOPMAT=1)\n");
     }
     {
         const char *tile64_env = getenv("WORLD_VULKAN_LINEAR_TILE64");
@@ -3189,6 +3443,25 @@ static int create_runtime_model_slice(
                             &rt->runtime_indexed_attention_d64_shader,
                             &rt->runtime_indexed_attention_d64_pipeline_layout,
                             &rt->runtime_indexed_attention_d64_pipeline)) return 1;
+                {
+                    const char *flash96_env = getenv("WORLD_VULKAN_FLASH_ATTN96");
+                    if (flash96_env && flash96_env[0] == '1') {
+                        if (rt->max_compute_shared_memory_size >= 96u * 64u * 2u * (uint32_t)sizeof(float)) {
+                            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash96_f32.comp",
+                                        rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                                        &rt->runtime_indexed_attention_d64_flash96_shader,
+                                        &rt->runtime_indexed_attention_d64_flash96_pipeline_layout,
+                                        &rt->runtime_indexed_attention_d64_flash96_pipeline)) return 1;
+                            rt->runtime_indexed_attention_d64_flash96_enabled = 1;
+                            fprintf(stderr, "Vulkan d64 flash96 attention enabled (WORLD_VULKAN_FLASH_ATTN96=1)\n");
+                        } else {
+                            fprintf(stderr,
+                                    "warning: WORLD_VULKAN_FLASH_ATTN96=1 ignored; maxComputeSharedMemorySize=%u need=%u\n",
+                                    rt->max_compute_shared_memory_size,
+                                    96u * 64u * 2u * (uint32_t)sizeof(float));
+                        }
+                    }
+                }
                 const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
                 if (!flash_env || flash_env[0] != '0') {
                     if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash_f32.comp",
@@ -3366,6 +3639,19 @@ static int create_runtime_model_slice(
                         &rt->qkv_proj_descriptor_pools[layer_idx],
                         &rt->qkv_proj_descriptor_sets[layer_idx])) return 1;
         }
+        if (rt->runtime_linear_wf16_coopmat_enabled &&
+                rt->qkv_proj_weight_f16_buffer) {
+            for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                VkBuffer buffers[4] = {
+                    rt->norm_buffer, rt->qkv_proj_weight_f16_buffer, rt->dummy_bias_buffer, rt->qkv_raw_buffer
+                };
+                VkDeviceSize sizes[4] = {token_bytes, qkv_proj_weight_layer_f16_bytes, sizeof(float), qkv_raw_bytes};
+                VkDeviceSize offsets[4] = {0, (VkDeviceSize)((size_t)layer_idx * qkv_proj_weight_layer_f16_bytes), 0, 0};
+                if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
+                            &rt->qkv_proj_wf16_descriptor_pools[layer_idx],
+                            &rt->qkv_proj_wf16_descriptor_sets[layer_idx])) return 1;
+            }
+        }
         {
             VkBuffer buffers[9] = {
                 rt->qkv_raw_buffer, rt->x_pos_buffer, rt->y_pos_buffer, rt->t_pos_buffer,
@@ -3462,6 +3748,25 @@ static int create_runtime_model_slice(
                     if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
                                 &rt->attn_out_proj_descriptor_pools[layer_idx],
                                 &rt->attn_out_proj_descriptor_sets[layer_idx])) return 1;
+                }
+                if (rt->runtime_linear_wf16_coopmat_enabled &&
+                        rt->attn_out_proj_weight_f16_buffer) {
+                    for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                        VkBuffer buffers[4] = {
+                            rt->attn_buffer, rt->attn_out_proj_weight_f16_buffer, rt->dummy_bias_buffer, rt->attn_proj_buffer
+                        };
+                        VkDeviceSize sizes[4] = {token_bytes, attn_out_proj_weight_layer_f16_bytes, sizeof(float), token_bytes};
+                        VkDeviceSize offsets[4] = {
+                            0,
+                            (VkDeviceSize)((size_t)layer_idx * attn_out_proj_weight_layer_f16_bytes),
+                            0,
+                            0
+                        };
+                        if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4,
+                                    buffers, sizes, offsets,
+                                    &rt->attn_out_proj_wf16_descriptor_pools[layer_idx],
+                                    &rt->attn_out_proj_wf16_descriptor_sets[layer_idx])) return 1;
+                    }
                 }
                 for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
                     for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
@@ -3574,6 +3879,22 @@ static int create_runtime_model_slice(
                                     &rt->mlp_fc1_descriptor_pools[layer_idx],
                                     &rt->mlp_fc1_descriptor_sets[layer_idx])) return 1;
                     }
+                    if (rt->runtime_linear_wf16_coopmat_enabled &&
+                            rt->dit_mlp_fc1_weight_f16_buffer) {
+                        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                            VkDeviceSize weight_offset = (VkDeviceSize)((size_t)layer_idx *
+                                    dit_mlp_fc1_weight_layer_f16_bytes);
+                            VkBuffer buffers[4] = {
+                                rt->mlp_in_buffer, rt->dit_mlp_fc1_weight_f16_buffer, rt->dummy_bias_buffer, rt->mlp_hidden_buffer
+                            };
+                            VkDeviceSize sizes[4] = {token_bytes, dit_mlp_fc1_weight_layer_f16_bytes, sizeof(float), mlp_hidden_token_bytes};
+                            VkDeviceSize offsets[4] = {0, weight_offset, 0, 0};
+                            if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4,
+                                        buffers, sizes, offsets,
+                                        &rt->mlp_fc1_wf16_descriptor_pools[layer_idx],
+                                        &rt->mlp_fc1_wf16_descriptor_sets[layer_idx])) return 1;
+                        }
+                    }
                     {
                         VkBuffer buffers[2] = {rt->mlp_hidden_buffer, rt->mlp_hidden_buffer};
                         VkDeviceSize sizes[2] = {mlp_hidden_token_bytes, mlp_hidden_token_bytes};
@@ -3591,6 +3912,22 @@ static int create_runtime_model_slice(
                         if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
                                     &rt->mlp_fc2_descriptor_pools[layer_idx],
                                     &rt->mlp_fc2_descriptor_sets[layer_idx])) return 1;
+                    }
+                    if (rt->runtime_linear_wf16_coopmat_enabled &&
+                            rt->dit_mlp_fc2_weight_f16_buffer) {
+                        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                            VkDeviceSize weight_offset = (VkDeviceSize)((size_t)layer_idx *
+                                    dit_mlp_fc2_weight_layer_f16_bytes);
+                            VkBuffer buffers[4] = {
+                                rt->mlp_hidden_buffer, rt->dit_mlp_fc2_weight_f16_buffer, rt->dummy_bias_buffer, rt->mlp_out_buffer
+                            };
+                            VkDeviceSize sizes[4] = {mlp_hidden_token_bytes, dit_mlp_fc2_weight_layer_f16_bytes, sizeof(float), token_bytes};
+                            VkDeviceSize offsets[4] = {0, weight_offset, 0, 0};
+                            if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4,
+                                        buffers, sizes, offsets,
+                                        &rt->mlp_fc2_wf16_descriptor_pools[layer_idx],
+                                        &rt->mlp_fc2_wf16_descriptor_sets[layer_idx])) return 1;
+                        }
                     }
                     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
                         for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
@@ -3874,13 +4211,44 @@ static int record_runtime_model_slice(
             PROFILE_DISPATCH("ada_rms.attn", (uint32_t)rt->T, 1, 1);
             cmd_shader_barrier(rt->command_buffer);
 
-            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(qkv_push));
+            int use_qkv_wf16 =
+                rt->qkv_proj_wf16_descriptor_sets &&
+                rt->qkv_proj_wf16_descriptor_sets[layer_idx] &&
+                use_runtime_linear_wf16_coopmat(rt,
+                        qkv_push.rows, qkv_push.cols,
+                        qkv_push.inner, qkv_push.has_bias);
+            int use_qkv_wf16_n16 =
+                use_qkv_wf16 &&
+                use_runtime_linear_wf16_coopmat_n16(rt,
+                        qkv_push.rows, qkv_push.cols,
+                        qkv_push.inner, qkv_push.has_bias);
+            VkPipeline qkv_pipeline = use_qkv_wf16_n16 ?
+                rt->runtime_linear_wf16_coopmat_n16_pipeline :
+                (use_qkv_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(qkv_push));
+            VkPipelineLayout qkv_layout = use_qkv_wf16_n16 ?
+                rt->runtime_linear_wf16_coopmat_n16_pipeline_layout :
+                (use_qkv_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(qkv_push));
+            VkDescriptorSet qkv_set = use_qkv_wf16 ?
+                rt->qkv_proj_wf16_descriptor_sets[layer_idx] : rt->qkv_proj_descriptor_sets[layer_idx];
+            vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, qkv_pipeline);
             vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    LINEAR_LAYOUT(qkv_push), 0, 1,
-                    &rt->qkv_proj_descriptor_sets[layer_idx], 0, NULL);
-            vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(qkv_push),
+                    qkv_layout, 0, 1,
+                    &qkv_set, 0, NULL);
+            vkCmdPushConstants(rt->command_buffer, qkv_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(qkv_push), &qkv_push);
-            LINEAR_DISPATCH("linear.qkv", qkv_push);
+            if (use_qkv_wf16_n16) {
+                PROFILE_DISPATCH("linear.qkv_wf16_n16",
+                        (qkv_push.cols + 15u) / 16u,
+                        (qkv_push.rows + 15u) / 16u,
+                        1);
+            } else if (use_qkv_wf16) {
+                PROFILE_DISPATCH("linear.qkv_wf16",
+                        (qkv_push.cols + 7u) / 8u,
+                        (qkv_push.rows + 15u) / 16u,
+                        1);
+            } else {
+                LINEAR_DISPATCH("linear.qkv", qkv_push);
+            }
             cmd_shader_barrier(rt->command_buffer);
 
             vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_qkv_rms_rope_pipeline);
@@ -3983,7 +4351,18 @@ static int record_runtime_model_slice(
                 if (rt->d_head == 64 && d64_allowed) {
                     uint32_t group = rt->cfg.n_kv_heads > 0 ?
                         (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
-                    if (rt->runtime_indexed_attention_d64_flash_enabled &&
+                    if (rt->runtime_indexed_attention_d64_flash96_enabled &&
+                            rt->runtime_indexed_attention_d64_flash96_pipeline &&
+                            group > 0u && group <= 16u &&
+                            (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
+                        uint32_t q_per_h = 16u / group;
+                        if (q_per_h == 0u) q_per_h = 1u;
+                        uint32_t q_blocks = ((uint32_t)rt->T + q_per_h - 1u) / q_per_h;
+                        attn_pipeline = rt->runtime_indexed_attention_d64_flash96_pipeline;
+                        attn_pipeline_layout = rt->runtime_indexed_attention_d64_flash96_pipeline_layout;
+                        attn_label = "attention.d64_flash96";
+                        attn_dispatch_x = (uint32_t)rt->cfg.n_kv_heads * q_blocks;
+                    } else if (rt->runtime_indexed_attention_d64_flash_enabled &&
                             rt->runtime_indexed_attention_d64_flash_pipeline &&
                             group > 0u && group <= 16u &&
                             (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads) {
@@ -4022,13 +4401,32 @@ static int record_runtime_model_slice(
                     residual_push.T = (uint32_t)rt->T;
                     residual_push.D = (uint32_t)rt->D;
 
-                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(out_proj_push));
+                    int use_attn_out_wf16 =
+                        rt->attn_out_proj_wf16_descriptor_sets &&
+                        rt->attn_out_proj_wf16_descriptor_sets[layer_idx] &&
+                        use_runtime_linear_wf16_coopmat(rt,
+                                out_proj_push.rows, out_proj_push.cols,
+                                out_proj_push.inner, out_proj_push.has_bias);
+                    VkPipeline out_proj_pipeline = use_attn_out_wf16 ?
+                        rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(out_proj_push);
+                    VkPipelineLayout out_proj_layout = use_attn_out_wf16 ?
+                        rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(out_proj_push);
+                    VkDescriptorSet out_proj_set = use_attn_out_wf16 ?
+                        rt->attn_out_proj_wf16_descriptor_sets[layer_idx] : rt->attn_out_proj_descriptor_sets[layer_idx];
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, out_proj_pipeline);
                     vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            LINEAR_LAYOUT(out_proj_push), 0, 1,
-                            &rt->attn_out_proj_descriptor_sets[layer_idx], 0, NULL);
-                    vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(out_proj_push),
+                            out_proj_layout, 0, 1,
+                            &out_proj_set, 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer, out_proj_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(out_proj_push), &out_proj_push);
-                    LINEAR_DISPATCH("linear.attn_out", out_proj_push);
+                    if (use_attn_out_wf16) {
+                        PROFILE_DISPATCH("linear.attn_out_wf16",
+                                (out_proj_push.cols + 7u) / 8u,
+                                (out_proj_push.rows + 15u) / 16u,
+                                1);
+                    } else {
+                        LINEAR_DISPATCH("linear.attn_out", out_proj_push);
+                    }
                     cmd_shader_barrier(rt->command_buffer);
 
                     vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
@@ -4151,13 +4549,32 @@ static int record_runtime_model_slice(
                         PROFILE_DISPATCH("ada_rms.mlp", (uint32_t)rt->T, 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(mlp_fc1_push));
+                        int use_mlp_fc1_wf16 =
+                            rt->mlp_fc1_wf16_descriptor_sets &&
+                            rt->mlp_fc1_wf16_descriptor_sets[layer_idx] &&
+                            use_runtime_linear_wf16_coopmat(rt,
+                                    mlp_fc1_push.rows, mlp_fc1_push.cols,
+                                    mlp_fc1_push.inner, mlp_fc1_push.has_bias);
+                        VkPipeline mlp_fc1_pipeline = use_mlp_fc1_wf16 ?
+                            rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(mlp_fc1_push);
+                        VkPipelineLayout mlp_fc1_layout = use_mlp_fc1_wf16 ?
+                            rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(mlp_fc1_push);
+                        VkDescriptorSet mlp_fc1_set = use_mlp_fc1_wf16 ?
+                            rt->mlp_fc1_wf16_descriptor_sets[layer_idx] : rt->mlp_fc1_descriptor_sets[layer_idx];
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mlp_fc1_pipeline);
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                LINEAR_LAYOUT(mlp_fc1_push), 0, 1,
-                                &rt->mlp_fc1_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(mlp_fc1_push),
+                                mlp_fc1_layout, 0, 1,
+                                &mlp_fc1_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, mlp_fc1_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc1_push), &mlp_fc1_push);
-                        LINEAR_DISPATCH("linear.mlp_fc1", mlp_fc1_push);
+                        if (use_mlp_fc1_wf16) {
+                            PROFILE_DISPATCH("linear.mlp_fc1_wf16",
+                                    (mlp_fc1_push.cols + 7u) / 8u,
+                                    (mlp_fc1_push.rows + 15u) / 16u,
+                                    1);
+                        } else {
+                            LINEAR_DISPATCH("linear.mlp_fc1", mlp_fc1_push);
+                        }
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_silu_pipeline);
@@ -4171,13 +4588,32 @@ static int record_runtime_model_slice(
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(mlp_fc2_push));
+                        int use_mlp_fc2_wf16 =
+                            rt->mlp_fc2_wf16_descriptor_sets &&
+                            rt->mlp_fc2_wf16_descriptor_sets[layer_idx] &&
+                            use_runtime_linear_wf16_coopmat(rt,
+                                    mlp_fc2_push.rows, mlp_fc2_push.cols,
+                                    mlp_fc2_push.inner, mlp_fc2_push.has_bias);
+                        VkPipeline mlp_fc2_pipeline = use_mlp_fc2_wf16 ?
+                            rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(mlp_fc2_push);
+                        VkPipelineLayout mlp_fc2_layout = use_mlp_fc2_wf16 ?
+                            rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(mlp_fc2_push);
+                        VkDescriptorSet mlp_fc2_set = use_mlp_fc2_wf16 ?
+                            rt->mlp_fc2_wf16_descriptor_sets[layer_idx] : rt->mlp_fc2_descriptor_sets[layer_idx];
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mlp_fc2_pipeline);
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                LINEAR_LAYOUT(mlp_fc2_push), 0, 1,
-                                &rt->mlp_fc2_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(mlp_fc2_push),
+                                mlp_fc2_layout, 0, 1,
+                                &mlp_fc2_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, mlp_fc2_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc2_push), &mlp_fc2_push);
-                        LINEAR_DISPATCH("linear.mlp_fc2", mlp_fc2_push);
+                        if (use_mlp_fc2_wf16) {
+                            PROFILE_DISPATCH("linear.mlp_fc2_wf16",
+                                    (mlp_fc2_push.cols + 7u) / 8u,
+                                    (mlp_fc2_push.rows + 15u) / 16u,
+                                    1);
+                        } else {
+                            LINEAR_DISPATCH("linear.mlp_fc2", mlp_fc2_push);
+                        }
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_gated_residual_pipeline);
@@ -5018,7 +5454,6 @@ int world_vulkan_linear_f16_coopmat_probe(void) {
     float *y = (float *)y_mapped;
     for (int i = 0; i < rows * inner; ++i) x[i] = probe_f32_to_f16(probe_value(i + 1703, 0.03125f));
     for (int i = 0; i < cols * inner; ++i) w[i] = probe_f32_to_f16(probe_value(i + 1901, 0.0234375f));
-    memset(y, 0, y_bytes);
 
     WorldVulkanLinearPush push;
     memset(&push, 0, sizeof(push));
@@ -5141,6 +5576,111 @@ int world_vulkan_linear_f32_coopmat_probe(void) {
     mean_abs /= (float)(rows * cols);
     fprintf(stderr, "vulkan linear_f32_coopmat probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
     if (max_abs > 2.0e-4f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_linear_f32_wf16_coopmat_probe(void) {
+    enum { rows = 32, cols = 16, inner = 32 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer w_buffer = VK_NULL_HANDLE;
+    VkBuffer b_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory w_memory = VK_NULL_HANDLE;
+    VkDeviceMemory b_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *w_mapped = NULL;
+    void *b_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    if (!rt->shader_float16_enabled || !rt->storage_16bit_enabled || !rt->cooperative_matrix_enabled) {
+        fprintf(stderr, "vulkan linear_f32_wf16_coopmat probe: skipped; required optional features unavailable\n");
+        rc = 0;
+        goto cleanup;
+    }
+
+    size_t x_bytes = (size_t)rows * inner * sizeof(float);
+    size_t w_bytes = (size_t)cols * inner * sizeof(uint16_t);
+    size_t b_bytes = (size_t)cols * sizeof(float);
+    size_t y_bytes = (size_t)rows * cols * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, w_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &w_buffer, &w_memory, &w_mapped)) goto cleanup;
+    if (create_host_buffer(rt, b_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) goto cleanup;
+    if (create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+
+    float *x = (float *)x_mapped;
+    uint16_t *w = (uint16_t *)w_mapped;
+    float *b = (float *)b_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < rows * inner; ++i) x[i] = probe_value(i + 2309, 0.03125f);
+    for (int i = 0; i < cols * inner; ++i) {
+        w[i] = probe_f32_to_f16(probe_value(i + 2503, 0.0234375f));
+    }
+    memset(b, 0, b_bytes);
+    memset(y, 0, y_bytes);
+
+    WorldVulkanLinearPush push;
+    memset(&push, 0, sizeof(push));
+    push.rows = rows;
+    push.cols = cols;
+    push.inner = inner;
+    push.has_bias = 0;
+
+    VkBuffer buffers[4] = {x_buffer, w_buffer, b_buffer, y_buffer};
+    VkDeviceSize sizes[4] = {x_bytes, w_bytes, b_bytes, y_bytes};
+    const char *shader_names[2] = {
+        "linear_f32_wf16_coopmat.comp",
+        "linear_f32_wf16_coopmat_n16.comp",
+    };
+    uint32_t col_tiles[2] = {8u, 16u};
+    for (int variant = 0; variant < 2; ++variant) {
+        memset(y, 0, y_bytes);
+        if (run_probe_compute(rt, shader_names[variant], 4, sizeof(push), buffers, sizes, &push,
+                    (uint32_t)(cols / col_tiles[variant]), (uint32_t)(rows / 16), 1)) goto cleanup;
+
+        float max_abs = 0.0f;
+        float mean_abs = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                float ref = 0.0f;
+                for (int k = 0; k < inner; ++k) {
+                    float xh = probe_f16_to_f32(probe_f32_to_f16(x[r * inner + k]));
+                    float wh = probe_f16_to_f32(w[c * inner + k]);
+                    ref += xh * wh;
+                }
+                float diff = fabsf(y[r * cols + c] - ref);
+                if (diff > max_abs) max_abs = diff;
+                mean_abs += diff;
+            }
+        }
+        mean_abs /= (float)(rows * cols);
+        fprintf(stderr, "vulkan %s probe: max_abs=%g mean_abs=%g\n",
+                shader_names[variant], max_abs, mean_abs);
+        if (max_abs > 2.0e-4f) goto cleanup;
+    }
     rc = 0;
 
 cleanup:
@@ -8720,6 +9260,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkShaderModule flash_shader = VK_NULL_HANDLE;
     VkPipelineLayout flash_pipeline_layout = VK_NULL_HANDLE;
     VkPipeline flash_pipeline = VK_NULL_HANDLE;
+    VkShaderModule flash96_shader = VK_NULL_HANDLE;
+    VkPipelineLayout flash96_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline flash96_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkBuffer q_buffer = VK_NULL_HANDLE;
@@ -8846,11 +9389,26 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     if (submit_compute(rt, flash_pipeline, flash_pipeline_layout, descriptor_set, &push, sizeof(push),
                 Hkv * q_blocks, 1, 1)) goto cleanup;
     CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash_f32");
+
+    if (rt->max_compute_shared_memory_size >= 96u * 64u * 2u * (uint32_t)sizeof(float)) {
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_flash96_f32.comp",
+                    set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                    &flash96_shader, &flash96_pipeline_layout, &flash96_pipeline)) goto cleanup;
+        if (submit_compute(rt, flash96_pipeline, flash96_pipeline_layout, descriptor_set, &push, sizeof(push),
+                    Hkv * q_blocks, 1, 1)) goto cleanup;
+        CHECK_INDEXED_ATTENTION("indexed_attention_d64_flash96_f32");
+    } else {
+        fprintf(stderr, "vulkan indexed_attention_d64_flash96_f32 probe: skipped; maxComputeSharedMemorySize=%u\n",
+                rt->max_compute_shared_memory_size);
+    }
 #undef CHECK_INDEXED_ATTENTION
     rc = 0;
 
 cleanup:
     if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (flash96_pipeline) vkDestroyPipeline(rt->device, flash96_pipeline, NULL);
+    if (flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash96_pipeline_layout, NULL);
+    if (flash96_shader) vkDestroyShaderModule(rt->device, flash96_shader, NULL);
     if (flash_pipeline) vkDestroyPipeline(rt->device, flash_pipeline, NULL);
     if (flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, flash_pipeline_layout, NULL);
     if (flash_shader) vkDestroyShaderModule(rt->device, flash_shader, NULL);
@@ -8925,6 +9483,13 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
             }
         }
     }
+    if (rt->qkv_proj_wf16_descriptor_pools) {
+        for (int i = 0; i < rt->layers_to_run; ++i) {
+            if (rt->qkv_proj_wf16_descriptor_pools[i]) {
+                vkDestroyDescriptorPool(rt->device, rt->qkv_proj_wf16_descriptor_pools[i], NULL);
+            }
+        }
+    }
     if (rt->qkv_rms_rope_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->qkv_rms_rope_descriptor_pool, NULL);
     if (rt->qkv_rms_rope_first_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->qkv_rms_rope_first_descriptor_pool, NULL);
     for (int i = 0; i < rt->layers_to_run; ++i) {
@@ -8932,12 +9497,15 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
         if (rt->cache_indices_descriptor_pools && rt->cache_indices_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->cache_indices_descriptor_pools[i], NULL);
         if (rt->indexed_attention_descriptor_pools && rt->indexed_attention_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_descriptor_pools[i], NULL);
         if (rt->attn_out_proj_descriptor_pools && rt->attn_out_proj_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_descriptor_pools[i], NULL);
+        if (rt->attn_out_proj_wf16_descriptor_pools && rt->attn_out_proj_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_wf16_descriptor_pools[i], NULL);
         if (rt->ctrl_cond_descriptor_pools && rt->ctrl_cond_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_cond_descriptor_pools[i], NULL);
         if (rt->ctrl_fc1_x_descriptor_pools && rt->ctrl_fc1_x_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_x_descriptor_pools[i], NULL);
         if (rt->ctrl_add_silu_descriptor_pools && rt->ctrl_add_silu_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_silu_descriptor_pools[i], NULL);
         if (rt->ctrl_fc2_descriptor_pools_layer && rt->ctrl_fc2_descriptor_pools_layer[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_descriptor_pools_layer[i], NULL);
         if (rt->mlp_fc1_descriptor_pools && rt->mlp_fc1_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc1_descriptor_pools[i], NULL);
+        if (rt->mlp_fc1_wf16_descriptor_pools && rt->mlp_fc1_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc1_wf16_descriptor_pools[i], NULL);
         if (rt->mlp_fc2_descriptor_pools && rt->mlp_fc2_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc2_descriptor_pools[i], NULL);
+        if (rt->mlp_fc2_wf16_descriptor_pools && rt->mlp_fc2_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc2_wf16_descriptor_pools[i], NULL);
     }
     for (int i = 0; i < rt->total_passes * rt->layers_to_run; ++i) {
         if (rt->attn_residual_descriptor_pools && rt->attn_residual_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_residual_descriptor_pools[i], NULL);
@@ -8954,6 +9522,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->value_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->value_residual_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
     if (rt->runtime_linear_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_coopmat_pipeline, NULL);
+    if (rt->runtime_linear_wf16_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_wf16_coopmat_pipeline, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_wf16_coopmat_n16_pipeline, NULL);
     if (rt->runtime_linear_tile64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_tile64_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
@@ -8965,6 +9535,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_flash96_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
     if (rt->runtime_add_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_pipeline, NULL);
@@ -8987,6 +9558,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_pixel_shuffle_pipeline) vkDestroyPipeline(rt->device, rt->taehv_pixel_shuffle_pipeline, NULL);
     if (rt->runtime_linear_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_pipeline_layout, NULL);
     if (rt->runtime_linear_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_coopmat_pipeline_layout, NULL);
+    if (rt->runtime_linear_wf16_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_wf16_coopmat_pipeline_layout, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_wf16_coopmat_n16_pipeline_layout, NULL);
     if (rt->runtime_linear_tile64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_tile64_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
     if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
@@ -8998,6 +9571,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
     if (rt->runtime_add_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_pipeline_layout, NULL);
@@ -9049,6 +9623,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_pixel_shuffle_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_pixel_shuffle_set_layout, NULL);
     if (rt->runtime_linear_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_shader, NULL);
     if (rt->runtime_linear_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_coopmat_shader, NULL);
+    if (rt->runtime_linear_wf16_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_wf16_coopmat_shader, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n16_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_wf16_coopmat_n16_shader, NULL);
     if (rt->runtime_linear_tile64_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_tile64_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
     if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
@@ -9060,6 +9636,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
     if (rt->runtime_indexed_attention_d64_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_flash96_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash96_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
     if (rt->runtime_add_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_shader, NULL);
@@ -9108,6 +9685,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->layer_cond_proj_weight_buffer, rt->layer_cond_proj_weight_memory, rt->layer_cond_proj_weight_mapped);
     destroy_host_buffer(rt, rt->layer_mod_table_buffer, rt->layer_mod_table_memory, rt->layer_mod_table_mapped);
     destroy_host_buffer(rt, rt->qkv_proj_weight_buffer, rt->qkv_proj_weight_memory, rt->qkv_proj_weight_mapped);
+    destroy_host_buffer(rt, rt->qkv_proj_weight_f16_buffer, rt->qkv_proj_weight_f16_memory, NULL);
     destroy_host_buffer(rt, rt->patch_weight_buffer, rt->patch_weight_memory, rt->patch_weight_mapped);
     destroy_host_buffer(rt, rt->tokens_buffer, rt->tokens_memory, rt->tokens_mapped);
     destroy_host_buffer(rt, rt->norm_buffer, rt->norm_memory, rt->norm_mapped);
@@ -9128,6 +9706,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->cache_index_count_buffer, rt->cache_index_count_memory, rt->cache_index_count_mapped);
     destroy_host_buffer(rt, rt->attn_buffer, rt->attn_memory, rt->attn_mapped);
     destroy_host_buffer(rt, rt->attn_out_proj_weight_buffer, rt->attn_out_proj_weight_memory, rt->attn_out_proj_weight_mapped);
+    destroy_host_buffer(rt, rt->attn_out_proj_weight_f16_buffer, rt->attn_out_proj_weight_f16_memory, NULL);
     destroy_host_buffer(rt, rt->attn_proj_buffer, rt->attn_proj_memory, rt->attn_proj_mapped);
     destroy_host_buffer(rt, rt->tokens_after_attn_buffer, rt->tokens_after_attn_memory, rt->tokens_after_attn_mapped);
     destroy_host_buffer(rt, rt->ctrl_fc1_c_weight_buffer, rt->ctrl_fc1_c_weight_memory, rt->ctrl_fc1_c_weight_mapped);
@@ -9139,7 +9718,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->ctrl_out_buffer, rt->ctrl_out_memory, rt->ctrl_out_mapped);
     destroy_host_buffer(rt, rt->tokens_after_ctrl_buffer, rt->tokens_after_ctrl_memory, rt->tokens_after_ctrl_mapped);
     destroy_host_buffer(rt, rt->dit_mlp_fc1_weight_buffer, rt->dit_mlp_fc1_weight_memory, rt->dit_mlp_fc1_weight_mapped);
+    destroy_host_buffer(rt, rt->dit_mlp_fc1_weight_f16_buffer, rt->dit_mlp_fc1_weight_f16_memory, NULL);
     destroy_host_buffer(rt, rt->dit_mlp_fc2_weight_buffer, rt->dit_mlp_fc2_weight_memory, rt->dit_mlp_fc2_weight_mapped);
+    destroy_host_buffer(rt, rt->dit_mlp_fc2_weight_f16_buffer, rt->dit_mlp_fc2_weight_f16_memory, NULL);
     destroy_host_buffer(rt, rt->mlp_in_buffer, rt->mlp_in_memory, rt->mlp_in_mapped);
     destroy_host_buffer(rt, rt->mlp_hidden_buffer, rt->mlp_hidden_memory, rt->mlp_hidden_mapped);
     destroy_host_buffer(rt, rt->mlp_out_buffer, rt->mlp_out_memory, rt->mlp_out_mapped);
@@ -9171,6 +9752,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->attn_ada_descriptor_sets);
     free(rt->qkv_proj_descriptor_pools);
     free(rt->qkv_proj_descriptor_sets);
+    free(rt->qkv_proj_wf16_descriptor_pools);
+    free(rt->qkv_proj_wf16_descriptor_sets);
     free(rt->kv_upsert_descriptor_pools);
     free(rt->kv_upsert_descriptor_sets);
     free(rt->cache_indices_descriptor_pools);
@@ -9179,6 +9762,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->indexed_attention_descriptor_sets);
     free(rt->attn_out_proj_descriptor_pools);
     free(rt->attn_out_proj_descriptor_sets);
+    free(rt->attn_out_proj_wf16_descriptor_pools);
+    free(rt->attn_out_proj_wf16_descriptor_sets);
     free(rt->attn_residual_descriptor_pools);
     free(rt->attn_residual_descriptor_sets);
     free(rt->ctrl_cond_descriptor_pools);
@@ -9193,8 +9778,12 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->mlp_ada_descriptor_sets);
     free(rt->mlp_fc1_descriptor_pools);
     free(rt->mlp_fc1_descriptor_sets);
+    free(rt->mlp_fc1_wf16_descriptor_pools);
+    free(rt->mlp_fc1_wf16_descriptor_sets);
     free(rt->mlp_fc2_descriptor_pools);
     free(rt->mlp_fc2_descriptor_sets);
+    free(rt->mlp_fc2_wf16_descriptor_pools);
+    free(rt->mlp_fc2_wf16_descriptor_sets);
     free(rt->mlp_residual_descriptor_pools);
     free(rt->mlp_residual_descriptor_sets);
     free(rt->layer_has_ctrl);
