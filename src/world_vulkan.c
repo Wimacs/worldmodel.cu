@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 
 #include <stdint.h>
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2249,8 +2250,9 @@ static int create_runtime_model_slice(
     rt->d_xy = rt->d_head / 8;
     rt->d_t = rt->d_head / 4;
     {
-        int fps_div = rt->cfg.base_fps > 0 ? rt->cfg.inference_fps / rt->cfg.base_fps : 0;
-        rt->frame_stride = fps_div > 0 ? rt->cfg.base_fps / fps_div : 1;
+        int latent_fps = rt->cfg.temporal_compression > 0 ?
+            rt->cfg.inference_fps / rt->cfg.temporal_compression : 0;
+        rt->frame_stride = latent_fps > 0 ? rt->cfg.base_fps / latent_fps : 1;
         if (rt->frame_stride <= 0) rt->frame_stride = 1;
     }
     rt->rms_eps = 1.0e-6f;
@@ -3631,7 +3633,9 @@ static int record_runtime_model_slice(
 
                 VkPipeline attn_pipeline = rt->runtime_indexed_attention_pipeline;
                 VkPipelineLayout attn_pipeline_layout = rt->runtime_indexed_attention_pipeline_layout;
-                if (rt->d_head == 64 && rt->runtime_indexed_attention_d64_pipeline) {
+                const char *disable_d64_attn = getenv("WORLD_VULKAN_DISABLE_D64_ATTENTION");
+                if (rt->d_head == 64 && rt->runtime_indexed_attention_d64_pipeline &&
+                        !(disable_d64_attn && disable_d64_attn[0] && disable_d64_attn[0] != '0')) {
                     attn_pipeline = rt->runtime_indexed_attention_d64_pipeline;
                     attn_pipeline_layout = rt->runtime_indexed_attention_d64_pipeline_layout;
                 }
@@ -4084,6 +4088,21 @@ static int world_vulkan_runtime_step_pixels(
     submit_info.pCommandBuffers = &rt->command_buffer;
     VK_CALL_RET(vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence));
     VK_CALL_RET(vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX));
+
+    const char *dump_latent_path = getenv("WORLD_DUMP_RUNTIME_LATENT");
+    if (rt->model_slice_enabled && dump_latent_path && dump_latent_path[0] && rt->latent_mapped) {
+        FILE *f = fopen(dump_latent_path, rt->frame_ordinal == 0 ? "wb" : "ab");
+        if (!f) {
+            fprintf(stderr, "failed to open Vulkan latent dump %s: %s\n", dump_latent_path, strerror(errno));
+            return 1;
+        }
+        size_t wrote = fwrite(rt->latent_mapped, sizeof(float), rt->latent_elems, f);
+        fclose(f);
+        if (wrote != rt->latent_elems) {
+            fprintf(stderr, "failed to write Vulkan latent dump %s\n", dump_latent_path);
+            return 1;
+        }
+    }
 
     const unsigned char *pixels = (const unsigned char *)rt->output_mapped;
     const char *pixel_label = "rgba";
