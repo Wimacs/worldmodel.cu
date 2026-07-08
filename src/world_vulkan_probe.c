@@ -6,6 +6,7 @@ int world_vulkan_linear_f32_probe(void);
 int world_vulkan_silu_f32_probe(void);
 int world_vulkan_rms_norm_f32_probe(void);
 int world_vulkan_control_embedding_f32_probe(void);
+int world_vulkan_denoise_out_norm_f32_probe(void);
 int world_vulkan_ada_rms_norm_f32_probe(void);
 int world_vulkan_ortho_rope_f32_probe(void);
 int world_vulkan_qkv_rms_rope_f32_probe(void);
@@ -37,6 +38,11 @@ int main(void) {
         return 1;
     }
     fprintf(stderr, "world_vulkan_control_embedding_f32_probe: ok\n");
+    if (world_vulkan_denoise_out_norm_f32_probe()) {
+        fprintf(stderr, "world_vulkan_denoise_out_norm_f32_probe: failed\n");
+        return 1;
+    }
+    fprintf(stderr, "world_vulkan_denoise_out_norm_f32_probe: ok\n");
     if (world_vulkan_ada_rms_norm_f32_probe()) {
         fprintf(stderr, "world_vulkan_ada_rms_norm_f32_probe: failed\n");
         return 1;
