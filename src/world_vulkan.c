@@ -283,6 +283,8 @@ struct WorldVulkanRuntime {
     VkFence fence;
     VkBuffer output_buffer;
     VkDeviceMemory output_memory;
+    VkBuffer output_readback_buffer;
+    VkDeviceMemory output_readback_memory;
     void *output_mapped;
     unsigned char *rgb_host;
     size_t pixel_count;
@@ -1077,11 +1079,16 @@ static int download_from_device_buffer(
 }
 
 static int create_output_buffer(WorldVulkanRuntime *rt) {
+    VkDeviceSize bytes = (VkDeviceSize)(rt->pixel_count * sizeof(uint32_t));
+    if (create_device_buffer(rt, bytes,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                &rt->output_buffer,
+                &rt->output_memory)) return 1;
     return create_host_buffer(rt,
-            rt->pixel_count * sizeof(uint32_t),
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            &rt->output_buffer,
-            &rt->output_memory,
+            bytes,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            &rt->output_readback_buffer,
+            &rt->output_readback_memory,
             &rt->output_mapped);
 }
 
@@ -1462,6 +1469,45 @@ static void cmd_shader_barrier(VkCommandBuffer cmd) {
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+static void record_output_readback(WorldVulkanRuntime *rt) {
+    VkDeviceSize bytes = (VkDeviceSize)(rt->pixel_count * sizeof(uint32_t));
+    VkBufferCopy copy_region;
+    memset(&copy_region, 0, sizeof(copy_region));
+    copy_region.size = bytes;
+
+    VkBufferMemoryBarrier to_transfer;
+    memset(&to_transfer, 0, sizeof(to_transfer));
+    to_transfer.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.buffer = rt->output_buffer;
+    to_transfer.offset = 0;
+    to_transfer.size = bytes;
+    vkCmdPipelineBarrier(rt->command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, NULL, 1, &to_transfer, 0, NULL);
+
+    vkCmdCopyBuffer(rt->command_buffer, rt->output_buffer, rt->output_readback_buffer, 1, &copy_region);
+
+    VkBufferMemoryBarrier to_host;
+    memset(&to_host, 0, sizeof(to_host));
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = rt->output_readback_buffer;
+    to_host.offset = 0;
+    to_host.size = bytes;
+    vkCmdPipelineBarrier(rt->command_buffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, NULL, 1, &to_host, 0, NULL);
 }
 
 static int precompute_runtime_out_mods(WorldVulkanRuntime *rt) {
@@ -3896,6 +3942,7 @@ int world_vulkan_runtime_step_rgb(
                 ((uint32_t)rt->height + 15u) / 16u,
                 (uint32_t)rt->frames);
     }
+    record_output_readback(rt);
     VK_CALL_RET(vkEndCommandBuffer(rt->command_buffer));
 
     VkSubmitInfo submit_info;
@@ -8086,7 +8133,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->unpatch_weight_buffer, rt->unpatch_weight_memory, rt->unpatch_weight_mapped);
     destroy_host_buffer(rt, rt->unpatch_bias_buffer, rt->unpatch_bias_memory, rt->unpatch_bias_mapped);
     destroy_host_buffer(rt, rt->latent_out_buffer, rt->latent_out_memory, rt->latent_out_mapped);
-    if (rt->output_mapped) vkUnmapMemory(rt->device, rt->output_memory);
+    if (rt->output_mapped) vkUnmapMemory(rt->device, rt->output_readback_memory);
     if (rt->fence) vkDestroyFence(rt->device, rt->fence, NULL);
     if (rt->command_pool) vkDestroyCommandPool(rt->device, rt->command_pool, NULL);
     if (rt->descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->descriptor_pool, NULL);
@@ -8094,6 +8141,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->pipeline_layout, NULL);
     if (rt->descriptor_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->descriptor_set_layout, NULL);
     if (rt->fill_shader) vkDestroyShaderModule(rt->device, rt->fill_shader, NULL);
+    if (rt->output_readback_buffer) vkDestroyBuffer(rt->device, rt->output_readback_buffer, NULL);
+    if (rt->output_readback_memory) vkFreeMemory(rt->device, rt->output_readback_memory, NULL);
     if (rt->output_buffer) vkDestroyBuffer(rt->device, rt->output_buffer, NULL);
     if (rt->output_memory) vkFreeMemory(rt->device, rt->output_memory, NULL);
     if (rt->device) vkDestroyDevice(rt->device, NULL);
