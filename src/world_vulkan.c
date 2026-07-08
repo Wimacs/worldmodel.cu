@@ -385,6 +385,9 @@ struct WorldVulkanRuntime {
     VkShaderModule runtime_linear_wf16_coopmat_n16_shader;
     VkPipelineLayout runtime_linear_wf16_coopmat_n16_pipeline_layout;
     VkPipeline runtime_linear_wf16_coopmat_n16_pipeline;
+    VkShaderModule runtime_linear_wf16_coopmat_n32_shader;
+    VkPipelineLayout runtime_linear_wf16_coopmat_n32_pipeline_layout;
+    VkPipeline runtime_linear_wf16_coopmat_n32_pipeline;
     VkShaderModule runtime_linear_f16x_wf16_coopmat_shader;
     VkPipelineLayout runtime_linear_f16x_wf16_coopmat_pipeline_layout;
     VkPipeline runtime_linear_f16x_wf16_coopmat_pipeline;
@@ -1901,6 +1904,23 @@ static int use_runtime_linear_wf16_coopmat_n16(
         inner >= 16u &&
         (rows % 16u) == 0u &&
         (cols % 16u) == 0u &&
+        (inner % 16u) == 0u;
+}
+
+static int use_runtime_linear_wf16_coopmat_n32(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner,
+        uint32_t has_bias) {
+    return rt->runtime_linear_wf16_coopmat_enabled &&
+        rt->runtime_linear_wf16_coopmat_n32_pipeline &&
+        !has_bias &&
+        rows >= 16u &&
+        cols >= 32u &&
+        inner >= 16u &&
+        (rows % 16u) == 0u &&
+        (cols % 32u) == 0u &&
         (inner % 16u) == 0u;
 }
 
@@ -3436,6 +3456,11 @@ static int create_runtime_model_slice(
                     &rt->runtime_linear_wf16_coopmat_n16_shader,
                     &rt->runtime_linear_wf16_coopmat_n16_pipeline_layout,
                     &rt->runtime_linear_wf16_coopmat_n16_pipeline)) return 1;
+        if (create_storage_pipeline_with_set_layout(rt, "linear_f32_wf16_coopmat_n32.comp",
+                    rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
+                    &rt->runtime_linear_wf16_coopmat_n32_shader,
+                    &rt->runtime_linear_wf16_coopmat_n32_pipeline_layout,
+                    &rt->runtime_linear_wf16_coopmat_n32_pipeline)) return 1;
         if (create_storage_pipeline_with_set_layout(rt, "linear_f16x_wf16_coopmat.comp",
                     rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
                     &rt->runtime_linear_f16x_wf16_coopmat_shader,
@@ -4630,10 +4655,17 @@ static int record_runtime_model_slice(
                             use_runtime_linear_wf16_coopmat(rt,
                                     mlp_fc1_push.rows, mlp_fc1_push.cols,
                                     mlp_fc1_push.inner, mlp_fc1_push.has_bias);
-                        VkPipeline mlp_fc1_pipeline = use_mlp_fc1_wf16 ?
-                            rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(mlp_fc1_push);
-                        VkPipelineLayout mlp_fc1_layout = use_mlp_fc1_wf16 ?
-                            rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(mlp_fc1_push);
+                        int use_mlp_fc1_wf16_n32 =
+                            use_mlp_fc1_wf16 &&
+                            use_runtime_linear_wf16_coopmat_n32(rt,
+                                    mlp_fc1_push.rows, mlp_fc1_push.cols,
+                                    mlp_fc1_push.inner, mlp_fc1_push.has_bias);
+                        VkPipeline mlp_fc1_pipeline = use_mlp_fc1_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline :
+                            (use_mlp_fc1_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline : LINEAR_PIPELINE(mlp_fc1_push));
+                        VkPipelineLayout mlp_fc1_layout = use_mlp_fc1_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline_layout :
+                            (use_mlp_fc1_wf16 ? rt->runtime_linear_wf16_coopmat_pipeline_layout : LINEAR_LAYOUT(mlp_fc1_push));
                         VkDescriptorSet mlp_fc1_set = use_mlp_fc1_wf16 ?
                             rt->mlp_fc1_wf16_descriptor_sets[layer_idx] : rt->mlp_fc1_descriptor_sets[layer_idx];
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, mlp_fc1_pipeline);
@@ -4642,7 +4674,12 @@ static int record_runtime_model_slice(
                                 &mlp_fc1_set, 0, NULL);
                         vkCmdPushConstants(rt->command_buffer, mlp_fc1_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(mlp_fc1_push), &mlp_fc1_push);
-                        if (use_mlp_fc1_wf16) {
+                        if (use_mlp_fc1_wf16_n32) {
+                            PROFILE_DISPATCH("linear.mlp_fc1_wf16_n32",
+                                    (mlp_fc1_push.cols + 31u) / 32u,
+                                    (mlp_fc1_push.rows + 15u) / 16u,
+                                    1);
+                        } else if (use_mlp_fc1_wf16) {
                             PROFILE_DISPATCH("linear.mlp_fc1_wf16",
                                     (mlp_fc1_push.cols + 7u) / 8u,
                                     (mlp_fc1_push.rows + 15u) / 16u,
@@ -5694,7 +5731,7 @@ cleanup:
 }
 
 int world_vulkan_linear_f32_wf16_coopmat_probe(void) {
-    enum { rows = 32, cols = 16, inner = 32 };
+    enum { rows = 32, cols = 32, inner = 32 };
     int rc = 1;
     WorldConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -5754,12 +5791,13 @@ int world_vulkan_linear_f32_wf16_coopmat_probe(void) {
 
     VkBuffer buffers[4] = {x_buffer, w_buffer, b_buffer, y_buffer};
     VkDeviceSize sizes[4] = {x_bytes, w_bytes, b_bytes, y_bytes};
-    const char *shader_names[2] = {
+    const char *shader_names[3] = {
         "linear_f32_wf16_coopmat.comp",
         "linear_f32_wf16_coopmat_n16.comp",
+        "linear_f32_wf16_coopmat_n32.comp",
     };
-    uint32_t col_tiles[2] = {8u, 16u};
-    for (int variant = 0; variant < 2; ++variant) {
+    uint32_t col_tiles[3] = {8u, 16u, 32u};
+    for (int variant = 0; variant < 3; ++variant) {
         memset(y, 0, y_bytes);
         if (run_probe_compute(rt, shader_names[variant], 4, sizeof(push), buffers, sizes, &push,
                     (uint32_t)(cols / col_tiles[variant]), (uint32_t)(rows / 16), 1)) goto cleanup;
@@ -9797,6 +9835,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_linear_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_coopmat_pipeline, NULL);
     if (rt->runtime_linear_wf16_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_wf16_coopmat_pipeline, NULL);
     if (rt->runtime_linear_wf16_coopmat_n16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_wf16_coopmat_n16_pipeline, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n32_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_wf16_coopmat_n32_pipeline, NULL);
     if (rt->runtime_linear_f16x_wf16_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_f16x_wf16_coopmat_pipeline, NULL);
     if (rt->runtime_linear_tile64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_tile64_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
@@ -9835,6 +9874,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_linear_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_coopmat_pipeline_layout, NULL);
     if (rt->runtime_linear_wf16_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_wf16_coopmat_pipeline_layout, NULL);
     if (rt->runtime_linear_wf16_coopmat_n16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_wf16_coopmat_n16_pipeline_layout, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n32_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_wf16_coopmat_n32_pipeline_layout, NULL);
     if (rt->runtime_linear_f16x_wf16_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_f16x_wf16_coopmat_pipeline_layout, NULL);
     if (rt->runtime_linear_tile64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_tile64_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
@@ -9903,6 +9943,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_linear_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_coopmat_shader, NULL);
     if (rt->runtime_linear_wf16_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_wf16_coopmat_shader, NULL);
     if (rt->runtime_linear_wf16_coopmat_n16_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_wf16_coopmat_n16_shader, NULL);
+    if (rt->runtime_linear_wf16_coopmat_n32_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_wf16_coopmat_n32_shader, NULL);
     if (rt->runtime_linear_f16x_wf16_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_f16x_wf16_coopmat_shader, NULL);
     if (rt->runtime_linear_tile64_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_tile64_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
