@@ -3014,14 +3014,15 @@ static int create_runtime_model_slice(
     size_t mlp_hidden_token_f16_bytes = (size_t)rt->T * rt->mlp_hidden * sizeof(uint16_t);
     size_t pass_layer_count = (size_t)rt->total_passes * (size_t)rt->layers_to_run;
     const char *splitk_env = getenv("WORLD_VULKAN_SPLITK_ATTENTION");
-    int splitk_env_enabled = splitk_env &&
-        (strcmp(splitk_env, "1") == 0 || strcmp(splitk_env, "64") == 0 || strcmp(splitk_env, "96") == 0);
+    int splitk_force64 = splitk_env && strcmp(splitk_env, "64") == 0;
+    int splitk_force96 = splitk_env && strcmp(splitk_env, "96") == 0;
+    int splitk_env_enabled = !splitk_env || strcmp(splitk_env, "1") == 0 ||
+        splitk_force64 || splitk_force96;
     uint32_t splitk96_shared_bytes = 96u * 64u * 2u * (uint32_t)sizeof(float);
     uint32_t splitk_block = 64u;
-    if (splitk_env && strcmp(splitk_env, "96") == 0) {
+    if (splitk_force96) {
         splitk_block = 96u;
-    } else if (splitk_env && strcmp(splitk_env, "1") == 0 &&
-            rt->max_compute_shared_memory_size >= splitk96_shared_bytes) {
+    } else if (!splitk_force64 && rt->max_compute_shared_memory_size >= splitk96_shared_bytes) {
         splitk_block = 96u;
     }
     int max_cache_capacity = 0;
@@ -3782,8 +3783,8 @@ static int create_runtime_model_slice(
                                         &rt->runtime_indexed_attention_d64_splitk_reduce_pipeline)) return 1;
                             rt->runtime_indexed_attention_d64_splitk_enabled = 1;
                             rt->runtime_indexed_attention_d64_splitk_block = splitk_block;
-                            fprintf(stderr, "Vulkan d64 split-K%u block-tiled attention enabled (WORLD_VULKAN_SPLITK_ATTENTION=%u)\n",
-                                    splitk_block, splitk_block);
+                            fprintf(stderr, "Vulkan d64 split-K%u block-tiled attention enabled; set WORLD_VULKAN_SPLITK_ATTENTION=0 to disable\n",
+                                    splitk_block);
                         } else {
                             fprintf(stderr,
                                     "warning: WORLD_VULKAN_SPLITK_ATTENTION ignored; maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSizeX=%u maxComputeSharedMemorySize=%u need_invocations=768 need_shared=%u\n",
