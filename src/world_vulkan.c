@@ -3888,15 +3888,16 @@ static void convert_rgba_to_rgb(WorldVulkanRuntime *rt) {
     }
 }
 
-int world_vulkan_runtime_step_rgb(
+static int world_vulkan_runtime_step_pixels(
         WorldVulkanRuntime *rt,
         const float *control_input,
-        const unsigned char **rgb_out,
+        const unsigned char **pixels_out,
         int *width_out,
         int *height_out,
         int *frames_out,
-        float *seconds_out) {
-    if (!rt || !rgb_out || !width_out || !height_out || !frames_out) return 1;
+        float *seconds_out,
+        int rgba_output) {
+    if (!rt || !pixels_out || !width_out || !height_out || !frames_out) return 1;
     double t0 = now_seconds();
     if (rt->model_slice_enabled) {
         if (rt->use_external_latent_once) {
@@ -3953,19 +3954,51 @@ int world_vulkan_runtime_step_rgb(
     VK_CALL_RET(vkQueueSubmit(rt->queue, 1, &submit_info, rt->fence));
     VK_CALL_RET(vkWaitForFences(rt->device, 1, &rt->fence, VK_TRUE, UINT64_MAX));
 
-    convert_rgba_to_rgb(rt);
+    const unsigned char *pixels = (const unsigned char *)rt->output_mapped;
+    const char *pixel_label = "rgba";
+    if (!rgba_output) {
+        convert_rgba_to_rgb(rt);
+        pixels = rt->rgb_host;
+        pixel_label = "rgb";
+    }
     rt->frame_ordinal += 1;
 
-    *rgb_out = rt->rgb_host;
+    *pixels_out = pixels;
     *width_out = rt->width;
     *height_out = rt->height;
     *frames_out = rt->frames;
-    if (seconds_out) *seconds_out = (float)(now_seconds() - t0);
-    fprintf(stderr, "Vulkan %s timing: total=%.3fms rgb_fps=%.3f\n",
+    double elapsed = now_seconds() - t0;
+    if (seconds_out) *seconds_out = (float)elapsed;
+    fprintf(stderr, "Vulkan %s timing: total=%.3fms %s_fps=%.3f\n",
             rt->model_slice_enabled ? "resident-slice" : "scaffold",
-            (now_seconds() - t0) * 1000.0,
-            (double)rt->frames / (now_seconds() - t0));
+            elapsed * 1000.0,
+            pixel_label,
+            (double)rt->frames / elapsed);
     return 0;
+}
+
+int world_vulkan_runtime_step_rgb(
+        WorldVulkanRuntime *rt,
+        const float *control_input,
+        const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out) {
+    return world_vulkan_runtime_step_pixels(
+            rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out, 0);
+}
+
+int world_vulkan_runtime_step_rgba(
+        WorldVulkanRuntime *rt,
+        const float *control_input,
+        const unsigned char **rgba_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out) {
+    return world_vulkan_runtime_step_pixels(
+            rt, control_input, rgba_out, width_out, height_out, frames_out, seconds_out, 1);
 }
 
 int world_vulkan_runtime_seed_latent_rgb(
@@ -3982,6 +4015,22 @@ int world_vulkan_runtime_seed_latent_rgb(
         rt->use_external_latent_once = 1;
     }
     return world_vulkan_runtime_step_rgb(rt, control_input, rgb_out, width_out, height_out, frames_out, seconds_out);
+}
+
+int world_vulkan_runtime_seed_latent_rgba(
+        WorldVulkanRuntime *rt,
+        const float *latent,
+        const float *control_input,
+        const unsigned char **rgba_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out) {
+    if (rt && latent && rt->model_slice_enabled && rt->latent_mapped) {
+        memcpy(rt->latent_mapped, latent, rt->latent_elems * sizeof(float));
+        rt->use_external_latent_once = 1;
+    }
+    return world_vulkan_runtime_step_rgba(rt, control_input, rgba_out, width_out, height_out, frames_out, seconds_out);
 }
 
 static float probe_value(int i, float scale) {

@@ -8,6 +8,12 @@
 #include <math.h>
 #include <errno.h>
 
+#if WORLD_BACKEND_BYTES_PER_PIXEL == 4
+#define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+#else
+#define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8
+#endif
+
 typedef struct {
     WorldModelProbeWeights probe;
     WorldLayerWeights *layers;
@@ -56,7 +62,7 @@ static void ray_usage(const char *argv0) {
             "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident runtime, warms up,\n"
-            "then renders decoded RGB frames to a raylib texture without writing images.\n",
+            "then renders decoded frames to a raylib texture without writing images.\n",
             argv0);
 }
 
@@ -235,12 +241,12 @@ static void *generation_worker(void *arg) {
         pthread_mutex_unlock(&s->mutex);
         if (stop) break;
 
-        const unsigned char *rgb = NULL;
+        const unsigned char *pixels = NULL;
         int width = 0;
         int height = 0;
         int frames = 0;
         float seconds = 0.0f;
-        if (world_runtime_step_rgb(s->rt, control, &rgb, &width, &height, &frames, &seconds)) {
+        if (world_runtime_step_pixels(s->rt, control, &pixels, &width, &height, &frames, &seconds)) {
             pthread_mutex_lock(&s->mutex);
             s->failed = 1;
             s->stop = 1;
@@ -248,10 +254,10 @@ static void *generation_worker(void *arg) {
             break;
         }
 
-        size_t bytes = (size_t)width * height * 3 * frames;
+        size_t bytes = (size_t)width * height * WORLD_BACKEND_BYTES_PER_PIXEL * frames;
         pthread_mutex_lock(&s->mutex);
         if (bytes == s->rgb_bytes) {
-            memcpy(s->rgb, rgb, bytes);
+            memcpy(s->rgb, pixels, bytes);
             s->width = width;
             s->height = height;
             s->frames = frames;
@@ -279,15 +285,43 @@ static Rectangle fit_rect(int dst_w, int dst_h, int src_w, int src_h) {
     return r;
 }
 
-static int ray_write_ppm(const char *path, const unsigned char *rgb, int width, int height) {
+static int ray_write_ppm(
+        const char *path,
+        const unsigned char *pixels,
+        int width,
+        int height,
+        int bytes_per_pixel) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "failed to open debug image %s: %s\n", path, strerror(errno));
         return 1;
     }
     fprintf(f, "P6\n%d %d\n255\n", width, height);
-    size_t n = (size_t)width * height * 3;
-    int ok = fwrite(rgb, 1, n, f) == n;
+    int ok = 1;
+    if (bytes_per_pixel == 3) {
+        size_t n = (size_t)width * height * 3;
+        ok = fwrite(pixels, 1, n, f) == n;
+    } else if (bytes_per_pixel == 4) {
+        unsigned char *row = (unsigned char *)malloc((size_t)width * 3);
+        if (!row) {
+            fclose(f);
+            fprintf(stderr, "failed to allocate debug image row\n");
+            return 1;
+        }
+        for (int y = 0; y < height && ok; ++y) {
+            const unsigned char *src = pixels + (size_t)y * width * 4;
+            for (int x = 0; x < width; ++x) {
+                row[x * 3 + 0] = src[x * 4 + 0];
+                row[x * 3 + 1] = src[x * 4 + 1];
+                row[x * 3 + 2] = src[x * 4 + 2];
+            }
+            size_t n = (size_t)width * 3;
+            ok = fwrite(row, 1, n, f) == n;
+        }
+        free(row);
+    } else {
+        ok = 0;
+    }
     fclose(f);
     if (!ok) {
         fprintf(stderr, "failed to write debug image %s\n", path);
@@ -306,13 +340,19 @@ static int ray_make_frame_path(char *out, size_t out_size, const char *path, int
     return n < 0 || (size_t)n >= out_size;
 }
 
-static int ray_write_ppm_frames(const char *path, const unsigned char *rgb, int frame_count, int width, int height) {
-    size_t frame_bytes = (size_t)width * height * 3;
-    if (ray_write_ppm(path, rgb, width, height)) return 1;
+static int ray_write_ppm_frames(
+        const char *path,
+        const unsigned char *pixels,
+        int frame_count,
+        int width,
+        int height,
+        int bytes_per_pixel) {
+    size_t frame_bytes = (size_t)width * height * bytes_per_pixel;
+    if (ray_write_ppm(path, pixels, width, height, bytes_per_pixel)) return 1;
     for (int i = 0; i < frame_count; ++i) {
         char frame_path[PATH_BUF];
         if (ray_make_frame_path(frame_path, sizeof(frame_path), path, i)) return 1;
-        if (ray_write_ppm(frame_path, rgb + (size_t)i * frame_bytes, width, height)) return 1;
+        if (ray_write_ppm(frame_path, pixels + (size_t)i * frame_bytes, width, height, bytes_per_pixel)) return 1;
     }
     return 0;
 }
@@ -480,43 +520,43 @@ int main(int argc, char **argv) {
     int ctrl_dim = cfg.n_buttons + 3;
     float *zero_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
     if (!zero_control) goto cleanup_before_window;
-    const unsigned char *warm_rgb = NULL;
+    const unsigned char *warm_pixels = NULL;
     int rgb_w = 0;
     int rgb_h = 0;
     int rgb_frames = 0;
     float warm_seconds = 0.0f;
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
-        if (world_runtime_seed_latent_rgb(rt, seed_latent, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_runtime_seed_latent_pixels(rt, seed_latent, zero_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(zero_control);
             goto cleanup_before_window;
         }
     }
     for (int i = 0; i < warmup_chunks; ++i) {
         fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
-        if (world_runtime_step_rgb(rt, zero_control, &warm_rgb, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_runtime_step_pixels(rt, zero_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(zero_control);
             goto cleanup_before_window;
         }
     }
     free(zero_control);
-    if (!warm_rgb || rgb_w <= 0 || rgb_h <= 0 || rgb_frames <= 0) goto cleanup_before_window;
+    if (!warm_pixels || rgb_w <= 0 || rgb_h <= 0 || rgb_frames <= 0) goto cleanup_before_window;
 
-    size_t frame_bytes = (size_t)rgb_w * rgb_h * 3;
+    size_t frame_bytes = (size_t)rgb_w * rgb_h * WORLD_BACKEND_BYTES_PER_PIXEL;
     size_t rgb_bytes = frame_bytes * (size_t)rgb_frames;
     unsigned char *display_rgb = (unsigned char *)malloc(rgb_bytes);
     if (!display_rgb) goto cleanup_before_window;
-    memcpy(display_rgb, warm_rgb, rgb_bytes);
+    memcpy(display_rgb, warm_pixels, rgb_bytes);
     if (headless_smoke) {
-        if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h)) {
+        if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h, WORLD_BACKEND_BYTES_PER_PIXEL)) {
             free(display_rgb);
             free(seed_latent);
             world_runtime_destroy(rt);
             return 1;
         }
         fprintf(stderr,
-                "headless smoke: resident runtime produced %d RGB frame(s) %dx%d in %.3fs%s\n",
-                rgb_frames, rgb_w, rgb_h, warm_seconds,
+                "headless smoke: resident runtime produced %d %s frame(s) %dx%d in %.3fs%s\n",
+                rgb_frames, WORLD_BACKEND_OUTPUT_LABEL, rgb_w, rgb_h, warm_seconds,
                 headless_out_path ? ", wrote debug frames" : ", no image files written");
         free(display_rgb);
         free(seed_latent);
@@ -531,7 +571,7 @@ int main(int argc, char **argv) {
     SetTargetFPS(60);
 
     int latest_frame = rgb_frames - 1;
-    Image image = {display_rgb + (size_t)latest_frame * frame_bytes, rgb_w, rgb_h, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8};
+    Image image = {display_rgb + (size_t)latest_frame * frame_bytes, rgb_w, rgb_h, 1, WORLD_RAYLIB_PIXEL_FORMAT};
     Texture2D texture = LoadTextureFromImage(image);
     UpdateTexture(texture, display_rgb + (size_t)latest_frame * frame_bytes);
 
@@ -612,10 +652,11 @@ int main(int argc, char **argv) {
         }
 
         char title[256];
-        snprintf(title, sizeof(title), "worldmodel.cu %s | chunk %d | frame %d/%d | gen %.2fs | %.2f rgb fps",
+        snprintf(title, sizeof(title), "worldmodel.cu %s | chunk %d | frame %d/%d | gen %.2fs | %.2f %s fps",
                  WORLD_BACKEND_NAME,
                  chunk_id, playback_frame + 1, rgb_frames, last_generation_seconds,
-                 rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f));
+                 rgb_frames / fmaxf(last_generation_seconds, 1.0e-6f),
+                 WORLD_BACKEND_OUTPUT_LABEL);
         SetWindowTitle(title);
 
         BeginDrawing();

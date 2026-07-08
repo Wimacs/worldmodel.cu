@@ -29,11 +29,30 @@ int world_vulkan_runtime_step_rgb(
         int *frames_out,
         float *seconds_out);
 
+int world_vulkan_runtime_step_rgba(
+        WorldVulkanRuntime *rt,
+        const float *control_input,
+        const unsigned char **rgba_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out);
+
 int world_vulkan_runtime_seed_latent_rgb(
         WorldVulkanRuntime *rt,
         const float *latent,
         const float *control_input,
         const unsigned char **rgb_out,
+        int *width_out,
+        int *height_out,
+        int *frames_out,
+        float *seconds_out);
+
+int world_vulkan_runtime_seed_latent_rgba(
+        WorldVulkanRuntime *rt,
+        const float *latent,
+        const float *control_input,
+        const unsigned char **rgba_out,
         int *width_out,
         int *height_out,
         int *frames_out,
