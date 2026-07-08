@@ -43,6 +43,8 @@ typedef struct {
     int failed;
     int produced_chunks;
     float generation_seconds;
+    float control_seconds;
+    float target_control_seconds;
 } LiveShared;
 
 enum {
@@ -59,7 +61,7 @@ enum {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
             "\n"
             "Raylib realtime frontend. Loads weights to a resident runtime, warms up,\n"
             "then renders decoded frames to a raylib texture without writing images.\n",
@@ -195,6 +197,12 @@ static float clamp_mouse_axis(float x) {
     return x;
 }
 
+static float clamp_mouse_accum(float x) {
+    if (x > 8.0f) return 8.0f;
+    if (x < -8.0f) return -8.0f;
+    return x;
+}
+
 static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, float mouse_scale) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
@@ -214,10 +222,13 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
     }
 }
 
-static void merge_frame_control(LiveShared *s, const float *frame_control) {
+static void merge_frame_control(LiveShared *s, const float *frame_control, float frame_seconds) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    s->control[0] = clamp_mouse_axis(s->control[0] + frame_control[0]);
-    s->control[1] = clamp_mouse_axis(s->control[1] + frame_control[1]);
+    s->control[0] = clamp_mouse_accum(s->control[0] + frame_control[0]);
+    s->control[1] = clamp_mouse_accum(s->control[1] + frame_control[1]);
+    if (frame_seconds > 0.0f && frame_seconds < 0.25f) {
+        s->control_seconds += frame_seconds;
+    }
     for (int i = 0; i < s->n_buttons; ++i) {
         s->control[2 + i] = frame_control[2 + i];
     }
@@ -240,9 +251,15 @@ static void *generation_worker(void *arg) {
         int stop = s->stop;
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
+            if (s->target_control_seconds > 0.0f && s->control_seconds > s->target_control_seconds) {
+                float k = s->target_control_seconds / s->control_seconds;
+                control[0] = clamp_mouse_axis(control[0] * k);
+                control[1] = clamp_mouse_axis(control[1] * k);
+            }
             s->control[0] = 0.0f;
             s->control[1] = 0.0f;
             s->control[2 + s->n_buttons] = 0.0f;
+            s->control_seconds = 0.0f;
         }
         pthread_mutex_unlock(&s->mutex);
         if (stop) break;
@@ -383,6 +400,10 @@ int main(int argc, char **argv) {
     int headless_smoke = 0;
     int fast_realtime = 0;
     int cache_window_override = -1;
+    int headless_has_mouse = 0;
+    float headless_mouse_x = 0.0f;
+    float headless_mouse_y = 0.0f;
+    int headless_button = -1;
     float mouse_scale = 1.0f;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
@@ -432,6 +453,12 @@ int main(int argc, char **argv) {
             headless_smoke = 1;
         } else if (strcmp(argv[i], "--headless-out") == 0 && i + 1 < argc) {
             headless_out_path = argv[++i];
+        } else if (strcmp(argv[i], "--headless-mouse") == 0 && i + 2 < argc) {
+            headless_mouse_x = strtof(argv[++i], NULL);
+            headless_mouse_y = strtof(argv[++i], NULL);
+            headless_has_mouse = 1;
+        } else if (strcmp(argv[i], "--headless-button") == 0 && i + 1 < argc) {
+            headless_button = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             ray_usage(argv[0]);
             return 0;
@@ -524,8 +551,25 @@ int main(int argc, char **argv) {
     free_vae_decoder_weights(&vae);
 
     int ctrl_dim = cfg.n_buttons + 3;
-    float *zero_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
-    if (!zero_control) goto cleanup_before_window;
+    float *seed_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
+    float *warm_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
+    if (!seed_control || !warm_control) {
+        free(seed_control);
+        free(warm_control);
+        goto cleanup_before_window;
+    }
+    if (headless_has_mouse) {
+        warm_control[0] = clamp_mouse_axis(headless_mouse_x);
+        warm_control[1] = clamp_mouse_axis(headless_mouse_y);
+    }
+    if (headless_button >= 0) {
+        if (headless_button < cfg.n_buttons) {
+            warm_control[2 + headless_button] = 1.0f;
+        } else {
+            fprintf(stderr, "warning: ignoring --headless-button %d outside n_buttons=%d\n",
+                    headless_button, cfg.n_buttons);
+        }
+    }
     const unsigned char *warm_pixels = NULL;
     int rgb_w = 0;
     int rgb_h = 0;
@@ -533,19 +577,22 @@ int main(int argc, char **argv) {
     float warm_seconds = 0.0f;
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
-        if (world_runtime_seed_latent_pixels(rt, seed_latent, zero_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
-            free(zero_control);
+        if (world_runtime_seed_latent_pixels(rt, seed_latent, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            free(seed_control);
+            free(warm_control);
             goto cleanup_before_window;
         }
     }
     for (int i = 0; i < warmup_chunks; ++i) {
         fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
-        if (world_runtime_step_pixels(rt, zero_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
-            free(zero_control);
+        if (world_runtime_step_pixels(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            free(seed_control);
+            free(warm_control);
             goto cleanup_before_window;
         }
     }
-    free(zero_control);
+    free(seed_control);
+    free(warm_control);
     if (!warm_pixels || rgb_w <= 0 || rgb_h <= 0 || rgb_frames <= 0) goto cleanup_before_window;
 
     size_t frame_bytes = (size_t)rgb_w * rgb_h * WORLD_BACKEND_BYTES_PER_PIXEL;
@@ -591,6 +638,7 @@ int main(int argc, char **argv) {
     shared.width = rgb_w;
     shared.height = rgb_h;
     shared.frames = rgb_frames;
+    shared.target_control_seconds = cfg.inference_fps > 0 ? (float)rgb_frames / (float)cfg.inference_fps : 0.0f;
     shared.control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
     shared.rgb = (unsigned char *)malloc(rgb_bytes);
     if (!shared.control || !shared.rgb) {
@@ -626,9 +674,10 @@ int main(int argc, char **argv) {
     }
     while (!WindowShouldClose()) {
         if (!frame_control) break;
+        float frame_seconds = GetFrameTime();
         fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons, mouse_scale);
         pthread_mutex_lock(&shared.mutex);
-        merge_frame_control(&shared, frame_control);
+        merge_frame_control(&shared, frame_control, frame_seconds);
         int failed = shared.failed;
         if (shared.ready) {
             memcpy(display_rgb, shared.rgb, rgb_bytes);

@@ -98,6 +98,7 @@ if(WORLD_ENABLE_VULKAN)
     cache_frame_indices.comp
     fill_rgba.comp
     gated_residual_add_f32.comp
+    indexed_attention_d64_warp_f32.comp
     indexed_attention_f32.comp
     kv_cache_mask.comp
     kv_cache_upsert_copy_f32.comp
@@ -133,7 +134,7 @@ if(WORLD_ENABLE_VULKAN)
     add_custom_command(
       OUTPUT ${shader_spv}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WORLD_VULKAN_SHADER_OUTPUT_DIR}
-      COMMAND ${GLSLC_EXECUTABLE} -O ${shader_src} -o ${shader_spv}
+      COMMAND ${GLSLC_EXECUTABLE} -O --target-env=vulkan1.2 ${shader_src} -o ${shader_spv}
       DEPENDS ${shader_src}
       VERBATIM
     )

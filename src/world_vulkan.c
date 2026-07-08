@@ -379,6 +379,9 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_indexed_attention_set_layout;
     VkPipelineLayout runtime_indexed_attention_pipeline_layout;
     VkPipeline runtime_indexed_attention_pipeline;
+    VkShaderModule runtime_indexed_attention_d64_shader;
+    VkPipelineLayout runtime_indexed_attention_d64_pipeline_layout;
+    VkPipeline runtime_indexed_attention_d64_pipeline;
     VkShaderModule runtime_gated_residual_shader;
     VkDescriptorSetLayout runtime_gated_residual_set_layout;
     VkPipelineLayout runtime_gated_residual_pipeline_layout;
@@ -1280,6 +1283,50 @@ static int create_storage_pipeline(
     layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     layout_info.setLayoutCount = 1;
     layout_info.pSetLayouts = set_layout;
+    layout_info.pushConstantRangeCount = push_size ? 1 : 0;
+    layout_info.pPushConstantRanges = push_size ? &push_range : NULL;
+    VK_CALL_RET(vkCreatePipelineLayout(rt->device, &layout_info, NULL, pipeline_layout));
+
+    VkPipelineShaderStageCreateInfo stage_info;
+    memset(&stage_info, 0, sizeof(stage_info));
+    stage_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage_info.module = *shader;
+    stage_info.pName = "main";
+
+    VkComputePipelineCreateInfo pipeline_info;
+    memset(&pipeline_info, 0, sizeof(pipeline_info));
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage = stage_info;
+    pipeline_info.layout = *pipeline_layout;
+    VK_CALL_RET(vkCreateComputePipelines(rt->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline));
+    return 0;
+}
+
+static int create_storage_pipeline_with_set_layout(
+        WorldVulkanRuntime *rt,
+        const char *shader_name,
+        VkDescriptorSetLayout set_layout,
+        uint32_t push_size,
+        VkShaderModule *shader,
+        VkPipelineLayout *pipeline_layout,
+        VkPipeline *pipeline) {
+    *shader = VK_NULL_HANDLE;
+    *pipeline_layout = VK_NULL_HANDLE;
+    *pipeline = VK_NULL_HANDLE;
+    if (create_shader_module_from_name(rt, shader_name, shader)) return 1;
+
+    VkPushConstantRange push_range;
+    memset(&push_range, 0, sizeof(push_range));
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset = 0;
+    push_range.size = push_size;
+
+    VkPipelineLayoutCreateInfo layout_info;
+    memset(&layout_info, 0, sizeof(layout_info));
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &set_layout;
     layout_info.pushConstantRangeCount = push_size ? 1 : 0;
     layout_info.pPushConstantRanges = push_size ? &push_range : NULL;
     VK_CALL_RET(vkCreatePipelineLayout(rt->device, &layout_info, NULL, pipeline_layout));
@@ -2812,6 +2859,13 @@ static int create_runtime_model_slice(
             if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 6, sizeof(WorldVulkanIndexedAttentionPush),
                         &rt->runtime_indexed_attention_shader, &rt->runtime_indexed_attention_set_layout,
                         &rt->runtime_indexed_attention_pipeline_layout, &rt->runtime_indexed_attention_pipeline)) return 1;
+            if (rt->d_head == 64) {
+                if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_warp_f32.comp",
+                            rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                            &rt->runtime_indexed_attention_d64_shader,
+                            &rt->runtime_indexed_attention_d64_pipeline_layout,
+                            &rt->runtime_indexed_attention_d64_pipeline)) return 1;
+            }
             if (rt->layer_attn_out_enabled) {
                 if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
                             &rt->runtime_gated_residual_shader, &rt->runtime_gated_residual_set_layout,
@@ -3575,11 +3629,17 @@ static int record_runtime_model_slice(
                 vkCmdDispatch(rt->command_buffer, (uint32_t)(cache_capacity / rt->T), 1, 1);
                 cmd_shader_barrier(rt->command_buffer);
 
-                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_indexed_attention_pipeline);
+                VkPipeline attn_pipeline = rt->runtime_indexed_attention_pipeline;
+                VkPipelineLayout attn_pipeline_layout = rt->runtime_indexed_attention_pipeline_layout;
+                if (rt->d_head == 64 && rt->runtime_indexed_attention_d64_pipeline) {
+                    attn_pipeline = rt->runtime_indexed_attention_d64_pipeline;
+                    attn_pipeline_layout = rt->runtime_indexed_attention_d64_pipeline_layout;
+                }
+                vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, attn_pipeline);
                 vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        rt->runtime_indexed_attention_pipeline_layout, 0, 1,
+                        attn_pipeline_layout, 0, 1,
                         &rt->indexed_attention_descriptor_sets[layer_idx], 0, NULL);
-                vkCmdPushConstants(rt->command_buffer, rt->runtime_indexed_attention_pipeline_layout,
+                vkCmdPushConstants(rt->command_buffer, attn_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(attn_push), &attn_push);
                 vkCmdDispatch(rt->command_buffer,
                         (uint32_t)(rt->cfg.n_heads * rt->T),
@@ -7977,6 +8037,9 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkShaderModule d64_shader = VK_NULL_HANDLE;
+    VkPipelineLayout d64_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline d64_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkBuffer q_buffer = VK_NULL_HANDLE;
@@ -8043,49 +8106,64 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     if (submit_compute(rt, pipeline, pipeline_layout, descriptor_set, &push, sizeof(push),
                 B * Hq * Tq, 1, 1)) goto cleanup;
 
-    float max_abs = 0.0f;
-    float mean_abs = 0.0f;
     int group = Hq / Hkv;
-    for (int b = 0; b < B; ++b) {
-        for (int hq = 0; hq < Hq; ++hq) {
-            int hk = hq / group;
-            for (int tq = 0; tq < Tq; ++tq) {
-                const float *qrow = q + ((b * Hq + hq) * Tq + tq) * D;
-                const float *kbase = k + (b * Hkv + hk) * Tk * D;
-                const float *vbase = v + (b * Hkv + hk) * Tk * D;
-                float scores[Nkv];
-                float max_score = -INFINITY;
-                for (int n = 0; n < Nkv; ++n) {
-                    int tk = (int)indices[n];
-                    float dot = 0.0f;
-                    for (int d = 0; d < D; ++d) dot += qrow[d] * kbase[tk * D + d];
-                    scores[n] = dot * scale;
-                    if (scores[n] > max_score) max_score = scores[n];
-                }
-                float denom = 0.0f;
-                for (int n = 0; n < Nkv; ++n) denom += expf(scores[n] - max_score);
-                for (int d = 0; d < D; ++d) {
-                    float ref = 0.0f;
-                    for (int n = 0; n < Nkv; ++n) {
-                        int tk = (int)indices[n];
-                        ref += expf(scores[n] - max_score) * vbase[tk * D + d];
-                    }
-                    ref /= denom;
-                    size_t idx = (size_t)(((b * Tq + tq) * Hq + hq) * D + d);
-                    float diff = fabsf(out[idx] - ref);
-                    if (diff > max_abs) max_abs = diff;
-                    mean_abs += diff;
-                }
-            }
-        }
-    }
-    mean_abs /= (float)(B * Hq * Tq * D);
-    fprintf(stderr, "vulkan indexed_attention_f32 probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
-    if (max_abs > 4.0e-5f) goto cleanup;
+#define CHECK_INDEXED_ATTENTION(label) do { \
+        float max_abs = 0.0f; \
+        float mean_abs = 0.0f; \
+        for (int b = 0; b < B; ++b) { \
+            for (int hq = 0; hq < Hq; ++hq) { \
+                int hk = hq / group; \
+                for (int tq = 0; tq < Tq; ++tq) { \
+                    const float *qrow = q + ((b * Hq + hq) * Tq + tq) * D; \
+                    const float *kbase = k + (b * Hkv + hk) * Tk * D; \
+                    const float *vbase = v + (b * Hkv + hk) * Tk * D; \
+                    float scores[Nkv]; \
+                    float max_score = -INFINITY; \
+                    for (int n = 0; n < Nkv; ++n) { \
+                        int tk = (int)indices[n]; \
+                        float dot = 0.0f; \
+                        for (int d = 0; d < D; ++d) dot += qrow[d] * kbase[tk * D + d]; \
+                        scores[n] = dot * scale; \
+                        if (scores[n] > max_score) max_score = scores[n]; \
+                    } \
+                    float denom = 0.0f; \
+                    for (int n = 0; n < Nkv; ++n) denom += expf(scores[n] - max_score); \
+                    for (int d = 0; d < D; ++d) { \
+                        float ref = 0.0f; \
+                        for (int n = 0; n < Nkv; ++n) { \
+                            int tk = (int)indices[n]; \
+                            ref += expf(scores[n] - max_score) * vbase[tk * D + d]; \
+                        } \
+                        ref /= denom; \
+                        size_t idx = (size_t)(((b * Tq + tq) * Hq + hq) * D + d); \
+                        float diff = fabsf(out[idx] - ref); \
+                        if (diff > max_abs) max_abs = diff; \
+                        mean_abs += diff; \
+                    } \
+                } \
+            } \
+        } \
+        mean_abs /= (float)(B * Hq * Tq * D); \
+        fprintf(stderr, "vulkan %s probe: max_abs=%g mean_abs=%g\n", (label), max_abs, mean_abs); \
+        if (max_abs > 4.0e-5f) goto cleanup; \
+    } while (0)
+
+    CHECK_INDEXED_ATTENTION("indexed_attention_f32");
+
+    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_warp_f32.comp",
+                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                &d64_shader, &d64_pipeline_layout, &d64_pipeline)) goto cleanup;
+    if (submit_compute(rt, d64_pipeline, d64_pipeline_layout, descriptor_set, &push, sizeof(push),
+                B * Hq * Tq, 1, 1)) goto cleanup;
+    CHECK_INDEXED_ATTENTION("indexed_attention_d64_warp_f32");
+#undef CHECK_INDEXED_ATTENTION
     rc = 0;
 
 cleanup:
     if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (d64_pipeline) vkDestroyPipeline(rt->device, d64_pipeline, NULL);
+    if (d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, d64_pipeline_layout, NULL);
+    if (d64_shader) vkDestroyShaderModule(rt->device, d64_shader, NULL);
     if (pipeline) vkDestroyPipeline(rt->device, pipeline, NULL);
     if (pipeline_layout) vkDestroyPipelineLayout(rt->device, pipeline_layout, NULL);
     if (descriptor_pool) vkDestroyDescriptorPool(rt->device, descriptor_pool, NULL);
@@ -8187,6 +8265,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_pipeline) vkDestroyPipeline(rt->device, rt->runtime_kv_upsert_pipeline, NULL);
     if (rt->runtime_cache_indices_pipeline) vkDestroyPipeline(rt->device, rt->runtime_cache_indices_pipeline, NULL);
     if (rt->runtime_indexed_attention_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_pipeline, NULL);
+    if (rt->runtime_indexed_attention_d64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
     if (rt->runtime_add_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_pipeline, NULL);
@@ -8216,6 +8295,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_kv_upsert_pipeline_layout, NULL);
     if (rt->runtime_cache_indices_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_cache_indices_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_pipeline_layout, NULL);
+    if (rt->runtime_indexed_attention_d64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
     if (rt->runtime_add_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_pipeline_layout, NULL);
@@ -8274,6 +8354,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_kv_upsert_shader) vkDestroyShaderModule(rt->device, rt->runtime_kv_upsert_shader, NULL);
     if (rt->runtime_cache_indices_shader) vkDestroyShaderModule(rt->device, rt->runtime_cache_indices_shader, NULL);
     if (rt->runtime_indexed_attention_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_shader, NULL);
+    if (rt->runtime_indexed_attention_d64_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
     if (rt->runtime_add_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_shader, NULL);
