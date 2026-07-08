@@ -116,6 +116,7 @@ if(WORLD_ENABLE_VULKAN)
     taehv_conv2d_nchw_1x1_c4_f32.comp
     taehv_conv2d_nchw_c4_f32.comp
     taehv_conv2d_nchw_f32.comp
+    taehv_conv_out_rgba_f32.comp
     taehv_pixel_shuffle_rgba_f32.comp
     taehv_relu_f32.comp
     taehv_repeat_clamp_f32.comp
