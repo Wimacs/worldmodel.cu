@@ -374,6 +374,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_linear_set_layout;
     VkPipelineLayout runtime_linear_pipeline_layout;
     VkPipeline runtime_linear_pipeline;
+    VkShaderModule runtime_linear_coopmat_shader;
+    VkPipelineLayout runtime_linear_coopmat_pipeline_layout;
+    VkPipeline runtime_linear_coopmat_pipeline;
+    int runtime_linear_coopmat_enabled;
     VkShaderModule runtime_linear_tile64_shader;
     VkPipelineLayout runtime_linear_tile64_pipeline_layout;
     VkPipeline runtime_linear_tile64_pipeline;
@@ -1760,11 +1764,32 @@ static int use_runtime_linear_tile64(
         inner >= 1024u;
 }
 
+static int use_runtime_linear_coopmat(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner,
+        uint32_t has_bias) {
+    return rt->runtime_linear_coopmat_enabled &&
+        rt->runtime_linear_coopmat_pipeline &&
+        !has_bias &&
+        rows >= 16u &&
+        cols >= 8u &&
+        inner >= 16u &&
+        (rows % 16u) == 0u &&
+        (cols % 8u) == 0u &&
+        (inner % 16u) == 0u;
+}
+
 static VkPipeline runtime_linear_pipeline_for(
         WorldVulkanRuntime *rt,
         uint32_t rows,
         uint32_t cols,
-        uint32_t inner) {
+        uint32_t inner,
+        uint32_t has_bias) {
+    if (use_runtime_linear_coopmat(rt, rows, cols, inner, has_bias)) {
+        return rt->runtime_linear_coopmat_pipeline;
+    }
     return use_runtime_linear_tile64(rt, rows, cols, inner) ?
         rt->runtime_linear_tile64_pipeline : rt->runtime_linear_pipeline;
 }
@@ -1773,16 +1798,32 @@ static VkPipelineLayout runtime_linear_layout_for(
         WorldVulkanRuntime *rt,
         uint32_t rows,
         uint32_t cols,
-        uint32_t inner) {
+        uint32_t inner,
+        uint32_t has_bias) {
+    if (use_runtime_linear_coopmat(rt, rows, cols, inner, has_bias)) {
+        return rt->runtime_linear_coopmat_pipeline_layout;
+    }
     return use_runtime_linear_tile64(rt, rows, cols, inner) ?
         rt->runtime_linear_tile64_pipeline_layout : rt->runtime_linear_pipeline_layout;
 }
 
-static uint32_t runtime_linear_tile_for(
+static uint32_t runtime_linear_tile_x_for(
         const WorldVulkanRuntime *rt,
         uint32_t rows,
         uint32_t cols,
-        uint32_t inner) {
+        uint32_t inner,
+        uint32_t has_bias) {
+    if (use_runtime_linear_coopmat(rt, rows, cols, inner, has_bias)) return 8u;
+    return use_runtime_linear_tile64(rt, rows, cols, inner) ? 64u : 16u;
+}
+
+static uint32_t runtime_linear_tile_y_for(
+        const WorldVulkanRuntime *rt,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t inner,
+        uint32_t has_bias) {
+    if (use_runtime_linear_coopmat(rt, rows, cols, inner, has_bias)) return 16u;
     return use_runtime_linear_tile64(rt, rows, cols, inner) ? 64u : 16u;
 }
 
@@ -3086,6 +3127,23 @@ static int create_runtime_model_slice(
                 &rt->runtime_linear_shader, &rt->runtime_linear_set_layout,
                 &rt->runtime_linear_pipeline_layout, &rt->runtime_linear_pipeline)) return 1;
     {
+        const char *coopmat_env = getenv("WORLD_VULKAN_LINEAR_COOPMAT");
+        if (coopmat_env && coopmat_env[0] == '1') {
+            if (rt->shader_float16_enabled && rt->cooperative_matrix_enabled) {
+                if (create_storage_pipeline_with_set_layout(rt, "linear_f32_coopmat.comp",
+                            rt->runtime_linear_set_layout, sizeof(WorldVulkanLinearPush),
+                            &rt->runtime_linear_coopmat_shader,
+                            &rt->runtime_linear_coopmat_pipeline_layout,
+                            &rt->runtime_linear_coopmat_pipeline)) return 1;
+                rt->runtime_linear_coopmat_enabled = 1;
+                fprintf(stderr, "Vulkan linear f32->f16 cooperative-matrix path enabled (WORLD_VULKAN_LINEAR_COOPMAT=1)\n");
+            } else {
+                fprintf(stderr, "warning: WORLD_VULKAN_LINEAR_COOPMAT=1 ignored; shaderFloat16=%d cooperativeMatrix=%d\n",
+                        rt->shader_float16_enabled, rt->cooperative_matrix_enabled);
+            }
+        }
+    }
+    {
         const char *tile64_env = getenv("WORLD_VULKAN_LINEAR_TILE64");
         if (tile64_env && tile64_env[0] == '1') {
             if (create_storage_pipeline_with_set_layout(rt, "linear_f32_tile64.comp",
@@ -3624,12 +3682,13 @@ static int record_runtime_model_slice(
     vkCmdDispatch(rt->command_buffer, (gx), (gy), (gz)); \
     profile_end_dispatch(rt, _profile_event); \
 } while (0)
-#define LINEAR_PIPELINE(push) runtime_linear_pipeline_for(rt, (push).rows, (push).cols, (push).inner)
-#define LINEAR_LAYOUT(push) runtime_linear_layout_for(rt, (push).rows, (push).cols, (push).inner)
+#define LINEAR_PIPELINE(push) runtime_linear_pipeline_for(rt, (push).rows, (push).cols, (push).inner, (push).has_bias)
+#define LINEAR_LAYOUT(push) runtime_linear_layout_for(rt, (push).rows, (push).cols, (push).inner, (push).has_bias)
 #define LINEAR_DISPATCH(label, push) do { \
-    uint32_t _linear_tile = runtime_linear_tile_for(rt, (push).rows, (push).cols, (push).inner); \
-    PROFILE_DISPATCH((label), ((push).cols + _linear_tile - 1u) / _linear_tile, \
-            ((push).rows + _linear_tile - 1u) / _linear_tile, 1); \
+    uint32_t _linear_tile_x = runtime_linear_tile_x_for(rt, (push).rows, (push).cols, (push).inner, (push).has_bias); \
+    uint32_t _linear_tile_y = runtime_linear_tile_y_for(rt, (push).rows, (push).cols, (push).inner, (push).has_bias); \
+    PROFILE_DISPATCH((label), ((push).cols + _linear_tile_x - 1u) / _linear_tile_x, \
+            ((push).rows + _linear_tile_y - 1u) / _linear_tile_y, 1); \
 } while (0)
 
     if (rt->ctrl_embedding_enabled) {
@@ -4996,6 +5055,100 @@ cleanup:
     if (rt) {
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
         destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_linear_f32_coopmat_probe(void) {
+    enum { rows = 32, cols = 16, inner = 32 };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkBuffer x_buffer = VK_NULL_HANDLE;
+    VkBuffer w_buffer = VK_NULL_HANDLE;
+    VkBuffer b_buffer = VK_NULL_HANDLE;
+    VkBuffer y_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory x_memory = VK_NULL_HANDLE;
+    VkDeviceMemory w_memory = VK_NULL_HANDLE;
+    VkDeviceMemory b_memory = VK_NULL_HANDLE;
+    VkDeviceMemory y_memory = VK_NULL_HANDLE;
+    void *x_mapped = NULL;
+    void *w_mapped = NULL;
+    void *b_mapped = NULL;
+    void *y_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    if (!rt->shader_float16_enabled || !rt->cooperative_matrix_enabled) {
+        fprintf(stderr, "vulkan linear_f32_coopmat probe: skipped; required optional features unavailable\n");
+        rc = 0;
+        goto cleanup;
+    }
+
+    size_t x_bytes = (size_t)rows * inner * sizeof(float);
+    size_t w_bytes = (size_t)cols * inner * sizeof(float);
+    size_t b_bytes = (size_t)cols * sizeof(float);
+    size_t y_bytes = (size_t)rows * cols * sizeof(float);
+    if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) goto cleanup;
+    if (create_host_buffer(rt, w_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &w_buffer, &w_memory, &w_mapped)) goto cleanup;
+    if (create_host_buffer(rt, b_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) goto cleanup;
+    if (create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) goto cleanup;
+
+    float *x = (float *)x_mapped;
+    float *w = (float *)w_mapped;
+    float *b = (float *)b_mapped;
+    float *y = (float *)y_mapped;
+    for (int i = 0; i < rows * inner; ++i) x[i] = probe_value(i + 2011, 0.03125f);
+    for (int i = 0; i < cols * inner; ++i) w[i] = probe_value(i + 2203, 0.0234375f);
+    memset(b, 0, b_bytes);
+    memset(y, 0, y_bytes);
+
+    WorldVulkanLinearPush push;
+    memset(&push, 0, sizeof(push));
+    push.rows = rows;
+    push.cols = cols;
+    push.inner = inner;
+    push.has_bias = 0;
+
+    VkBuffer buffers[4] = {x_buffer, w_buffer, b_buffer, y_buffer};
+    VkDeviceSize sizes[4] = {x_bytes, w_bytes, b_bytes, y_bytes};
+    if (run_probe_compute(rt, "linear_f32_coopmat.comp", 4, sizeof(push), buffers, sizes, &push,
+                (uint32_t)(cols / 8), (uint32_t)(rows / 16), 1)) goto cleanup;
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            float ref = 0.0f;
+            for (int k = 0; k < inner; ++k) {
+                float xh = probe_f16_to_f32(probe_f32_to_f16(x[r * inner + k]));
+                float wh = probe_f16_to_f32(probe_f32_to_f16(w[c * inner + k]));
+                ref += xh * wh;
+            }
+            float diff = fabsf(y[r * cols + c] - ref);
+            if (diff > max_abs) max_abs = diff;
+            mean_abs += diff;
+        }
+    }
+    mean_abs /= (float)(rows * cols);
+    fprintf(stderr, "vulkan linear_f32_coopmat probe: max_abs=%g mean_abs=%g\n", max_abs, mean_abs);
+    if (max_abs > 2.0e-4f) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (rt) {
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
         destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
     }
     world_vulkan_runtime_destroy(rt);
@@ -8800,6 +8953,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->latent_update_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->latent_update_descriptor_pool, NULL);
     if (rt->value_residual_descriptor_pool) vkDestroyDescriptorPool(rt->device, rt->value_residual_descriptor_pool, NULL);
     if (rt->runtime_linear_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_pipeline, NULL);
+    if (rt->runtime_linear_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_coopmat_pipeline, NULL);
     if (rt->runtime_linear_tile64_pipeline) vkDestroyPipeline(rt->device, rt->runtime_linear_tile64_pipeline, NULL);
     if (rt->runtime_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_silu_pipeline, NULL);
     if (rt->runtime_add_bias_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_bias_silu_pipeline, NULL);
@@ -8832,6 +8986,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_tgrow_pipeline) vkDestroyPipeline(rt->device, rt->taehv_tgrow_pipeline, NULL);
     if (rt->taehv_pixel_shuffle_pipeline) vkDestroyPipeline(rt->device, rt->taehv_pixel_shuffle_pipeline, NULL);
     if (rt->runtime_linear_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_pipeline_layout, NULL);
+    if (rt->runtime_linear_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_coopmat_pipeline_layout, NULL);
     if (rt->runtime_linear_tile64_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_linear_tile64_pipeline_layout, NULL);
     if (rt->runtime_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_silu_pipeline_layout, NULL);
     if (rt->runtime_add_bias_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_bias_silu_pipeline_layout, NULL);
@@ -8893,6 +9048,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_tgrow_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_tgrow_set_layout, NULL);
     if (rt->taehv_pixel_shuffle_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_pixel_shuffle_set_layout, NULL);
     if (rt->runtime_linear_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_shader, NULL);
+    if (rt->runtime_linear_coopmat_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_coopmat_shader, NULL);
     if (rt->runtime_linear_tile64_shader) vkDestroyShaderModule(rt->device, rt->runtime_linear_tile64_shader, NULL);
     if (rt->runtime_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_silu_shader, NULL);
     if (rt->runtime_add_bias_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_bias_silu_shader, NULL);
