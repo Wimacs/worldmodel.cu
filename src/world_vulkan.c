@@ -540,10 +540,14 @@ struct WorldVulkanRuntime {
     VkDescriptorSet ctrl_norm_descriptor_set;
     VkDescriptorPool *ctrl_fc1_x_descriptor_pools;
     VkDescriptorSet *ctrl_fc1_x_descriptor_sets;
+    VkDescriptorPool *ctrl_fc1_x_wf16_descriptor_pools;
+    VkDescriptorSet *ctrl_fc1_x_wf16_descriptor_sets;
     VkDescriptorPool *ctrl_add_silu_descriptor_pools;
     VkDescriptorSet *ctrl_add_silu_descriptor_sets;
     VkDescriptorPool *ctrl_fc2_descriptor_pools_layer;
     VkDescriptorSet *ctrl_fc2_descriptor_sets_layer;
+    VkDescriptorPool *ctrl_fc2_wf16_descriptor_pools_layer;
+    VkDescriptorSet *ctrl_fc2_wf16_descriptor_sets_layer;
     VkDescriptorPool ctrl_add_descriptor_pool;
     VkDescriptorSet ctrl_add_descriptor_set;
     VkDescriptorPool *mlp_ada_descriptor_pools;
@@ -797,9 +801,13 @@ struct WorldVulkanRuntime {
     VkBuffer ctrl_fc1_x_weight_buffer;
     VkDeviceMemory ctrl_fc1_x_weight_memory;
     void *ctrl_fc1_x_weight_mapped;
+    VkBuffer ctrl_fc1_x_weight_f16_buffer;
+    VkDeviceMemory ctrl_fc1_x_weight_f16_memory;
     VkBuffer ctrl_fc2_weight_buffer_layer;
     VkDeviceMemory ctrl_fc2_weight_memory_layer;
     void *ctrl_fc2_weight_mapped_layer;
+    VkBuffer ctrl_fc2_weight_f16_buffer_layer;
+    VkDeviceMemory ctrl_fc2_weight_f16_memory_layer;
     VkBuffer ctrl_cond_buffer;
     VkDeviceMemory ctrl_cond_memory;
     void *ctrl_cond_mapped;
@@ -2959,6 +2967,8 @@ static int create_runtime_model_slice(
     size_t attn_out_proj_weight_f16_bytes = (size_t)rt->layers_to_run * attn_out_proj_weight_layer_f16_bytes;
     size_t ctrl_layer_weight_bytes = (size_t)rt->D * rt->D * sizeof(float);
     size_t ctrl_layer_weight_table_bytes = (size_t)rt->layers_to_run * ctrl_layer_weight_bytes;
+    size_t ctrl_layer_weight_f16_bytes = (size_t)rt->D * rt->D * sizeof(uint16_t);
+    size_t ctrl_layer_weight_table_f16_bytes = (size_t)rt->layers_to_run * ctrl_layer_weight_f16_bytes;
     size_t ctrl_cond_table_bytes = (size_t)rt->layers_to_run * ctrl_emb_bytes;
     size_t dit_mlp_fc1_weight_layer_bytes = (size_t)rt->mlp_hidden * rt->D * sizeof(float);
     size_t dit_mlp_fc2_weight_layer_bytes = (size_t)rt->D * rt->mlp_hidden * sizeof(float);
@@ -3134,10 +3144,19 @@ static int create_runtime_model_slice(
                     rt->ctrl_add_silu_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
                     rt->ctrl_fc2_descriptor_pools_layer = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
                     rt->ctrl_fc2_descriptor_sets_layer = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                    if (rt->runtime_linear_wf16_coopmat_enabled) {
+                        rt->ctrl_fc1_x_wf16_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                        rt->ctrl_fc1_x_wf16_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                        rt->ctrl_fc2_wf16_descriptor_pools_layer = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                        rt->ctrl_fc2_wf16_descriptor_sets_layer = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+                    }
                     if (!rt->ctrl_cond_descriptor_pools || !rt->ctrl_cond_descriptor_sets ||
                             !rt->ctrl_fc1_x_descriptor_pools || !rt->ctrl_fc1_x_descriptor_sets ||
                             !rt->ctrl_add_silu_descriptor_pools || !rt->ctrl_add_silu_descriptor_sets ||
-                            !rt->ctrl_fc2_descriptor_pools_layer || !rt->ctrl_fc2_descriptor_sets_layer) return 1;
+                            !rt->ctrl_fc2_descriptor_pools_layer || !rt->ctrl_fc2_descriptor_sets_layer ||
+                            (rt->runtime_linear_wf16_coopmat_enabled &&
+                             (!rt->ctrl_fc1_x_wf16_descriptor_pools || !rt->ctrl_fc1_x_wf16_descriptor_sets ||
+                              !rt->ctrl_fc2_wf16_descriptor_pools_layer || !rt->ctrl_fc2_wf16_descriptor_sets_layer))) return 1;
                     if (create_device_buffer(rt, (VkDeviceSize)ctrl_layer_weight_table_bytes,
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 &rt->ctrl_fc1_c_weight_buffer, &rt->ctrl_fc1_c_weight_memory)) return 1;
@@ -3147,6 +3166,16 @@ static int create_runtime_model_slice(
                     if (create_device_buffer(rt, (VkDeviceSize)ctrl_layer_weight_table_bytes,
                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 &rt->ctrl_fc2_weight_buffer_layer, &rt->ctrl_fc2_weight_memory_layer)) return 1;
+                    if (rt->runtime_linear_wf16_coopmat_enabled) {
+                        if (create_device_buffer(rt, (VkDeviceSize)ctrl_layer_weight_table_f16_bytes,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    &rt->ctrl_fc1_x_weight_f16_buffer,
+                                    &rt->ctrl_fc1_x_weight_f16_memory)) return 1;
+                        if (create_device_buffer(rt, (VkDeviceSize)ctrl_layer_weight_table_f16_bytes,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    &rt->ctrl_fc2_weight_f16_buffer_layer,
+                                    &rt->ctrl_fc2_weight_f16_memory_layer)) return 1;
+                    }
                     if (create_host_buffer(rt, ctrl_cond_table_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                 &rt->ctrl_cond_buffer, &rt->ctrl_cond_memory, &rt->ctrl_cond_mapped)) return 1;
                     if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
@@ -3416,6 +3445,32 @@ static int create_runtime_model_slice(
                         copy_failed = copy_buffer_to_device(rt, staging_buffer,
                                 rt->ctrl_fc2_weight_buffer_layer,
                                 (VkDeviceSize)ctrl_layer_weight_table_bytes);
+                    }
+                    if (!copy_failed && rt->runtime_linear_wf16_coopmat_enabled &&
+                            rt->ctrl_fc1_x_weight_f16_buffer &&
+                            rt->ctrl_fc2_weight_f16_buffer_layer) {
+                        size_t ctrl_layer_elems = (size_t)rt->D * rt->D;
+                        for (int layer_idx = 0; layer_idx < rt->layers_to_run; ++layer_idx) {
+                            if (!rt->layer_has_ctrl[layer_idx]) continue;
+                            VkDeviceSize dst_offset = (VkDeviceSize)((size_t)layer_idx *
+                                    ctrl_layer_weight_f16_bytes);
+                            if (upload_f32_as_f16_to_device_buffer(rt,
+                                        rt->ctrl_fc1_x_weight_f16_buffer,
+                                        dst_offset,
+                                        weights->layers[layer_idx].ctrl_fc1_x_weight,
+                                        ctrl_layer_elems)) {
+                                copy_failed = 1;
+                                break;
+                            }
+                            if (upload_f32_as_f16_to_device_buffer(rt,
+                                        rt->ctrl_fc2_weight_f16_buffer_layer,
+                                        dst_offset,
+                                        weights->layers[layer_idx].ctrl_fc2_weight,
+                                        ctrl_layer_elems)) {
+                                copy_failed = 1;
+                                break;
+                            }
+                        }
                     }
                     destroy_host_buffer(rt, staging_buffer, staging_memory, staging_mapped);
                     if (copy_failed) return 1;
@@ -4074,6 +4129,20 @@ static int create_runtime_model_slice(
                         if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4, buffers, sizes, offsets,
                                     &rt->ctrl_fc1_x_descriptor_pools[layer_idx],
                                     &rt->ctrl_fc1_x_descriptor_sets[layer_idx])) return 1;
+                        if (rt->runtime_linear_wf16_coopmat_enabled &&
+                                rt->ctrl_fc1_x_weight_f16_buffer) {
+                            VkDeviceSize weight_offset_f16 = (VkDeviceSize)((size_t)layer_idx *
+                                    ctrl_layer_weight_f16_bytes);
+                            VkBuffer wf16_buffers[4] = {
+                                rt->ctrl_norm_buffer, rt->ctrl_fc1_x_weight_f16_buffer, rt->dummy_bias_buffer, rt->ctrl_hidden_layer_buffer
+                            };
+                            VkDeviceSize wf16_sizes[4] = {token_bytes, ctrl_layer_weight_f16_bytes, sizeof(float), token_bytes};
+                            VkDeviceSize wf16_offsets[4] = {0, weight_offset_f16, 0, 0};
+                            if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4,
+                                        wf16_buffers, wf16_sizes, wf16_offsets,
+                                        &rt->ctrl_fc1_x_wf16_descriptor_pools[layer_idx],
+                                        &rt->ctrl_fc1_x_wf16_descriptor_sets[layer_idx])) return 1;
+                        }
                         {
                             VkBuffer silu_buffers[3] = {rt->ctrl_hidden_layer_buffer, rt->ctrl_cond_buffer, rt->ctrl_hidden_layer_buffer};
                             VkDeviceSize silu_sizes[3] = {token_bytes, ctrl_emb_bytes, token_bytes};
@@ -4093,6 +4162,20 @@ static int create_runtime_model_slice(
                                         fc2_buffers, fc2_sizes, fc2_offsets,
                                         &rt->ctrl_fc2_descriptor_pools_layer[layer_idx],
                                         &rt->ctrl_fc2_descriptor_sets_layer[layer_idx])) return 1;
+                            if (rt->runtime_linear_wf16_coopmat_enabled &&
+                                    rt->ctrl_fc2_weight_f16_buffer_layer) {
+                                VkDeviceSize weight_offset_f16 = (VkDeviceSize)((size_t)layer_idx *
+                                        ctrl_layer_weight_f16_bytes);
+                                VkBuffer fc2_wf16_buffers[4] = {
+                                    rt->ctrl_hidden_layer_buffer, rt->ctrl_fc2_weight_f16_buffer_layer, rt->dummy_bias_buffer, rt->ctrl_out_buffer
+                                };
+                                VkDeviceSize fc2_wf16_sizes[4] = {token_bytes, ctrl_layer_weight_f16_bytes, sizeof(float), token_bytes};
+                                VkDeviceSize fc2_wf16_offsets[4] = {0, weight_offset_f16, 0, 0};
+                                if (create_storage_descriptor_set(rt, rt->runtime_linear_set_layout, 4,
+                                            fc2_wf16_buffers, fc2_wf16_sizes, fc2_wf16_offsets,
+                                            &rt->ctrl_fc2_wf16_descriptor_pools_layer[layer_idx],
+                                            &rt->ctrl_fc2_wf16_descriptor_sets_layer[layer_idx])) return 1;
+                            }
                         }
                     }
                     {
@@ -4835,13 +4918,32 @@ static int record_runtime_model_slice(
                         PROFILE_DISPATCH("rms.ctrl_fusion", (uint32_t)rt->T, 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(ctrl_fc_push));
+                        int use_ctrl_fc1_x_wf16_n32 =
+                            rt->ctrl_fc1_x_wf16_descriptor_sets &&
+                            rt->ctrl_fc1_x_wf16_descriptor_sets[layer_idx] &&
+                            use_runtime_linear_wf16_coopmat_n32(rt,
+                                    ctrl_fc_push.rows, ctrl_fc_push.cols,
+                                    ctrl_fc_push.inner, ctrl_fc_push.has_bias);
+                        VkPipeline ctrl_fc1_x_pipeline = use_ctrl_fc1_x_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline : LINEAR_PIPELINE(ctrl_fc_push);
+                        VkPipelineLayout ctrl_fc1_x_layout = use_ctrl_fc1_x_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline_layout : LINEAR_LAYOUT(ctrl_fc_push);
+                        VkDescriptorSet ctrl_fc1_x_set = use_ctrl_fc1_x_wf16_n32 ?
+                            rt->ctrl_fc1_x_wf16_descriptor_sets[layer_idx] : rt->ctrl_fc1_x_descriptor_sets[layer_idx];
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctrl_fc1_x_pipeline);
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                LINEAR_LAYOUT(ctrl_fc_push), 0, 1,
-                                &rt->ctrl_fc1_x_descriptor_sets[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(ctrl_fc_push),
+                                ctrl_fc1_x_layout, 0, 1,
+                                &ctrl_fc1_x_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, ctrl_fc1_x_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                        LINEAR_DISPATCH("linear.ctrl_fc1_x", ctrl_fc_push);
+                        if (use_ctrl_fc1_x_wf16_n32) {
+                            PROFILE_DISPATCH("linear.ctrl_fc1_x_wf16_n32",
+                                    (ctrl_fc_push.cols + 31u) / 32u,
+                                    (ctrl_fc_push.rows + 15u) / 16u,
+                                    1);
+                        } else {
+                            LINEAR_DISPATCH("linear.ctrl_fc1_x", ctrl_fc_push);
+                        }
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_channel_silu_pipeline);
@@ -4855,13 +4957,32 @@ static int record_runtime_model_slice(
                                 1, 1);
                         cmd_shader_barrier(rt->command_buffer);
 
-                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, LINEAR_PIPELINE(ctrl_fc_push));
+                        int use_ctrl_fc2_wf16_n32 =
+                            rt->ctrl_fc2_wf16_descriptor_sets_layer &&
+                            rt->ctrl_fc2_wf16_descriptor_sets_layer[layer_idx] &&
+                            use_runtime_linear_wf16_coopmat_n32(rt,
+                                    ctrl_fc_push.rows, ctrl_fc_push.cols,
+                                    ctrl_fc_push.inner, ctrl_fc_push.has_bias);
+                        VkPipeline ctrl_fc2_pipeline = use_ctrl_fc2_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline : LINEAR_PIPELINE(ctrl_fc_push);
+                        VkPipelineLayout ctrl_fc2_layout = use_ctrl_fc2_wf16_n32 ?
+                            rt->runtime_linear_wf16_coopmat_n32_pipeline_layout : LINEAR_LAYOUT(ctrl_fc_push);
+                        VkDescriptorSet ctrl_fc2_set = use_ctrl_fc2_wf16_n32 ?
+                            rt->ctrl_fc2_wf16_descriptor_sets_layer[layer_idx] : rt->ctrl_fc2_descriptor_sets_layer[layer_idx];
+                        vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctrl_fc2_pipeline);
                         vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                LINEAR_LAYOUT(ctrl_fc_push), 0, 1,
-                                &rt->ctrl_fc2_descriptor_sets_layer[layer_idx], 0, NULL);
-                        vkCmdPushConstants(rt->command_buffer, LINEAR_LAYOUT(ctrl_fc_push),
+                                ctrl_fc2_layout, 0, 1,
+                                &ctrl_fc2_set, 0, NULL);
+                        vkCmdPushConstants(rt->command_buffer, ctrl_fc2_layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ctrl_fc_push), &ctrl_fc_push);
-                        LINEAR_DISPATCH("linear.ctrl_fc2", ctrl_fc_push);
+                        if (use_ctrl_fc2_wf16_n32) {
+                            PROFILE_DISPATCH("linear.ctrl_fc2_wf16_n32",
+                                    (ctrl_fc_push.cols + 31u) / 32u,
+                                    (ctrl_fc_push.rows + 15u) / 16u,
+                                    1);
+                        } else {
+                            LINEAR_DISPATCH("linear.ctrl_fc2", ctrl_fc_push);
+                        }
                         cmd_shader_barrier(rt->command_buffer);
 
                         vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, rt->runtime_add_pipeline);
@@ -10237,8 +10358,10 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
         if (rt->attn_out_proj_wf16_descriptor_pools && rt->attn_out_proj_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_wf16_descriptor_pools[i], NULL);
         if (rt->ctrl_cond_descriptor_pools && rt->ctrl_cond_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_cond_descriptor_pools[i], NULL);
         if (rt->ctrl_fc1_x_descriptor_pools && rt->ctrl_fc1_x_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_x_descriptor_pools[i], NULL);
+        if (rt->ctrl_fc1_x_wf16_descriptor_pools && rt->ctrl_fc1_x_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc1_x_wf16_descriptor_pools[i], NULL);
         if (rt->ctrl_add_silu_descriptor_pools && rt->ctrl_add_silu_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_add_silu_descriptor_pools[i], NULL);
         if (rt->ctrl_fc2_descriptor_pools_layer && rt->ctrl_fc2_descriptor_pools_layer[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_descriptor_pools_layer[i], NULL);
+        if (rt->ctrl_fc2_wf16_descriptor_pools_layer && rt->ctrl_fc2_wf16_descriptor_pools_layer[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_fc2_wf16_descriptor_pools_layer[i], NULL);
         if (rt->mlp_fc1_descriptor_pools && rt->mlp_fc1_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc1_descriptor_pools[i], NULL);
         if (rt->mlp_fc1_wf16_descriptor_pools && rt->mlp_fc1_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc1_wf16_descriptor_pools[i], NULL);
         if (rt->mlp_fc2_descriptor_pools && rt->mlp_fc2_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->mlp_fc2_descriptor_pools[i], NULL);
@@ -10477,7 +10600,9 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->tokens_after_attn_buffer, rt->tokens_after_attn_memory, rt->tokens_after_attn_mapped);
     destroy_host_buffer(rt, rt->ctrl_fc1_c_weight_buffer, rt->ctrl_fc1_c_weight_memory, rt->ctrl_fc1_c_weight_mapped);
     destroy_host_buffer(rt, rt->ctrl_fc1_x_weight_buffer, rt->ctrl_fc1_x_weight_memory, rt->ctrl_fc1_x_weight_mapped);
+    destroy_host_buffer(rt, rt->ctrl_fc1_x_weight_f16_buffer, rt->ctrl_fc1_x_weight_f16_memory, NULL);
     destroy_host_buffer(rt, rt->ctrl_fc2_weight_buffer_layer, rt->ctrl_fc2_weight_memory_layer, rt->ctrl_fc2_weight_mapped_layer);
+    destroy_host_buffer(rt, rt->ctrl_fc2_weight_f16_buffer_layer, rt->ctrl_fc2_weight_f16_memory_layer, NULL);
     destroy_host_buffer(rt, rt->ctrl_cond_buffer, rt->ctrl_cond_memory, rt->ctrl_cond_mapped);
     destroy_host_buffer(rt, rt->ctrl_norm_buffer, rt->ctrl_norm_memory, rt->ctrl_norm_mapped);
     destroy_host_buffer(rt, rt->ctrl_hidden_layer_buffer, rt->ctrl_hidden_layer_memory, rt->ctrl_hidden_layer_mapped);
@@ -10537,10 +10662,14 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->ctrl_cond_descriptor_sets);
     free(rt->ctrl_fc1_x_descriptor_pools);
     free(rt->ctrl_fc1_x_descriptor_sets);
+    free(rt->ctrl_fc1_x_wf16_descriptor_pools);
+    free(rt->ctrl_fc1_x_wf16_descriptor_sets);
     free(rt->ctrl_add_silu_descriptor_pools);
     free(rt->ctrl_add_silu_descriptor_sets);
     free(rt->ctrl_fc2_descriptor_pools_layer);
     free(rt->ctrl_fc2_descriptor_sets_layer);
+    free(rt->ctrl_fc2_wf16_descriptor_pools_layer);
+    free(rt->ctrl_fc2_wf16_descriptor_sets_layer);
     free(rt->mlp_ada_descriptor_pools);
     free(rt->mlp_ada_descriptor_sets);
     free(rt->mlp_fc1_descriptor_pools);
