@@ -1,11 +1,13 @@
 #include "world_cuda.h"
 
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#ifdef WORLD_USE_CUDNN
-#include <cudnn.h>
-#endif
+
+#include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/numeric_types.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -40,23 +42,13 @@
     } \
 } while (0)
 
-#define CUBLAS_OK(expr) do { \
-    cublasStatus_t _s = (expr); \
-    if (_s != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)_s); \
+#define CUTLASS_OK(expr) do { \
+    cutlass::Status _s = (expr); \
+    if (_s != cutlass::Status::kSuccess) { \
+        fprintf(stderr, "CUTLASS error %s:%d: %s\n", __FILE__, __LINE__, cutlassGetStatusString(_s)); \
         return 1; \
     } \
 } while (0)
-
-#ifdef WORLD_USE_CUDNN
-#define CUDNN_OK(expr) do { \
-    cudnnStatus_t _s = (expr); \
-    if (_s != CUDNN_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        return 1; \
-    } \
-} while (0)
-#endif
 
 static int div_up_i64(int64_t a, int b) {
     return (int)((a + b - 1) / b);
@@ -740,94 +732,6 @@ __global__ static void indexed_attention_cache_d64_flash_f32_kernel(
     }
 }
 
-__global__ static void gather_indexed_kv_d64_f32_kernel(
-        const float *__restrict__ cache_k,
-        const float *__restrict__ cache_v,
-        const int64_t *__restrict__ indices,
-        float *__restrict__ k_compact,
-        float *__restrict__ v_compact,
-        int Hq,
-        int Hkv,
-        int Nkv,
-        int Tk) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)Hq * Nkv * 64;
-    if (i >= total) return;
-    int d = (int)(i & 63);
-    int64_t q = i >> 6;
-    int n = (int)(q % Nkv);
-    int hq = (int)(q / Nkv);
-    int group = Hq / Hkv;
-    int hk = hq / group;
-    int tk = (int)indices[n];
-    if (tk < 0) tk = 0;
-    if (tk >= Tk) tk = Tk - 1;
-    int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
-    k_compact[i] = cache_k[src];
-    v_compact[i] = cache_v[src];
-}
-
-__global__ static void gather_indexed_kv_hkv_d64_f32_kernel(
-        const float *__restrict__ cache_k,
-        const float *__restrict__ cache_v,
-        const int64_t *__restrict__ indices,
-        float *__restrict__ k_compact,
-        float *__restrict__ v_compact,
-        int Hkv,
-        int Nkv,
-        int Tk) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)Hkv * Nkv * 64;
-    if (i >= total) return;
-    int d = (int)(i & 63);
-    int64_t q = i >> 6;
-    int n = (int)(q % Nkv);
-    int hk = (int)(q / Nkv);
-    int tk = (int)indices[n];
-    if (tk < 0) tk = 0;
-    if (tk >= Tk) tk = Tk - 1;
-    int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
-    k_compact[i] = cache_k[src];
-    v_compact[i] = cache_v[src];
-}
-
-__global__ static void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
-    __shared__ float red[256];
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-    if (row >= rows) return;
-    float *row_x = x + (int64_t)row * cols;
-
-    float mx = -INFINITY;
-    for (int c = tid; c < cols; c += blockDim.x) {
-        mx = fmaxf(mx, row_x[c]);
-    }
-    red[tid] = mx;
-    __syncthreads();
-    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
-        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
-        __syncthreads();
-    }
-    mx = red[0];
-
-    float sum = 0.0f;
-    for (int c = tid; c < cols; c += blockDim.x) {
-        float v = expf(row_x[c] - mx);
-        row_x[c] = v;
-        sum += v;
-    }
-    red[tid] = sum;
-    __syncthreads();
-    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
-        if (tid < step) red[tid] += red[tid + step];
-        __syncthreads();
-    }
-    float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
-    for (int c = tid; c < cols; c += blockDim.x) {
-        row_x[c] *= inv;
-    }
-}
-
 __global__ static void gated_residual_add_f32_kernel(
         const float *residual,
         const float *update,
@@ -1185,15 +1089,6 @@ __global__ static void taehv_relu_nhwc_h_kernel(__half *x, int64_t n) {
     }
 }
 
-__global__ static void taehv_add_bias_nhwc_h_kernel(__half *x, const __half *bias, int N, int H, int W, int C) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)N * H * W * C;
-    if (i >= total) return;
-    int c = (int)(i % C);
-    float v = __half2float(x[i]) + __half2float(bias[c]);
-    x[i] = __float2half_rn(v);
-}
-
 __global__ static void taehv_concat_past_nhwc_h_kernel(
         const __half *x,
         __half *out,
@@ -1363,38 +1258,45 @@ static void print_stats(const char *name, const float *x, int n) {
 }
 
 static int row_major_linear(
-        cublasHandle_t handle,
         const float *x_rm,
         const float *w_rm,
         float *y_rm,
         int m,
         int k,
         int n) {
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    // Row-major y[m,n] = x[m,k] * w[n,k]^T.
-    // Interpreted by cuBLAS as column-major:
-    // Y_col[n,m] = W_col[k,n]^T * X_col[k,m].
-    CUBLAS_OK(cublasSgemm(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        n,
-        m,
-        k,
-        &alpha,
-        w_rm,
-        k,
-        x_rm,
-        k,
-        &beta,
-        y_rm,
-        n));
+    using Gemm = cutlass::gemm::device::Gemm<
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassSimt,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 64, 8>,
+        cutlass::gemm::GemmShape<32, 64, 8>,
+        cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        2,
+        1,
+        1>;
+
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_rm, k},
+        {w_rm, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
     return 0;
 }
 
 static int row_major_linear_fp16_weight(
-        cublasHandle_t handle,
         const float *x_rm,
         __half *x_half_tmp,
         const __half *w_rm_h,
@@ -1406,28 +1308,37 @@ static int row_major_linear_fp16_weight(
     f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
     CUDA_OK(cudaGetLastError());
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    CUBLAS_OK(cublasGemmEx(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        n,
-        m,
-        k,
-        &alpha,
-        w_rm_h,
-        CUDA_R_16F,
-        k,
-        x_half_tmp,
-        CUDA_R_16F,
-        k,
-        &beta,
-        y_rm,
-        CUDA_R_32F,
-        n,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassSimt,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 64, 8>,
+        cutlass::gemm::GemmShape<32, 64, 8>,
+        cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        2,
+        1,
+        1>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
     return 0;
 }
 
@@ -1783,29 +1694,6 @@ typedef struct {
     int in_c;
     int kernel;
     int has_bias;
-#ifdef WORLD_USE_CUDNN
-    cudnnTensorDescriptor_t in_desc;
-    cudnnTensorDescriptor_t out_desc;
-    cudnnTensorDescriptor_t bias_desc;
-    cudnnFilterDescriptor_t filter_desc;
-    cudnnConvolutionDescriptor_t conv_desc;
-    cudnnConvolutionFwdAlgo_t algo;
-    size_t workspace_bytes;
-    int plan_ready;
-    int plan_n;
-    int plan_h;
-    int plan_w;
-    cudnnTensorDescriptor_t h_in_desc;
-    cudnnTensorDescriptor_t h_out_desc;
-    cudnnFilterDescriptor_t h_filter_desc;
-    cudnnConvolutionDescriptor_t h_conv_desc;
-    cudnnConvolutionFwdAlgo_t h_algo;
-    size_t h_workspace_bytes;
-    int h_plan_ready;
-    int h_plan_n;
-    int h_plan_h;
-    int h_plan_w;
-#endif
 } DeviceVaeConvWeight;
 
 typedef struct {
@@ -1820,11 +1708,6 @@ typedef struct {
     unsigned char *h_rgb;
     size_t max_elems;
     size_t rgb_elems;
-#ifdef WORLD_USE_CUDNN
-    cudnnHandle_t cudnn;
-    void *cudnn_workspace;
-    size_t cudnn_workspace_bytes;
-#endif
     int out_w;
     int out_h;
     int H_pre_shuffle;
@@ -1876,17 +1759,6 @@ static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COU
 
 static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT]) {
     for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
-#ifdef WORLD_USE_CUDNN
-        if (dev[i].bias_desc) cudnnDestroyTensorDescriptor(dev[i].bias_desc);
-        if (dev[i].conv_desc) cudnnDestroyConvolutionDescriptor(dev[i].conv_desc);
-        if (dev[i].filter_desc) cudnnDestroyFilterDescriptor(dev[i].filter_desc);
-        if (dev[i].out_desc) cudnnDestroyTensorDescriptor(dev[i].out_desc);
-        if (dev[i].in_desc) cudnnDestroyTensorDescriptor(dev[i].in_desc);
-        if (dev[i].h_conv_desc) cudnnDestroyConvolutionDescriptor(dev[i].h_conv_desc);
-        if (dev[i].h_filter_desc) cudnnDestroyFilterDescriptor(dev[i].h_filter_desc);
-        if (dev[i].h_out_desc) cudnnDestroyTensorDescriptor(dev[i].h_out_desc);
-        if (dev[i].h_in_desc) cudnnDestroyTensorDescriptor(dev[i].h_in_desc);
-#endif
         cudaFree(dev[i].weight);
         cudaFree(dev[i].bias);
         cudaFree(dev[i].weight_h);
@@ -1900,10 +1772,6 @@ static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_CO
 
 static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     if (!dec) return;
-#ifdef WORLD_USE_CUDNN
-    cudaFree(dec->cudnn_workspace);
-    if (dec->cudnn) cudnnDestroy(dec->cudnn);
-#endif
     taehv_free_weights(dec->convs);
     cudaFree(dec->buf0);
     cudaFree(dec->buf1);
@@ -1916,254 +1784,10 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     memset(dec, 0, sizeof(*dec));
 }
 
-#ifdef WORLD_USE_CUDNN
-static int taehv_prepare_conv_plan(DeviceVaeDecoder *dec, DeviceVaeConvWeight *conv, int N, int H, int W) {
-    if (!dec || !dec->cudnn || !conv) return 1;
-    size_t workspace_bytes = 0;
-
-#define VAE_CUDNN_PLAN_OK(expr) do { \
-    cudnnStatus_t _s = (expr); \
-    if (_s != CUDNN_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        return 1; \
-    } \
-} while (0)
-
-    VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->in_desc));
-    VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->out_desc));
-    VAE_CUDNN_PLAN_OK(cudnnCreateFilterDescriptor(&conv->filter_desc));
-    VAE_CUDNN_PLAN_OK(cudnnCreateConvolutionDescriptor(&conv->conv_desc));
-    VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
-        conv->in_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->in_c, H, W));
-    VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
-        conv->out_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, N, conv->out_c, H, W));
-    VAE_CUDNN_PLAN_OK(cudnnSetFilter4dDescriptor(
-        conv->filter_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, conv->out_c, conv->in_c, conv->kernel, conv->kernel));
-    VAE_CUDNN_PLAN_OK(cudnnSetConvolution2dDescriptor(
-        conv->conv_desc, conv->kernel / 2, conv->kernel / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
-    VAE_CUDNN_PLAN_OK(cudnnSetConvolutionMathType(conv->conv_desc, CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION));
-
-    conv->algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-    {
-        int algo_count = 0;
-        int returned = 0;
-        cudnnConvolutionFwdAlgoPerf_t perf[16];
-        if (cudnnGetConvolutionForwardAlgorithmMaxCount(dec->cudnn, &algo_count) == CUDNN_STATUS_SUCCESS) {
-            if (algo_count > (int)(sizeof(perf) / sizeof(perf[0]))) algo_count = (int)(sizeof(perf) / sizeof(perf[0]));
-            if (algo_count > 0 &&
-                cudnnGetConvolutionForwardAlgorithm_v7(
-                    dec->cudnn, conv->in_desc, conv->filter_desc, conv->conv_desc, conv->out_desc,
-                    algo_count, &returned, perf) == CUDNN_STATUS_SUCCESS) {
-                for (int i = 0; i < returned; ++i) {
-                    if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= dec->cudnn_workspace_bytes) {
-                        conv->algo = perf[i].algo;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (cudnnGetConvolutionForwardWorkspaceSize(
-                dec->cudnn, conv->in_desc, conv->filter_desc, conv->conv_desc, conv->out_desc,
-                conv->algo, &workspace_bytes) != CUDNN_STATUS_SUCCESS ||
-            workspace_bytes > dec->cudnn_workspace_bytes) {
-        conv->algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-        workspace_bytes = 0;
-    }
-    conv->workspace_bytes = workspace_bytes;
-
-    if (conv->has_bias) {
-        VAE_CUDNN_PLAN_OK(cudnnCreateTensorDescriptor(&conv->bias_desc));
-        VAE_CUDNN_PLAN_OK(cudnnSetTensor4dDescriptor(
-            conv->bias_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, conv->out_c, 1, 1));
-    }
-    conv->plan_ready = 1;
-    conv->plan_n = N;
-    conv->plan_h = H;
-    conv->plan_w = W;
-#undef VAE_CUDNN_PLAN_OK
-    return 0;
-}
-
-static int taehv_prepare_conv_plan_h_nhwc(DeviceVaeDecoder *dec, DeviceVaeConvWeight *conv, int N, int H, int W) {
-    if (!dec || !dec->cudnn || !conv || !conv->weight_h) return 1;
-    size_t workspace_bytes = 0;
-
-#define VAE_CUDNN_PLAN_H_OK(expr) do { \
-    cudnnStatus_t _s = (expr); \
-    if (_s != CUDNN_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuDNN half NHWC error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        return 1; \
-    } \
-} while (0)
-
-    VAE_CUDNN_PLAN_H_OK(cudnnCreateTensorDescriptor(&conv->h_in_desc));
-    VAE_CUDNN_PLAN_H_OK(cudnnCreateTensorDescriptor(&conv->h_out_desc));
-    VAE_CUDNN_PLAN_H_OK(cudnnCreateFilterDescriptor(&conv->h_filter_desc));
-    VAE_CUDNN_PLAN_H_OK(cudnnCreateConvolutionDescriptor(&conv->h_conv_desc));
-    VAE_CUDNN_PLAN_H_OK(cudnnSetTensor4dDescriptor(
-        conv->h_in_desc, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, N, conv->in_c, H, W));
-    VAE_CUDNN_PLAN_H_OK(cudnnSetTensor4dDescriptor(
-        conv->h_out_desc, CUDNN_TENSOR_NHWC, CUDNN_DATA_HALF, N, conv->out_c, H, W));
-    VAE_CUDNN_PLAN_H_OK(cudnnSetFilter4dDescriptor(
-        conv->h_filter_desc, CUDNN_DATA_HALF, CUDNN_TENSOR_NCHW, conv->out_c, conv->in_c, conv->kernel, conv->kernel));
-    VAE_CUDNN_PLAN_H_OK(cudnnSetConvolution2dDescriptor(
-        conv->h_conv_desc, conv->kernel / 2, conv->kernel / 2, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
-    VAE_CUDNN_PLAN_H_OK(cudnnSetConvolutionMathType(conv->h_conv_desc, CUDNN_TENSOR_OP_MATH));
-
-    conv->h_algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;
-    {
-        int algo_count = 0;
-        int returned = 0;
-        cudnnConvolutionFwdAlgoPerf_t perf[16];
-        if (cudnnGetConvolutionForwardAlgorithmMaxCount(dec->cudnn, &algo_count) == CUDNN_STATUS_SUCCESS) {
-            if (algo_count > (int)(sizeof(perf) / sizeof(perf[0]))) algo_count = (int)(sizeof(perf) / sizeof(perf[0]));
-            if (algo_count > 0 &&
-                cudnnGetConvolutionForwardAlgorithm_v7(
-                    dec->cudnn, conv->h_in_desc, conv->h_filter_desc, conv->h_conv_desc, conv->h_out_desc,
-                    algo_count, &returned, perf) == CUDNN_STATUS_SUCCESS) {
-                for (int i = 0; i < returned; ++i) {
-                    if (perf[i].status == CUDNN_STATUS_SUCCESS && perf[i].memory <= dec->cudnn_workspace_bytes) {
-                        conv->h_algo = perf[i].algo;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (cudnnGetConvolutionForwardWorkspaceSize(
-                dec->cudnn, conv->h_in_desc, conv->h_filter_desc, conv->h_conv_desc, conv->h_out_desc,
-                conv->h_algo, &workspace_bytes) != CUDNN_STATUS_SUCCESS ||
-            workspace_bytes > dec->cudnn_workspace_bytes) {
-        conv->h_algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
-        workspace_bytes = 0;
-    }
-    conv->h_workspace_bytes = workspace_bytes;
-    conv->h_plan_ready = 1;
-    conv->h_plan_n = N;
-    conv->h_plan_h = H;
-    conv->h_plan_w = W;
-#undef VAE_CUDNN_PLAN_H_OK
-    return 0;
-}
-
-static int taehv_prepare_conv_plans(DeviceVaeDecoder *dec, const WorldConfig *cfg) {
-    int H0 = cfg->height * cfg->patch_h;
-    int W0 = cfg->width * cfg->patch_w;
-    int N = 4;
-    int H = H0;
-    int W = W0;
-
-#define VAE_PLAN(idx) do { \
-    if (taehv_prepare_conv_plan(dec, &dec->convs[(idx)], N, H, W)) return 1; \
-} while (0)
-#define VAE_PLAN_MEMBLOCK(a, b, c) do { \
-    VAE_PLAN(a); \
-    VAE_PLAN(b); \
-    VAE_PLAN(c); \
-} while (0)
-#define VAE_PLAN_UPSAMPLE2() do { \
-    H *= 2; \
-    W *= 2; \
-} while (0)
-#define VAE_PLAN_TGROW(idx, stride_value) do { \
-    int _stride = (stride_value); \
-    VAE_PLAN(idx); \
-    N *= _stride; \
-} while (0)
-
-    VAE_PLAN(WORLD_VAE_DEC_CONV_IN);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
-    VAE_PLAN_UPSAMPLE2();
-    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW7, 1);
-
-    VAE_PLAN(WORLD_VAE_DEC_CONV8);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
-    VAE_PLAN_UPSAMPLE2();
-    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW13, 2);
-
-    VAE_PLAN(WORLD_VAE_DEC_CONV14);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
-    VAE_PLAN_MEMBLOCK(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
-    VAE_PLAN_UPSAMPLE2();
-    VAE_PLAN_TGROW(WORLD_VAE_DEC_TGROW19, 2);
-
-    VAE_PLAN(WORLD_VAE_DEC_CONV20);
-    VAE_PLAN(WORLD_VAE_DEC_CONV_OUT);
-
-#undef VAE_PLAN
-#undef VAE_PLAN_MEMBLOCK
-#undef VAE_PLAN_UPSAMPLE2
-#undef VAE_PLAN_TGROW
-    return 0;
-}
-
-static int taehv_prepare_conv_plans_h_nhwc(DeviceVaeDecoder *dec, const WorldConfig *cfg) {
-    int H0 = cfg->height * cfg->patch_h;
-    int W0 = cfg->width * cfg->patch_w;
-    int N = 4;
-    int H = H0;
-    int W = W0;
-
-#define VAE_PLAN_H(idx) do { \
-    if (taehv_prepare_conv_plan_h_nhwc(dec, &dec->convs[(idx)], N, H, W)) return 1; \
-} while (0)
-#define VAE_PLAN_H_MEMBLOCK(a, b, c) do { \
-    VAE_PLAN_H(a); \
-    VAE_PLAN_H(b); \
-    VAE_PLAN_H(c); \
-} while (0)
-#define VAE_PLAN_H_UPSAMPLE2() do { \
-    H *= 2; \
-    W *= 2; \
-} while (0)
-#define VAE_PLAN_H_TGROW(idx, stride_value) do { \
-    int _stride = (stride_value); \
-    VAE_PLAN_H(idx); \
-    N *= _stride; \
-} while (0)
-
-    VAE_PLAN_H(WORLD_VAE_DEC_CONV_IN);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
-    VAE_PLAN_H_UPSAMPLE2();
-    VAE_PLAN_H_TGROW(WORLD_VAE_DEC_TGROW7, 1);
-
-    VAE_PLAN_H(WORLD_VAE_DEC_CONV8);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
-    VAE_PLAN_H_UPSAMPLE2();
-    VAE_PLAN_H_TGROW(WORLD_VAE_DEC_TGROW13, 2);
-
-    VAE_PLAN_H(WORLD_VAE_DEC_CONV14);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
-    VAE_PLAN_H_MEMBLOCK(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
-    VAE_PLAN_H_UPSAMPLE2();
-    VAE_PLAN_H_TGROW(WORLD_VAE_DEC_TGROW19, 2);
-
-    VAE_PLAN_H(WORLD_VAE_DEC_CONV20);
-    VAE_PLAN_H(WORLD_VAE_DEC_CONV_OUT);
-
-#undef VAE_PLAN_H
-#undef VAE_PLAN_H_MEMBLOCK
-#undef VAE_PLAN_H_UPSAMPLE2
-#undef VAE_PLAN_H_TGROW
-    return 0;
-}
-#endif
 
 static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, const WorldVaeDecoderWeights *host) {
     memset(dec, 0, sizeof(*dec));
     if (!host) return 0;
-    const char *vae_fp16_env = getenv("WORLD_VAE_FP16_NHWC");
 
     int H0 = cfg->height * cfg->patch_h;
     int W0 = cfg->width * cfg->patch_w;
@@ -2187,46 +1811,10 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf1, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
-#ifdef WORLD_USE_CUDNN
-    if (cudnnCreate(&dec->cudnn) != CUDNN_STATUS_SUCCESS) {
-        fprintf(stderr, "failed to create cuDNN handle\n");
-        goto fail;
-    }
-    dec->cudnn_workspace_bytes = 128ull * 1024ull * 1024ull;
-    VAE_INIT_CUDA(cudaMalloc((void **)&dec->cudnn_workspace, dec->cudnn_workspace_bytes));
-    if (taehv_prepare_conv_plans(dec, cfg)) goto fail;
-    dec->fp16_nhwc_enabled = vae_fp16_env ? vae_fp16_env[0] != '0' : 1;
-    if (dec->fp16_nhwc_enabled) {
-        cudaError_t h0 = cudaMalloc((void **)&dec->hbuf0, dec->max_elems * sizeof(__half));
-        cudaError_t h1 = h0 == cudaSuccess ? cudaMalloc((void **)&dec->hbuf1, dec->max_elems * sizeof(__half)) : h0;
-        cudaError_t h2 = h1 == cudaSuccess ? cudaMalloc((void **)&dec->hbuf2, dec->max_elems * sizeof(__half)) : h1;
-        if (h2 != cudaSuccess) {
-            fprintf(stderr, "VAE FP16/NHWC scratch unavailable, falling back to F32/NCHW: %s\n", cudaGetErrorString(h2));
-            cudaFree(dec->hbuf0);
-            cudaFree(dec->hbuf1);
-            cudaFree(dec->hbuf2);
-            dec->hbuf0 = NULL;
-            dec->hbuf1 = NULL;
-            dec->hbuf2 = NULL;
-            dec->fp16_nhwc_enabled = 0;
-        } else if (taehv_prepare_conv_plans_h_nhwc(dec, cfg)) {
-            fprintf(stderr, "VAE FP16/NHWC cuDNN plan unavailable, falling back to F32/NCHW\n");
-            dec->fp16_nhwc_enabled = 0;
-        }
-    }
-#endif
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3%s%s, pinned RGB host buffer\n",
-            dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
-#ifdef WORLD_USE_CUDNN
-            ", cuDNN conv plans enabled",
-            dec->fp16_nhwc_enabled ? ", FP16/NHWC enabled" : ""
-#else
-            "",
-            ""
-#endif
-    );
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, built-in F32/NCHW conv, pinned RGB host buffer\n",
+            dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0));
 #undef VAE_INIT_CUDA
     return 0;
 
@@ -2237,40 +1825,7 @@ fail:
 }
 
 static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
-#ifdef WORLD_USE_CUDNN
-    if (dec && dec->cudnn && conv->plan_ready && conv->plan_n == N && conv->plan_h == H && conv->plan_w == W) {
-        {
-            const float alpha = 1.0f;
-            const float beta = 0.0f;
-#define CUDNN_CONV_OK(expr) do { \
-    cudnnStatus_t _s = (expr); \
-    if (_s != CUDNN_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuDNN error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        return 1; \
-    } \
-} while (0)
-            CUDNN_CONV_OK(cudnnConvolutionForward(
-                dec->cudnn,
-                &alpha,
-                conv->in_desc,
-                in,
-                conv->filter_desc,
-                conv->weight,
-                conv->conv_desc,
-                conv->algo,
-                dec->cudnn_workspace,
-                conv->workspace_bytes,
-                &beta,
-                conv->out_desc,
-                out));
-            if (conv->has_bias) {
-                CUDNN_CONV_OK(cudnnAddTensor(dec->cudnn, &alpha, conv->bias_desc, conv->bias, &alpha, conv->out_desc, out));
-            }
-#undef CUDNN_CONV_OK
-        }
-        return 0;
-    }
-#endif
+    (void)dec;
     int64_t total = (int64_t)N * conv->out_c * H * W;
     taehv_conv2d_nchw_kernel<<<div_up_i64(total, 256), 256>>>(
         in, conv->weight, conv->bias, out, N, conv->in_c, conv->out_c, H, W, conv->kernel, conv->has_bias);
@@ -2279,43 +1834,6 @@ static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, co
 }
 
 static int taehv_run_conv_h_nhwc(DeviceVaeDecoder *dec, const __half *in, __half *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
-#ifdef WORLD_USE_CUDNN
-    if (!dec || !dec->cudnn || !conv || !conv->h_plan_ready ||
-        conv->h_plan_n != N || conv->h_plan_h != H || conv->h_plan_w != W) {
-        return 1;
-    }
-    {
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-#define CUDNN_CONV_H_OK(expr) do { \
-    cudnnStatus_t _s = (expr); \
-    if (_s != CUDNN_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuDNN half NHWC error %s:%d: %s\n", __FILE__, __LINE__, cudnnGetErrorString(_s)); \
-        return 1; \
-    } \
-} while (0)
-        CUDNN_CONV_H_OK(cudnnConvolutionForward(
-            dec->cudnn,
-            &alpha,
-            conv->h_in_desc,
-            in,
-            conv->h_filter_desc,
-            conv->weight_h,
-            conv->h_conv_desc,
-            conv->h_algo,
-            dec->cudnn_workspace,
-            conv->h_workspace_bytes,
-            &beta,
-            conv->h_out_desc,
-            out));
-#undef CUDNN_CONV_H_OK
-    }
-    if (conv->has_bias) {
-        taehv_add_bias_nhwc_h_kernel<<<div_up_i64((int64_t)N * H * W * conv->out_c, 256), 256>>>(out, conv->bias_h, N, H, W, conv->out_c);
-        CUDA_OK(cudaGetLastError());
-    }
-    return 0;
-#else
     (void)dec;
     (void)in;
     (void)out;
@@ -2324,7 +1842,6 @@ static int taehv_run_conv_h_nhwc(DeviceVaeDecoder *dec, const __half *in, __half
     (void)H;
     (void)W;
     return 1;
-#endif
 }
 
 static int taehv_run_relu(float *x, int64_t n) {
@@ -2787,22 +2304,7 @@ struct WorldCudaRuntime {
     float *d_v;
     float *d_v_first;
     float *d_attn;
-    float *d_attn_scores;
-    float *d_attn_k_compact;
-    float *d_attn_v_compact;
     float *d_attn_out;
-    const float **h_attn_qk_a;
-    const float **h_attn_qk_b;
-    float **h_attn_qk_c;
-    const float **h_attn_av_a;
-    const float **h_attn_av_b;
-    float **h_attn_av_c;
-    const float **d_attn_qk_a;
-    const float **d_attn_qk_b;
-    float **d_attn_qk_c;
-    const float **d_attn_av_a;
-    const float **d_attn_av_b;
-    float **d_attn_av_c;
     float *d_tokens_after_attn;
     float *d_ctrl_norm;
     float *d_ctrl_cond_by_layer;
@@ -2819,182 +2321,15 @@ struct WorldCudaRuntime {
     int64_t *d_y_pos;
     int64_t *d_t_pos;
     __half *d_linear_half;
-    int attn_cublas_enabled;
-    int attn_cublas_gqa_enabled;
     int attn_flash_enabled;
-    int attn_cublas_max_tokens;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
-    cublasHandle_t handle;
     cudaEvent_t ev_step_start;
     cudaEvent_t ev_after_setup;
     cudaEvent_t ev_after_transformer;
     cudaEvent_t ev_after_vae;
     DeviceVaeDecoder d_vae;
 };
-
-static int visible_cache_tokens_pinned1_host(const DeviceWorldLayerCache *cache, int T, int frame_idx) {
-    int ring_slots = cache->ring_length / T;
-    int slots = frame_idx + 1;
-    if (slots < 1) slots = 1;
-    if (slots > ring_slots) slots = ring_slots;
-    return slots * T;
-}
-
-static int indexed_attention_cache_d64_cublas(
-        WorldCudaRuntime *rt,
-        const DeviceWorldLayerCache *cache,
-        int Nkv,
-        float scale) {
-    if (!rt || !cache || Nkv <= 0 || Nkv > rt->attn_cublas_max_tokens) return 1;
-    int Hq = rt->cfg.n_heads;
-    int Hkv = rt->cfg.n_kv_heads;
-    int Tq = rt->T;
-    int group = Hq / Hkv;
-    if (group <= 0 || Hq % Hkv != 0) return 1;
-
-    int64_t compact_elems = (int64_t)Hq * Nkv * 64;
-    gather_indexed_kv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256>>>(
-        cache->k, cache->v, cache->indices,
-        rt->d_attn_k_compact, rt->d_attn_v_compact,
-        Hq, Hkv, Nkv, cache->capacity);
-    CUDA_OK(cudaGetLastError());
-
-    const float alpha_qk = scale;
-    const float alpha_av = 1.0f;
-    const float beta = 0.0f;
-    CUBLAS_OK(cublasSgemmStridedBatched(
-        rt->handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        Nkv,
-        Tq,
-        64,
-        &alpha_qk,
-        rt->d_attn_k_compact,
-        64,
-        (long long)Nkv * 64,
-        rt->d_q,
-        64,
-        (long long)Tq * 64,
-        &beta,
-        rt->d_attn_scores,
-        Nkv,
-        (long long)Tq * Nkv,
-        Hq));
-
-    softmax_rows_inplace_f32_kernel<<<Hq * Tq, 256>>>(rt->d_attn_scores, Hq * Tq, Nkv);
-    CUDA_OK(cudaGetLastError());
-
-    CUBLAS_OK(cublasSgemmStridedBatched(
-        rt->handle,
-        CUBLAS_OP_N,
-        CUBLAS_OP_N,
-        64,
-        Tq,
-        Nkv,
-        &alpha_av,
-        rt->d_attn_v_compact,
-        64,
-        (long long)Nkv * 64,
-        rt->d_attn_scores,
-        Nkv,
-        (long long)Tq * Nkv,
-        &beta,
-        rt->d_attn,
-        Hq * 64,
-        64,
-        Hq));
-    return 0;
-}
-
-static int upload_attention_gqa_pointers(WorldCudaRuntime *rt, int Nkv) {
-    if (!rt || Nkv <= 0) return 1;
-    int Hq = rt->cfg.n_heads;
-    int Hkv = rt->cfg.n_kv_heads;
-    int Tq = rt->T;
-    int group = Hq / Hkv;
-    if (group <= 0 || Hq % Hkv != 0) return 1;
-    for (int hq = 0; hq < Hq; ++hq) {
-        int hk = hq / group;
-        rt->h_attn_qk_a[hq] = rt->d_attn_k_compact + (int64_t)hk * Nkv * 64;
-        rt->h_attn_qk_b[hq] = rt->d_q + (int64_t)hq * Tq * 64;
-        rt->h_attn_qk_c[hq] = rt->d_attn_scores + (int64_t)hq * Tq * Nkv;
-        rt->h_attn_av_a[hq] = rt->d_attn_v_compact + (int64_t)hk * Nkv * 64;
-        rt->h_attn_av_b[hq] = rt->d_attn_scores + (int64_t)hq * Tq * Nkv;
-        rt->h_attn_av_c[hq] = rt->d_attn + (int64_t)hq * 64;
-    }
-    size_t ptr_bytes = (size_t)Hq * sizeof(float *);
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_a, rt->h_attn_qk_a, ptr_bytes, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_b, rt->h_attn_qk_b, ptr_bytes, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_qk_c, rt->h_attn_qk_c, ptr_bytes, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_a, rt->h_attn_av_a, ptr_bytes, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_b, rt->h_attn_av_b, ptr_bytes, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpyAsync(rt->d_attn_av_c, rt->h_attn_av_c, ptr_bytes, cudaMemcpyHostToDevice));
-    return 0;
-}
-
-static int indexed_attention_cache_d64_cublas_gqa(
-        WorldCudaRuntime *rt,
-        const DeviceWorldLayerCache *cache,
-        int Nkv,
-        float scale) {
-    if (!rt || !cache || Nkv <= 0 || Nkv > rt->attn_cublas_max_tokens) return 1;
-    int Hq = rt->cfg.n_heads;
-    int Hkv = rt->cfg.n_kv_heads;
-    int Tq = rt->T;
-    int group = Hq / Hkv;
-    if (group <= 0 || Hq % Hkv != 0) return 1;
-
-    int64_t compact_elems = (int64_t)Hkv * Nkv * 64;
-    gather_indexed_kv_hkv_d64_f32_kernel<<<div_up_i64(compact_elems, 256), 256>>>(
-        cache->k, cache->v, cache->indices,
-        rt->d_attn_k_compact, rt->d_attn_v_compact,
-        Hkv, Nkv, cache->capacity);
-    CUDA_OK(cudaGetLastError());
-    if (upload_attention_gqa_pointers(rt, Nkv)) return 1;
-
-    const float alpha_qk = scale;
-    const float alpha_av = 1.0f;
-    const float beta = 0.0f;
-    CUBLAS_OK(cublasSgemmBatched(
-        rt->handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        Nkv,
-        Tq,
-        64,
-        &alpha_qk,
-        rt->d_attn_qk_a,
-        64,
-        rt->d_attn_qk_b,
-        64,
-        &beta,
-        rt->d_attn_qk_c,
-        Nkv,
-        Hq));
-
-    softmax_rows_inplace_f32_kernel<<<Hq * Tq, 256>>>(rt->d_attn_scores, Hq * Tq, Nkv);
-    CUDA_OK(cudaGetLastError());
-
-    CUBLAS_OK(cublasSgemmBatched(
-        rt->handle,
-        CUBLAS_OP_N,
-        CUBLAS_OP_N,
-        64,
-        Tq,
-        Nkv,
-        &alpha_av,
-        rt->d_attn_av_a,
-        64,
-        rt->d_attn_av_b,
-        Nkv,
-        &beta,
-        rt->d_attn_av_c,
-        Hq * 64,
-        Hq));
-    return 0;
-}
 
 static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
     if (!rt || !rt->d_layer_mod_table || !rt->d_out_mod_table) return 1;
@@ -3005,14 +2340,13 @@ static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
 
         fill_noise_embedding(rt->h_noise, sigma_step);
         CUDA_OK(cudaMemcpy(rt->d_noise, rt->h_noise, 512 * sizeof(float), cudaMemcpyHostToDevice));
-        if (row_major_linear(rt->handle, rt->d_noise, rt->d_denoise_fc1, rt->d_noise_hidden, 1, 512, rt->mlp_hidden)) return 1;
+        if (row_major_linear(rt->d_noise, rt->d_denoise_fc1, rt->d_noise_hidden, 1, 512, rt->mlp_hidden)) return 1;
         silu_f32_kernel<<<div_up_i64(rt->mlp_hidden, 256), 256>>>(rt->d_noise_hidden, rt->d_noise_hidden, rt->mlp_hidden);
         CUDA_OK(cudaGetLastError());
-        if (row_major_linear(rt->handle, rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D)) return 1;
+        if (row_major_linear(rt->d_noise_hidden, rt->d_denoise_fc2, rt->d_cond, 1, rt->mlp_hidden, rt->D)) return 1;
         silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, rt->d_cond_act, rt->D);
         CUDA_OK(cudaGetLastError());
         if (row_major_linear(
-                    rt->handle,
                     rt->d_cond_act,
                     rt->d_out_norm_w,
                     rt->d_out_mod_table + (int64_t)pass_idx * 2 * rt->D,
@@ -3025,7 +2359,7 @@ static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
             float *dst = rt->d_layer_mod_table + ((int64_t)pass_idx * rt->layers_to_run + layer_idx) * (6 * rt->D);
             add_bias_silu_f32_kernel<<<div_up_i64(rt->D, 256), 256>>>(rt->d_cond, lw->cond_bias, rt->d_cond_act, rt->D);
             CUDA_OK(cudaGetLastError());
-            if (row_major_linear(rt->handle, rt->d_cond_act, lw->cond_proj_weight, dst, 1, rt->D, 6 * rt->D)) return 1;
+            if (row_major_linear(rt->d_cond_act, lw->cond_proj_weight, dst, 1, rt->D, 6 * rt->D)) return 1;
         }
     }
     CUDA_OK(cudaGetLastError());
@@ -3057,7 +2391,6 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     if (rt->ev_after_transformer) cudaEventDestroy(rt->ev_after_transformer);
     if (rt->ev_after_setup) cudaEventDestroy(rt->ev_after_setup);
     if (rt->ev_step_start) cudaEventDestroy(rt->ev_step_start);
-    if (rt->handle) cublasDestroy(rt->handle);
     free_device_world_layers(rt->d_layers, rt->layers_to_run);
     free_device_world_caches(rt->d_caches, rt->layers_to_run);
     cudaFree(rt->d_latent);
@@ -3090,22 +2423,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_v);
     cudaFree(rt->d_v_first);
     cudaFree(rt->d_attn);
-    cudaFree(rt->d_attn_scores);
-    cudaFree(rt->d_attn_k_compact);
-    cudaFree(rt->d_attn_v_compact);
     cudaFree(rt->d_attn_out);
-    free(rt->h_attn_qk_a);
-    free(rt->h_attn_qk_b);
-    free(rt->h_attn_qk_c);
-    free(rt->h_attn_av_a);
-    free(rt->h_attn_av_b);
-    free(rt->h_attn_av_c);
-    cudaFree(rt->d_attn_qk_a);
-    cudaFree(rt->d_attn_qk_b);
-    cudaFree(rt->d_attn_qk_c);
-    cudaFree(rt->d_attn_av_a);
-    cudaFree(rt->d_attn_av_b);
-    cudaFree(rt->d_attn_av_c);
     cudaFree(rt->d_tokens_after_attn);
     cudaFree(rt->d_ctrl_norm);
     cudaFree(rt->d_ctrl_cond_by_layer);
@@ -3208,23 +2526,12 @@ extern "C" int world_cuda_runtime_create(
     size_t unpatch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
     size_t layer_mod_table_elems = (size_t)rt->total_passes * layers_to_run * 6 * rt->D;
     size_t out_mod_table_elems = (size_t)rt->total_passes * 2 * rt->D;
-    const char *cublas_attn_env = NULL;
-    const char *cublas_attn_gqa_env = NULL;
     const char *flash_attn_env = NULL;
-    int cublas_attn_max_tokens = 0;
-    int cublas_attn_supported = 1;
 
 #define RT_CUDA(expr) do { \
     cudaError_t _e = (expr); \
     if (_e != cudaSuccess) { \
         fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_e)); \
-        goto fail; \
-    } \
-} while (0)
-#define RT_CUBLAS(expr) do { \
-    cublasStatus_t _s = (expr); \
-    if (_s != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)_s); \
         goto fail; \
     } \
 } while (0)
@@ -3292,63 +2599,13 @@ extern "C" int world_cuda_runtime_create(
     if (copy_f32_to_device(&rt->d_unpatch_b, weights->unpatchify_bias, (size_t)rt->C)) goto fail;
     if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
     if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head)) goto fail;
-    cublas_attn_env = getenv("WORLD_CUBLAS_ATTN");
-    cublas_attn_gqa_env = getenv("WORLD_CUBLAS_ATTN_GQA");
     flash_attn_env = getenv("WORLD_FLASH_ATTN");
-    rt->attn_cublas_gqa_enabled = cublas_attn_gqa_env ? cublas_attn_gqa_env[0] != '0' : 0;
     rt->attn_flash_enabled = flash_attn_env ? flash_attn_env[0] != '0' : 0;
     if (rt->attn_flash_enabled) {
-        fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for non-cuBLAS cache layers\n");
-    }
-    if ((!cublas_attn_env || cublas_attn_env[0] != '0') && rt->d_head == 64 && cfg->n_heads % cfg->n_kv_heads == 0) {
-        cublas_attn_max_tokens = 0;
-        cublas_attn_supported = 0;
-        for (int i = 0; i < layers_to_run; ++i) {
-            DeviceWorldLayerCache *cache = &rt->d_caches[i];
-            if (cache->pinned_dilation == 1) {
-                cublas_attn_supported = 1;
-                if (cache->ring_length > cublas_attn_max_tokens) cublas_attn_max_tokens = cache->ring_length;
-            }
-        }
-        if (cublas_attn_supported && cublas_attn_max_tokens > 0 && cublas_attn_max_tokens <= 8192) {
-            rt->attn_cublas_enabled = 1;
-            rt->attn_cublas_max_tokens = cublas_attn_max_tokens;
-            RT_CUDA(cudaMalloc((void **)&rt->d_attn_scores, (size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)));
-            RT_CUDA(cudaMalloc((void **)&rt->d_attn_k_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
-            RT_CUDA(cudaMalloc((void **)&rt->d_attn_v_compact, (size_t)cfg->n_heads * cublas_attn_max_tokens * 64 * sizeof(float)));
-            if (rt->attn_cublas_gqa_enabled) {
-                size_t ptr_bytes = (size_t)cfg->n_heads * sizeof(float *);
-                rt->h_attn_qk_a = (const float **)malloc(ptr_bytes);
-                rt->h_attn_qk_b = (const float **)malloc(ptr_bytes);
-                rt->h_attn_qk_c = (float **)malloc(ptr_bytes);
-                rt->h_attn_av_a = (const float **)malloc(ptr_bytes);
-                rt->h_attn_av_b = (const float **)malloc(ptr_bytes);
-                rt->h_attn_av_c = (float **)malloc(ptr_bytes);
-                if (!rt->h_attn_qk_a || !rt->h_attn_qk_b || !rt->h_attn_qk_c ||
-                    !rt->h_attn_av_a || !rt->h_attn_av_b || !rt->h_attn_av_c) {
-                    fprintf(stderr, "runtime attention pointer host allocation failed\n");
-                    goto fail;
-                }
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_a, ptr_bytes));
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_b, ptr_bytes));
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_qk_c, ptr_bytes));
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_a, ptr_bytes));
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_b, ptr_bytes));
-                RT_CUDA(cudaMalloc((void **)&rt->d_attn_av_c, ptr_bytes));
-            }
-            fprintf(stderr, "cuBLAS attention enabled%s: max_tokens=%d score_scratch=%.2f MiB\n",
-                    rt->attn_cublas_gqa_enabled ? " (GQA pointer batched)" : "",
-                    cublas_attn_max_tokens,
-                    (double)((size_t)cfg->n_heads * rt->T * cublas_attn_max_tokens * sizeof(float)) / (1024.0 * 1024.0));
-        } else {
-            fprintf(stderr, "cuBLAS attention disabled: pinned1=%d max_tokens=%d\n",
-                    cublas_attn_supported, cublas_attn_max_tokens);
-        }
+        fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for D=64 cache layers\n");
     }
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
-    RT_CUBLAS(cublasCreate(&rt->handle));
-    RT_CUBLAS(cublasSetMathMode(rt->handle, CUBLAS_TF32_TENSOR_OP_MATH));
     if (precompute_runtime_layer_mods(rt)) goto fail;
     RT_CUDA(cudaEventCreate(&rt->ev_step_start));
     RT_CUDA(cudaEventCreate(&rt->ev_after_setup));
@@ -3359,12 +2616,10 @@ extern "C" int world_cuda_runtime_create(
 
     *out = rt;
 #undef RT_CUDA
-#undef RT_CUBLAS
     return 0;
 
 fail:
 #undef RT_CUDA
-#undef RT_CUBLAS
     world_cuda_runtime_destroy(rt);
     return 1;
 }
@@ -3395,11 +2650,11 @@ extern "C" int world_cuda_runtime_step_rgb(
     } \
 } while (0)
 #define STEP_LINEAR(x, w, y, m, k, n) do { \
-    if (row_major_linear(rt->handle, (x), (w), (y), (m), (k), (n))) return 1; \
+    if (row_major_linear((x), (w), (y), (m), (k), (n))) return 1; \
 } while (0)
 #define STEP_LINEAR_FAST(x, w, wh, y, m, k, n) do { \
     if (use_fp16_gemm && (wh) && (m) > 1) { \
-        if (row_major_linear_fp16_weight(rt->handle, (x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+        if (row_major_linear_fp16_weight((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
     } else { \
         STEP_LINEAR((x), (w), (y), (m), (k), (n)); \
     } \
@@ -3505,18 +2760,8 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
             if (rt->d_head == 64) {
-                int cublas_attn_ok = 0;
-                if (rt->attn_cublas_enabled && cache->pinned_dilation == 1) {
-                    int n_tokens = visible_cache_tokens_pinned1_host(cache, rt->T, current_frame_idx);
-                    if (n_tokens > 0 && n_tokens <= rt->attn_cublas_max_tokens) {
-                        if (rt->attn_cublas_gqa_enabled) {
-                            if (indexed_attention_cache_d64_cublas_gqa(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
-                        } else {
-                            if (indexed_attention_cache_d64_cublas(rt, cache, n_tokens, 1.0f / 8.0f)) return 1;
-                        }
-                        cublas_attn_ok = 1;
-                    }
-                } else if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
+                int attn_done = 0;
+                if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
                     int group = cfg->n_heads / cfg->n_kv_heads;
                     int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
                     if (q_per_h < 1) q_per_h = 1;
@@ -3526,9 +2771,9 @@ extern "C" int world_cuda_runtime_step_rgb(
                         rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
                         cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
                         1.0f / 8.0f);
-                    cublas_attn_ok = 1;
+                    attn_done = 1;
                 }
-                if (!cublas_attn_ok) {
+                if (!attn_done) {
                     indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
                         rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
                         cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
@@ -3724,10 +2969,7 @@ extern "C" int world_cuda_generation_probe(
     patchify_f32_kernel<<<rows, 256>>>(d_latent, d_patch, d_tokens, C, H, W, D, ph, pw, Hp, Wp);
     CUDA_OK(cudaGetLastError());
 
-    cublasHandle_t handle = NULL;
-    CUBLAS_OK(cublasCreate(&handle));
-    if (row_major_linear(handle, d_tokens, d_q_weight, d_q, T, D, D)) return 1;
-    CUBLAS_OK(cublasDestroy(handle));
+    if (row_major_linear(d_tokens, d_q_weight, d_q, T, D, D)) return 1;
 
     CUDA_OK(cudaMemcpy(h_tokens, d_tokens, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_OK(cudaMemcpy(h_q, d_q, token_elems * sizeof(float), cudaMemcpyDeviceToHost));
@@ -3918,7 +3160,6 @@ extern "C" int world_cuda_layer0_probe(
     int64_t *d_x_pos = NULL;
     int64_t *d_y_pos = NULL;
     int64_t *d_t_pos = NULL;
-    cublasHandle_t handle = NULL;
 
 #define TRY_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -3927,15 +3168,8 @@ extern "C" int world_cuda_layer0_probe(
         goto cleanup_device; \
     } \
 } while (0)
-#define TRY_CUBLAS(expr) do { \
-    cublasStatus_t _s = (expr); \
-    if (_s != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)_s); \
-        goto cleanup_device; \
-    } \
-} while (0)
 #define TRY_LINEAR(x, w, y, m, k, n) do { \
-    if (row_major_linear(handle, (x), (w), (y), (m), (k), (n))) goto cleanup_device; \
+    if (row_major_linear((x), (w), (y), (m), (k), (n))) goto cleanup_device; \
 } while (0)
 
     TRY_CUDA(cudaMalloc((void **)&d_latent, latent_elems * sizeof(float)));
@@ -4009,8 +3243,6 @@ extern "C" int world_cuda_layer0_probe(
     TRY_CUDA(cudaMemcpy(d_x_pos, h_x_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
     TRY_CUDA(cudaMemcpy(d_y_pos, h_y_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
     TRY_CUDA(cudaMemcpy(d_t_pos, h_t_pos, (size_t)T * sizeof(int64_t), cudaMemcpyHostToDevice));
-
-    TRY_CUBLAS(cublasCreate(&handle));
 
     TRY_LINEAR(d_control_input, d_ctrl_emb_fc1_w, d_ctrl_emb_hidden, 1, ctrl_dim, mlp_hidden);
     silu_f32_kernel<<<div_up_i64(mlp_hidden, 256), 256>>>(d_ctrl_emb_hidden, d_ctrl_emb_hidden, mlp_hidden);
@@ -4165,7 +3397,6 @@ extern "C" int world_cuda_layer0_probe(
     rc = 0;
 
 cleanup_device:
-    if (handle) cublasDestroy(handle);
     cudaFree(d_latent);
     cudaFree(d_patch);
     cudaFree(d_noise);
@@ -4229,7 +3460,6 @@ cleanup_device:
     cudaFree(d_t_pos);
 
 #undef TRY_CUDA
-#undef TRY_CUBLAS
 #undef TRY_LINEAR
 
     free(h_latent);
@@ -4398,7 +3628,6 @@ extern "C" int world_cuda_transformer_probe(
     int64_t *d_t_pos = NULL;
     DeviceWorldLayerWeights *d_layers = NULL;
     DeviceWorldLayerCache *d_caches = NULL;
-    cublasHandle_t handle = NULL;
     DeviceVaeDecoder d_vae;
     memset(&d_vae, 0, sizeof(d_vae));
     int have_d_vae = 0;
@@ -4410,15 +3639,8 @@ extern "C" int world_cuda_transformer_probe(
         goto cleanup_device; \
     } \
 } while (0)
-#define TRY_CUBLAS2(expr) do { \
-    cublasStatus_t _s = (expr); \
-    if (_s != CUBLAS_STATUS_SUCCESS) { \
-        fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, (int)_s); \
-        goto cleanup_device; \
-    } \
-} while (0)
 #define TRY_LINEAR2(x, w, y, m, k, n) do { \
-    if (row_major_linear(handle, (x), (w), (y), (m), (k), (n))) goto cleanup_device; \
+    if (row_major_linear((x), (w), (y), (m), (k), (n))) goto cleanup_device; \
 } while (0)
 
     TRY_CUDA2(cudaMalloc((void **)&d_latent, latent_elems * sizeof(float)));
@@ -4472,7 +3694,6 @@ extern "C" int world_cuda_transformer_probe(
 
     TRY_CUDA2(cudaMemcpy(d_xy_table, h_xy, (size_t)d_xy * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_inv_t, h_inv_t, (size_t)d_t * sizeof(float), cudaMemcpyHostToDevice));
-    TRY_CUBLAS2(cublasCreate(&handle));
     if (vae && out_path && out_path[0]) {
         if (taehv_decoder_init(&d_vae, cfg, vae)) goto cleanup_device;
         have_d_vae = 1;
@@ -4683,7 +3904,6 @@ extern "C" int world_cuda_transformer_probe(
 
 cleanup_device:
     taehv_decoder_free(&d_vae);
-    if (handle) cublasDestroy(handle);
     free_device_world_layers(d_layers, layers_to_run);
     free_device_world_caches(d_caches, layers_to_run);
     cudaFree(d_latent);
@@ -4733,7 +3953,6 @@ cleanup_device:
     cudaFree(d_t_pos);
 
 #undef TRY_CUDA2
-#undef TRY_CUBLAS2
 #undef TRY_LINEAR2
 
     free(h_latent);

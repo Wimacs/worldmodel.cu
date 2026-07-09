@@ -1,6 +1,8 @@
 # worldmodel.cu
 
-这是 Waypoint 1.5 权重的 CUDA/Vulkan 运行时。这个 README 只讲怎么把项目跑起来。
+这是 Waypoint 1.5 的纯 C/CUDA/Vulkan 运行时实验仓库。目标是把 PyTorch 侧实时 WorldDiT 管线逐步迁到可独立运行的 CUDA/Vulkan 后端，并持续用 PyTorch reference 对拍。
+
+当前 CUDA 路径不链接 cuBLAS/cuDNN，只链接 CUDA runtime；GEMM/linear 走 CUTLASS。CUTLASS kernel 现状、layout 取舍、Triton 优化思路映射和后续 autotune 计划见 [`docs/cuda_cutlass_kernels.md`](docs/cuda_cutlass_kernels.md)。
 
 ## 1. 环境
 
@@ -15,7 +17,7 @@
 可选：
 
 - Vulkan SDK: 只在编译 Vulkan 后端时需要，`glslc` 要能在 `PATH` 里找到
-- cuDNN 9: VAE decode 会更快；没有也可以编译和运行
+- CUTLASS checkout: 可通过 `WORLD_CUTLASS_DIR` 或 `CUTLASS_DIR` 指定；否则 CMake 会找 `3rd/cutlass`、常见 sibling checkout，最后用 FetchContent 拉取
 
 ## 2. Clone
 
@@ -66,6 +68,8 @@ worldmodel.cu/
     model.safetensors
 ```
 
+注意：当前 CUDA standalone F32 smoke path 使用 `Waypoint-1.5-1B` 的 F32 transformer 权重；360p checkpoint 是 BF16，主要用于 Vulkan 360p 路径。
+
 ## 4. 编译
 
 ### Windows CUDA
@@ -107,15 +111,7 @@ build/worldmodel_raylib
 build/worldmodel_cuda
 ```
 
-### 可选 cuDNN
-
-cuDNN 不是必须的。装好后重新跑 CMake，项目会从 `CUDNN_ROOT`、`CUDNN_PATH` 或 Python 包里尝试自动发现：
-
-```sh
-python -m pip install nvidia-cudnn-cu12
-```
-
-### 可选 Vulkan
+### Vulkan
 
 Windows：
 
@@ -139,7 +135,7 @@ cmake --build build-vulkan -j
 
 ## 5. 运行
 
-### 快速交互 CUDA
+### CUDA 交互窗口
 
 Windows：
 
@@ -162,51 +158,14 @@ Linux：
 - 鼠标左右键: 按钮输入
 - `Esc`: 退出
 
-### 推荐：带初始图的交互运行
-
-先装 Python 依赖：
-
-```sh
-python -m pip install torch diffusers pillow numpy safetensors
-```
-
-导出 seed latent：
-
-```bat
-python export_seed_latent.py --model-dir .\Waypoint-1.5-1B --out .\world_seed_latent.f32
-```
-
-Linux 用：
+推荐先用 PyTorch 导出一个 seed latent，减少随机初始画面：
 
 ```sh
 python export_seed_latent.py --model-dir ./Waypoint-1.5-1B --out ./world_seed_latent.f32
+./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --seed-latent ./world_seed_latent.f32 --steps 4 --cache-window 8 --mouse-scale 0.1
 ```
 
-Windows 运行：
-
-```bat
-.\build-win\Release\worldmodel_raylib.exe ^
-  --model-dir .\Waypoint-1.5-1B ^
-  --seed-latent .\world_seed_latent.f32 ^
-  --steps 4 ^
-  --cache-window 8 ^
-  --mouse-scale 0.1
-```
-
-Linux 运行：
-
-```sh
-./build/worldmodel_raylib \
-  --model-dir ./Waypoint-1.5-1B \
-  --seed-latent ./world_seed_latent.f32 \
-  --steps 4 \
-  --cache-window 8 \
-  --mouse-scale 0.1
-```
-
-不传 `--seed-latent` 也能启动，但会从随机 latent 开始，更适合调试，不太适合作为可控世界 rollout。
-
-### 无窗口 smoke test
+### Headless Smoke
 
 Windows：
 
@@ -226,7 +185,7 @@ Linux：
 --headless-out world_runtime.ppm
 ```
 
-### standalone CUDA 出图
+### Standalone CUDA 出图/生成
 
 Windows：
 
@@ -240,7 +199,9 @@ Linux：
 ./build/worldmodel_cuda --model-dir ./Waypoint-1.5-1B --steps 4 --frames 1 --out ./world_full.ppm
 ```
 
-### Vulkan 360p smoke test
+`--out` 会加载 VAE 权重并写 PPM；不传 `--out` 时只跑 latent/transformer path。
+
+### Vulkan 360p Smoke
 
 Vulkan 360p 路径使用 `Waypoint-1.5-1B-360P` 的 transformer 权重，同时复用 `Waypoint-1.5-1B` 的 VAE 权重。
 
@@ -274,17 +235,54 @@ Vulkan shader probe：
 ./build-vulkan/worldmodel_vulkan_probe
 ```
 
-Windows 路径：
-
-```bat
-.\build-win-vulkan\Release\worldmodel_vulkan_probe.exe
-```
-
-## 常用参数
+## 6. 常用参数
 
 - `--fast-realtime`: 低延迟预设，会用较少 steps 和较小 KV cache
 - `--steps 4 --cache-window 8`: 质量更好，但更慢
 - `--cache-window 1`: 仅用于调试，通常没有可控历史
-- `--mouse-scale 0.1`: 鼠标太灵敏时继续调低
-- 找不到 raylib 时，先跑 `git submodule update --init --recursive`
-- 运行时缺 CUDA DLL 时，从 CUDA 已加入 `PATH` 的 shell 启动
+- `--mouse-scale 0.1`: 鼠标太灵敏时继续调低，太弱时调高
+- `--frame-idx N`: 设置第一个 latent frame 的 temporal RoPE/cache 位置
+- `--frames N`: 同一进程生成 N 个 latent frame，并保留 KV cache 历史
+- `--cache-pass`: 每个 frame 生成后追加 sigma=0 的 cache 写入 pass
+- `--control FILE` / `--control-seq FILE`: 输入控制向量或控制序列
+- `--latent FILE`: 载入外部 little-endian float32 latent
+- `--vae-only --latent FILE --out FILE`: 只调试 TAEHV decode
+
+raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和滚轮，映射到 PyTorch controller layout。CUDA generation 在 worker thread 里跑，主线程继续轮询输入；收到新 decoded chunk 后按顺序播放一次，然后停在最后一帧等待下一个 chunk。
+
+## 7. CUDA/CUTLASS 状态
+
+- CUDA 目标只链接 `CUDA::cudart`，不链接 cuBLAS/cuDNN。
+- Transformer linear/GEMM 当前走 CUTLASS SIMT baseline，保证真实权重可 load 和完整 4-step 可运行。
+- FP16-weight path 也走 CUTLASS SIMT half x half -> float accumulator。之前直接套 tensor-op row-major/column-major layout 会在真实 shape 上触发 CUTLASS `ldsm RowMajor` unsupported path。
+- 后续高性能路线是权重 load 阶段预打包到 tensor-core friendly layout，或者用 CUTLASS 3.x/CuTe collective builder 专门生成可用 tensor-op kernel。
+- D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
+- VAE decode 当前走内置 F32/NCHW direct conv；后续应迁到 CUTLASS conv/implicit-GEMM 或 im2row + CUTLASS GEMM。
+
+## 8. 测试
+
+CUDA/Vulkan build：
+
+```sh
+cmake -S . -B build -DWORLD_ENABLE_CUDA=ON -DWORLD_ENABLE_VULKAN=ON
+cmake --build build -j
+```
+
+CUDA extension 对拍：
+
+```sh
+python test_worldmodel_kernels.py
+```
+
+真实 F32 权重 4-step smoke：
+
+```sh
+./build/worldmodel_cuda --model-dir ./Waypoint-1.5-1B --seed 1 --noise uniform --sigma 1.0 --steps 4 --frames 1
+```
+
+更完整的 standalone/PyTorch parity：
+
+```sh
+python test_standalone_probe.py
+python generate_smoke.py --model-dir ./Waypoint-1.5-1B --steps 4 --output smoke_latent.pt
+```

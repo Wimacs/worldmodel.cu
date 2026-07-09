@@ -23,9 +23,31 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parent
 
 
+def find_cutlass_include():
+    candidates = []
+    env_dir = os.environ.get("WORLD_CUTLASS_DIR") or os.environ.get("CUTLASS_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.extend(
+        [
+            ROOT / "3rd" / "cutlass",
+            ROOT.parents[1] / "flux2" / "third_party" / "cutlass",
+            ROOT.parents[1] / "flux.cu" / "third_party" / "cutlass",
+        ]
+    )
+    for candidate in candidates:
+        include = candidate / "include"
+        if (include / "cutlass" / "cutlass.h").exists():
+            return include
+    return None
+
+
 def load_wm_cuda():
     if not torch.cuda.is_available() or CUDA_HOME is None:
         pytest.skip("CUDA and nvcc are required for worldmodel.cu parity tests")
+    cutlass_include = find_cutlass_include()
+    if cutlass_include is None:
+        pytest.skip("CUTLASS include directory is required for worldmodel.cu parity tests")
 
     build_dir = ROOT / ".torch_extensions"
     build_dir.mkdir(exist_ok=True)
@@ -33,6 +55,7 @@ def load_wm_cuda():
         name="worldmodel_cuda_ext",
         sources=[str(ROOT / "worldmodel_kernels.cu")],
         build_directory=str(build_dir),
+        extra_include_paths=[str(cutlass_include)],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
         verbose=bool(os.environ.get("WORLD_CU_VERBOSE_BUILD")),
     )
@@ -208,48 +231,6 @@ def test_indexed_attention_matches_masked_attention_reference(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=3e-5, atol=3e-5)
 
 
-def test_indexed_attention_cublas_matches_masked_attention_reference(wm_cuda):
-    torch.manual_seed(16)
-    b, hq, hkv, tq, tk, d = 2, 8, 2, 11, 23, 64
-    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
-    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
-    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
-    indices = torch.tensor([0, 2, 5, 7, 11, 16, 22], device="cuda", dtype=torch.long)
-    scale = d ** -0.5
-
-    y = wm_cuda.indexed_attention_cublas(q, k, v, indices, scale)
-
-    group = hq // hkv
-    k_gqa = k.repeat_interleave(group, dim=1)
-    v_gqa = v.repeat_interleave(group, dim=1)
-    scores = torch.einsum("bhtd,bhkd->bhtk", q, k_gqa[:, :, indices, :]) * scale
-    probs = torch.softmax(scores, dim=-1)
-    ref = torch.einsum("bhtn,bhnd->bhtd", probs, v_gqa[:, :, indices, :])
-
-    torch.testing.assert_close(y, ref, rtol=2e-4, atol=2e-4)
-
-
-def test_indexed_attention_cublas_gqa_matches_masked_attention_reference(wm_cuda):
-    torch.manual_seed(18)
-    b, hq, hkv, tq, tk, d = 2, 8, 2, 11, 23, 64
-    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
-    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
-    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32)
-    indices = torch.tensor([0, 2, 5, 7, 11, 16, 22], device="cuda", dtype=torch.long)
-    scale = d ** -0.5
-
-    y = wm_cuda.indexed_attention_cublas_gqa(q, k, v, indices, scale)
-
-    group = hq // hkv
-    k_gqa = k.repeat_interleave(group, dim=1)
-    v_gqa = v.repeat_interleave(group, dim=1)
-    scores = torch.einsum("bhtd,bhkd->bhtk", q, k_gqa[:, :, indices, :]) * scale
-    probs = torch.softmax(scores, dim=-1)
-    ref = torch.einsum("bhtn,bhnd->bhtd", probs, v_gqa[:, :, indices, :])
-
-    torch.testing.assert_close(y, ref, rtol=2e-4, atol=2e-4)
-
-
 def test_indexed_attention_flash_matches_masked_attention_reference(wm_cuda):
     torch.manual_seed(19)
     b, hq, hkv, tq, tk, d = 2, 8, 2, 11, 23, 64
@@ -382,14 +363,14 @@ def test_patchify_matches_torch_conv2d_layout(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
 
 
-def test_patchify_cublas_matches_torch_conv2d_layout(wm_cuda):
+def test_patchify_cutlass_matches_torch_conv2d_layout(wm_cuda):
     torch.manual_seed(17)
     b, c, h, w = 2, 4, 8, 12
     d, ph, pw = 7, 2, 3
     x = torch.randn(b, c, h, w, device="cuda", dtype=torch.float32)
     weight = torch.randn(d, c, ph, pw, device="cuda", dtype=torch.float32)
 
-    y = wm_cuda.patchify_cublas(x, weight)
+    y = wm_cuda.patchify_cutlass(x, weight)
     ref = F.conv2d(x, weight, bias=None, stride=(ph, pw))
     ref = ref.permute(0, 2, 3, 1).reshape(b, (h // ph) * (w // pw), d).contiguous()
     torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
@@ -461,14 +442,12 @@ if __name__ == "__main__":
         test_qkv_rms_rope_matches_split_reference,
         test_masked_attention_matches_torch_gqa_written_mask,
         test_indexed_attention_matches_masked_attention_reference,
-        test_indexed_attention_cublas_matches_masked_attention_reference,
-        test_indexed_attention_cublas_gqa_matches_masked_attention_reference,
         test_indexed_attention_flash_matches_masked_attention_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_cache_frame_indices_matches_mask_nonzero_reference,
         test_patchify_matches_torch_conv2d_layout,
-        test_patchify_cublas_matches_torch_conv2d_layout,
+        test_patchify_cutlass_matches_torch_conv2d_layout,
         test_unpatchify_matches_torch_linear_layout,
         test_taehv_conv2d_matches_torch_same_padding,
         test_taehv_concat_past_matches_reference,
