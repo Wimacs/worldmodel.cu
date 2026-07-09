@@ -50,6 +50,26 @@ cmake -S . -B build -DWORLD_ENABLE_CUDA=ON -DWORLD_ENABLE_VULKAN=ON
 cmake --build build -j
 ```
 
+On Windows, use an x64 Visual Studio developer shell with CUDA Toolkit and the
+Vulkan SDK installed. `glslc.exe` is found from `PATH` or `%VULKAN_SDK%/Bin`;
+cuDNN is optional and can be found from the Python `nvidia-cudnn` package,
+`CUDNN_ROOT`, or `CUDNN_PATH`.
+
+```bat
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 ^
+  -DWORLD_ENABLE_CUDA=ON -DWORLD_ENABLE_VULKAN=ON ^
+  -DCMAKE_CUDA_ARCHITECTURES=89
+cmake --build build-win --config Release --parallel
+```
+
+For a Vulkan-only Windows build:
+
+```bat
+cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 ^
+  -DWORLD_ENABLE_CUDA=OFF -DWORLD_ENABLE_VULKAN=ON
+cmake --build build-win-vulkan --config Release --parallel
+```
+
 The Vulkan target currently builds `worldmodel_raylib_vulkan` and compiles
 the GLSL files in `shaders/vulkan/` to SPIR-V. The runtime creates a Vulkan
 device, resident compute pipelines, and returns RGB frames through the same

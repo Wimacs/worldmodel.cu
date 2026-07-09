@@ -10,6 +10,32 @@ option(WORLD_ENABLE_VULKAN "Build Vulkan backend targets" OFF)
 
 find_package(Threads REQUIRED)
 
+set(WORLD_PLATFORM_LIBS)
+if(UNIX)
+  list(APPEND WORLD_PLATFORM_LIBS m)
+endif()
+
+function(world_enable_large_objects target_name)
+  if(MSVC)
+    target_compile_options(${target_name} PRIVATE
+      $<$<COMPILE_LANGUAGE:C>:/bigobj>
+    )
+    if(CMAKE_CUDA_COMPILER)
+      target_compile_options(${target_name} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+      )
+    endif()
+  endif()
+endfunction()
+
+function(world_enable_cuda_options target_name)
+  target_compile_options(${target_name} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
+    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+  )
+  world_enable_large_objects(${target_name})
+endfunction()
+
 if(WORLD_ENABLE_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
@@ -38,8 +64,19 @@ if(WORLD_ENABLE_CUDA AND Python3_Interpreter_FOUND)
 endif()
 
 if(WORLD_ENABLE_CUDA)
-  find_path(CUDNN_INCLUDE_DIR cudnn.h HINTS ${CUDNN_INCLUDE_HINT})
-  find_library(CUDNN_LIBRARY NAMES cudnn libcudnn.so.9 HINTS ${CUDNN_LIBRARY_HINT})
+  set(CUDNN_ROOT_HINTS
+    "$ENV{CUDNN_ROOT}"
+    "$ENV{CUDNN_PATH}"
+  )
+  find_path(CUDNN_INCLUDE_DIR cudnn.h
+    HINTS ${CUDNN_INCLUDE_HINT} ${CUDNN_ROOT_HINTS}
+    PATH_SUFFIXES include
+  )
+  find_library(CUDNN_LIBRARY
+    NAMES cudnn cudnn64_9 libcudnn.so.9
+    HINTS ${CUDNN_LIBRARY_HINT} ${CUDNN_ROOT_HINTS}
+    PATH_SUFFIXES lib lib64 lib/x64
+  )
   if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
     add_library(CUDNN::cudnn UNKNOWN IMPORTED)
     set_target_properties(CUDNN::cudnn PROPERTIES
@@ -57,7 +94,9 @@ function(enable_optional_cudnn target_name)
   if(TARGET CUDNN::cudnn)
     target_link_libraries(${target_name} PRIVATE CUDNN::cudnn)
     target_compile_definitions(${target_name} PRIVATE WORLD_USE_CUDNN=1)
-    set_target_properties(${target_name} PROPERTIES BUILD_RPATH "${CUDNN_LIBRARY_DIR}")
+    if(NOT WIN32)
+      set_target_properties(${target_name} PROPERTIES BUILD_RPATH "${CUDNN_LIBRARY_DIR}")
+    endif()
   endif()
 endfunction()
 
@@ -76,20 +115,22 @@ if(WORLD_ENABLE_CUDA)
   target_link_libraries(worldmodel_cuda PRIVATE
     CUDA::cudart
     CUDA::cublas
+    ${WORLD_PLATFORM_LIBS}
   )
   enable_optional_cudnn(worldmodel_cuda)
-
-  target_compile_options(worldmodel_cuda PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
-    $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-  )
+  world_enable_cuda_options(worldmodel_cuda)
 endif()
 
 if(WORLD_ENABLE_VULKAN)
   find_package(Vulkan REQUIRED)
-  find_program(GLSLC_EXECUTABLE glslc REQUIRED)
+  find_program(GLSLC_EXECUTABLE
+    NAMES glslc glslc.exe
+    HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/Bin32"
+    REQUIRED
+  )
 
   set(WORLD_VULKAN_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/vulkan)
+  file(TO_CMAKE_PATH "${WORLD_VULKAN_SHADER_OUTPUT_DIR}" WORLD_VULKAN_SHADER_DEFINE_DIR)
   set(WORLD_VULKAN_SHADER_INCLUDE_DEPS
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/gemm_wf16_coopmat_template.comp
   )
@@ -202,11 +243,12 @@ if(WORLD_ENABLE_VULKAN)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   target_compile_definitions(worldmodel_vulkan_probe PRIVATE
-    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
+    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_DEFINE_DIR}"
   )
+  world_enable_large_objects(worldmodel_vulkan_probe)
   target_link_libraries(worldmodel_vulkan_probe PRIVATE
     Vulkan::Vulkan
-    m
+    ${WORLD_PLATFORM_LIBS}
   )
 
   add_executable(worldmodel_vulkan_gemm_autotune
@@ -219,11 +261,12 @@ if(WORLD_ENABLE_VULKAN)
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
   target_compile_definitions(worldmodel_vulkan_gemm_autotune PRIVATE
-    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
+    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_DEFINE_DIR}"
   )
+  world_enable_large_objects(worldmodel_vulkan_gemm_autotune)
   target_link_libraries(worldmodel_vulkan_gemm_autotune PRIVATE
     Vulkan::Vulkan
-    m
+    ${WORLD_PLATFORM_LIBS}
   )
 endif()
 
@@ -250,13 +293,10 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
       CUDA::cudart
       CUDA::cublas
       Threads::Threads
+      ${WORLD_PLATFORM_LIBS}
     )
     enable_optional_cudnn(worldmodel_raylib)
-
-    target_compile_options(worldmodel_raylib PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
-      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-    )
+    world_enable_cuda_options(worldmodel_raylib)
   endif()
 
   if(WORLD_ENABLE_VULKAN)
@@ -276,14 +316,15 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
 
     target_compile_definitions(worldmodel_raylib_vulkan PRIVATE
       WORLD_BACKEND_VULKAN=1
-      WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
+      WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_DEFINE_DIR}"
     )
+    world_enable_large_objects(worldmodel_raylib_vulkan)
 
     target_link_libraries(worldmodel_raylib_vulkan PRIVATE
       raylib
       Vulkan::Vulkan
       Threads::Threads
-      m
+      ${WORLD_PLATFORM_LIBS}
     )
   endif()
 endif()

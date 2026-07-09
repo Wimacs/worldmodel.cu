@@ -1,17 +1,95 @@
 #define WORLD_CLI_NO_MAIN
 #include "world_cli.c"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "raylib.h"
 #include "world_backend.h"
 
-#include <pthread.h>
 #include <math.h>
 #include <errno.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
 
 #if WORLD_BACKEND_BYTES_PER_PIXEL == 4
 #define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
 #else
 #define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8
+#endif
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION WorldMutex;
+typedef HANDLE WorldThread;
+#define WORLD_THREAD_RETURN DWORD WINAPI
+#define WORLD_THREAD_OK 0
+
+static int world_mutex_init(WorldMutex *m) {
+    InitializeCriticalSection(m);
+    return 0;
+}
+
+static void world_mutex_destroy(WorldMutex *m) {
+    DeleteCriticalSection(m);
+}
+
+static void world_mutex_lock(WorldMutex *m) {
+    EnterCriticalSection(m);
+}
+
+static void world_mutex_unlock(WorldMutex *m) {
+    LeaveCriticalSection(m);
+}
+
+static int world_thread_create(WorldThread *thread, WORLD_THREAD_RETURN (*fn)(void *), void *arg) {
+    *thread = CreateThread(NULL, 0, fn, arg, 0, NULL);
+    return *thread == NULL;
+}
+
+static void world_thread_join(WorldThread thread) {
+    if (!thread) return;
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+}
+#else
+typedef pthread_mutex_t WorldMutex;
+typedef pthread_t WorldThread;
+#define WORLD_THREAD_RETURN void *
+#define WORLD_THREAD_OK NULL
+
+static int world_mutex_init(WorldMutex *m) {
+    return pthread_mutex_init(m, NULL);
+}
+
+static void world_mutex_destroy(WorldMutex *m) {
+    pthread_mutex_destroy(m);
+}
+
+static void world_mutex_lock(WorldMutex *m) {
+    pthread_mutex_lock(m);
+}
+
+static void world_mutex_unlock(WorldMutex *m) {
+    pthread_mutex_unlock(m);
+}
+
+static int world_thread_create(WorldThread *thread, WORLD_THREAD_RETURN (*fn)(void *), void *arg) {
+    return pthread_create(thread, NULL, fn, arg);
+}
+
+static void world_thread_join(WorldThread thread) {
+    pthread_join(thread, NULL);
+}
 #endif
 
 typedef struct {
@@ -28,7 +106,7 @@ typedef struct {
 } LoadedWorldModel;
 
 typedef struct {
-    pthread_mutex_t mutex;
+    WorldMutex mutex;
     WorldRuntime *rt;
     float *control;
     int ctrl_dim;
@@ -236,18 +314,18 @@ static void merge_frame_control(LiveShared *s, const float *frame_control, float
         clamp_scroll_sign(s->control[2 + s->n_buttons] + frame_control[2 + s->n_buttons]);
 }
 
-static void *generation_worker(void *arg) {
+static WORLD_THREAD_RETURN generation_worker(void *arg) {
     LiveShared *s = (LiveShared *)arg;
     float *control = (float *)malloc((size_t)s->ctrl_dim * sizeof(float));
     if (!control) {
-        pthread_mutex_lock(&s->mutex);
+        world_mutex_lock(&s->mutex);
         s->failed = 1;
-        pthread_mutex_unlock(&s->mutex);
-        return NULL;
+        world_mutex_unlock(&s->mutex);
+        return WORLD_THREAD_OK;
     }
 
     for (;;) {
-        pthread_mutex_lock(&s->mutex);
+        world_mutex_lock(&s->mutex);
         int stop = s->stop;
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
@@ -261,7 +339,7 @@ static void *generation_worker(void *arg) {
             s->control[2 + s->n_buttons] = 0.0f;
             s->control_seconds = 0.0f;
         }
-        pthread_mutex_unlock(&s->mutex);
+        world_mutex_unlock(&s->mutex);
         if (stop) break;
 
         const unsigned char *pixels = NULL;
@@ -270,15 +348,15 @@ static void *generation_worker(void *arg) {
         int frames = 0;
         float seconds = 0.0f;
         if (world_runtime_step_pixels(s->rt, control, &pixels, &width, &height, &frames, &seconds)) {
-            pthread_mutex_lock(&s->mutex);
+            world_mutex_lock(&s->mutex);
             s->failed = 1;
             s->stop = 1;
-            pthread_mutex_unlock(&s->mutex);
+            world_mutex_unlock(&s->mutex);
             break;
         }
 
         size_t bytes = (size_t)width * height * WORLD_BACKEND_BYTES_PER_PIXEL * frames;
-        pthread_mutex_lock(&s->mutex);
+        world_mutex_lock(&s->mutex);
         if (bytes == s->rgb_bytes) {
             memcpy(s->rgb, pixels, bytes);
             s->width = width;
@@ -291,11 +369,11 @@ static void *generation_worker(void *arg) {
             s->failed = 1;
             s->stop = 1;
         }
-        pthread_mutex_unlock(&s->mutex);
+        world_mutex_unlock(&s->mutex);
     }
 
     free(control);
-    return NULL;
+    return WORLD_THREAD_OK;
 }
 
 static Rectangle fit_rect(int dst_w, int dst_h, int src_w, int src_h) {
@@ -630,7 +708,12 @@ int main(int argc, char **argv) {
 
     LiveShared shared;
     memset(&shared, 0, sizeof(shared));
-    pthread_mutex_init(&shared.mutex, NULL);
+    if (world_mutex_init(&shared.mutex) != 0) {
+        UnloadTexture(texture);
+        CloseWindow();
+        free(display_rgb);
+        goto cleanup_runtime_only;
+    }
     shared.rt = rt;
     shared.ctrl_dim = ctrl_dim;
     shared.n_buttons = cfg.n_buttons;
@@ -642,16 +725,16 @@ int main(int argc, char **argv) {
     shared.control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
     shared.rgb = (unsigned char *)malloc(rgb_bytes);
     if (!shared.control || !shared.rgb) {
-        pthread_mutex_destroy(&shared.mutex);
+        world_mutex_destroy(&shared.mutex);
         UnloadTexture(texture);
         CloseWindow();
         free(display_rgb);
         goto cleanup_runtime_only;
     }
 
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, generation_worker, &shared) != 0) {
-        pthread_mutex_destroy(&shared.mutex);
+    WorldThread worker;
+    if (world_thread_create(&worker, generation_worker, &shared) != 0) {
+        world_mutex_destroy(&shared.mutex);
         UnloadTexture(texture);
         CloseWindow();
         free(shared.control);
@@ -667,16 +750,16 @@ int main(int argc, char **argv) {
     float playback_interval = playback_interval_seconds(warm_seconds, rgb_frames);
     float *frame_control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
     if (!frame_control) {
-        pthread_mutex_lock(&shared.mutex);
+        world_mutex_lock(&shared.mutex);
         shared.failed = 1;
         shared.stop = 1;
-        pthread_mutex_unlock(&shared.mutex);
+        world_mutex_unlock(&shared.mutex);
     }
     while (!WindowShouldClose()) {
         if (!frame_control) break;
         float frame_seconds = GetFrameTime();
         fill_raylib_control(frame_control, ctrl_dim, cfg.n_buttons, mouse_scale);
-        pthread_mutex_lock(&shared.mutex);
+        world_mutex_lock(&shared.mutex);
         merge_frame_control(&shared, frame_control, frame_seconds);
         int failed = shared.failed;
         if (shared.ready) {
@@ -689,7 +772,7 @@ int main(int argc, char **argv) {
             playback_interval = playback_interval_seconds(last_generation_seconds, rgb_frames);
             UpdateTexture(texture, display_rgb);
         }
-        pthread_mutex_unlock(&shared.mutex);
+        world_mutex_unlock(&shared.mutex);
         if (failed) break;
 
         if (playback_frame < rgb_frames - 1) {
@@ -723,12 +806,12 @@ int main(int argc, char **argv) {
         EndDrawing();
     }
 
-    pthread_mutex_lock(&shared.mutex);
+    world_mutex_lock(&shared.mutex);
     shared.stop = 1;
     int final_failed = shared.failed;
-    pthread_mutex_unlock(&shared.mutex);
-    pthread_join(worker, NULL);
-    pthread_mutex_destroy(&shared.mutex);
+    world_mutex_unlock(&shared.mutex);
+    world_thread_join(worker);
+    world_mutex_destroy(&shared.mutex);
     free(frame_control);
     free(shared.control);
     free(shared.rgb);

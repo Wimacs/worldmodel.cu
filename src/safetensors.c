@@ -10,10 +10,16 @@
 #include <string.h>
 
 #ifdef _WIN32
-#define fseeko _fseeki64
-#define ftello _ftelli64
 #define strdup _strdup
 #endif
+
+static int safetensors_fseek64(FILE *f, uint64_t off) {
+#ifdef _WIN32
+    return _fseeki64(f, (__int64)off, SEEK_SET);
+#else
+    return fseeko(f, (off_t)off, SEEK_SET);
+#endif
+}
 
 static const char *skip_ws(const char *p) {
     while (*p && isspace((unsigned char)*p)) p++;
@@ -297,7 +303,7 @@ int safetensors_read_tensor(const SafeTensors *st, const SafeTensorEntry *entry,
         return 1;
     }
     uint64_t off = 8 + st->header_len + entry->begin;
-    if (fseeko(f, (off_t)off, SEEK_SET) != 0) {
+    if (safetensors_fseek64(f, off) != 0) {
         fclose(f);
         free(data);
         return 1;
