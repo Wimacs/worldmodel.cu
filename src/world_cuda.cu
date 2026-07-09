@@ -7,6 +7,16 @@
 #include <cudnn.h>
 #endif
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <math.h>
 #include <errno.h>
 #include <stdint.h>
@@ -3023,9 +3033,21 @@ static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
 }
 
 static double monotonic_seconds(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    static int have_freq = 0;
+    LARGE_INTEGER now;
+    if (!have_freq) {
+        QueryPerformanceFrequency(&freq);
+        have_freq = 1;
+    }
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+#endif
 }
 
 extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {

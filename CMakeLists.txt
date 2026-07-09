@@ -50,7 +50,7 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if(WORLD_ENABLE_CUDA AND Python3_Interpreter_FOUND)
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import pathlib; import nvidia.cudnn as c; p=pathlib.Path(c.__file__).resolve().parent; print(p/'include'); print(p/'lib')"
+    COMMAND ${Python3_EXECUTABLE} -c "import pathlib; import nvidia.cudnn as c; paths=list(getattr(c, '__path__', []) or []); p=pathlib.Path(paths[0] if paths else c.__file__).resolve(); p=p if p.is_dir() else p.parent; print(p/'include'); print(p/'lib'); print(p/'bin')"
     RESULT_VARIABLE CUDNN_PY_RESULT
     OUTPUT_VARIABLE CUDNN_PY_OUTPUT
     ERROR_QUIET
@@ -60,6 +60,7 @@ if(WORLD_ENABLE_CUDA AND Python3_Interpreter_FOUND)
     string(REPLACE "\n" ";" CUDNN_PY_HINTS "${CUDNN_PY_OUTPUT}")
     list(GET CUDNN_PY_HINTS 0 CUDNN_INCLUDE_HINT)
     list(GET CUDNN_PY_HINTS 1 CUDNN_LIBRARY_HINT)
+    list(GET CUDNN_PY_HINTS 2 CUDNN_RUNTIME_HINT)
   endif()
 endif()
 
@@ -77,6 +78,43 @@ if(WORLD_ENABLE_CUDA)
     HINTS ${CUDNN_LIBRARY_HINT} ${CUDNN_ROOT_HINTS}
     PATH_SUFFIXES lib lib64 lib/x64
   )
+  find_file(CUDNN_RUNTIME_DLL
+    NAMES cudnn64_9.dll libcudnn.so.9
+    HINTS ${CUDNN_RUNTIME_HINT} ${CUDNN_ROOT_HINTS}
+    PATH_SUFFIXES bin lib lib64 lib/x64
+  )
+  if(MSVC AND CUDNN_INCLUDE_DIR AND NOT CUDNN_LIBRARY AND CUDNN_RUNTIME_DLL)
+    get_filename_component(CUDNN_RUNTIME_DLL_DIR "${CUDNN_RUNTIME_DLL}" DIRECTORY)
+    get_filename_component(CUDNN_RUNTIME_DLL_NAME "${CUDNN_RUNTIME_DLL}" NAME)
+    set(CUDNN_GENERATED_LIB_DIR "${CMAKE_CURRENT_BINARY_DIR}/cudnn-import")
+    set(CUDNN_GENERATED_DEF "${CUDNN_GENERATED_LIB_DIR}/cudnn.def")
+    set(CUDNN_GENERATED_LIB "${CUDNN_GENERATED_LIB_DIR}/cudnn.lib")
+    get_filename_component(MSVC_TOOL_DIR "${CMAKE_LINKER}" DIRECTORY)
+    find_program(CUDNN_DUMPBIN_EXECUTABLE
+      NAMES dumpbin dumpbin.exe
+      HINTS "${MSVC_TOOL_DIR}"
+    )
+    if(CUDNN_DUMPBIN_EXECUTABLE AND CMAKE_AR)
+      execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${CUDNN_GENERATED_LIB_DIR}")
+      execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import re, subprocess, sys, pathlib; dumpbin, dll, dll_name, out_def = sys.argv[1:5]; txt = subprocess.check_output([dumpbin, '/exports', dll], text=True, errors='ignore'); names = []; pat = re.compile(r'^\\s*\\d+\\s+[0-9A-Fa-f]+\\s+[0-9A-Fa-f]+\\s+(\\S+)');\nfor line in txt.splitlines():\n    m = pat.match(line)\n    if m:\n        name = m.group(1)\n        if name not in names:\n            names.append(name)\npathlib.Path(out_def).write_text('LIBRARY ' + dll_name + '\\nEXPORTS\\n' + ''.join('    ' + n + '\\n' for n in names), encoding='ascii')"
+          "${CUDNN_DUMPBIN_EXECUTABLE}"
+          "${CUDNN_RUNTIME_DLL}"
+          "${CUDNN_RUNTIME_DLL_NAME}"
+          "${CUDNN_GENERATED_DEF}"
+        RESULT_VARIABLE CUDNN_DEF_RESULT
+      )
+      if(CUDNN_DEF_RESULT EQUAL 0)
+        execute_process(
+          COMMAND ${CMAKE_AR} /nologo /def:${CUDNN_GENERATED_DEF} /machine:x64 /out:${CUDNN_GENERATED_LIB}
+          RESULT_VARIABLE CUDNN_LIB_RESULT
+        )
+        if(CUDNN_LIB_RESULT EQUAL 0)
+          set(CUDNN_LIBRARY "${CUDNN_GENERATED_LIB}" CACHE FILEPATH "Generated cuDNN import library" FORCE)
+        endif()
+      endif()
+    endif()
+  endif()
   if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
     add_library(CUDNN::cudnn UNKNOWN IMPORTED)
     set_target_properties(CUDNN::cudnn PROPERTIES
@@ -84,6 +122,9 @@ if(WORLD_ENABLE_CUDA)
       INTERFACE_INCLUDE_DIRECTORIES "${CUDNN_INCLUDE_DIR}"
     )
     get_filename_component(CUDNN_LIBRARY_DIR "${CUDNN_LIBRARY}" DIRECTORY)
+    if(CUDNN_RUNTIME_DLL)
+      get_filename_component(CUDNN_RUNTIME_DIR "${CUDNN_RUNTIME_DLL}" DIRECTORY)
+    endif()
     message(STATUS "cuDNN found: ${CUDNN_LIBRARY}")
   else()
     message(STATUS "cuDNN not found; VAE decoder will use built-in CUDA conv kernels")
@@ -94,7 +135,13 @@ function(enable_optional_cudnn target_name)
   if(TARGET CUDNN::cudnn)
     target_link_libraries(${target_name} PRIVATE CUDNN::cudnn)
     target_compile_definitions(${target_name} PRIVATE WORLD_USE_CUDNN=1)
-    if(NOT WIN32)
+    if(WIN32 AND CUDNN_RUNTIME_DIR)
+      add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CUDNN_RUNTIME_DIR}"
+          "$<TARGET_FILE_DIR:${target_name}>"
+      )
+    elseif(NOT WIN32)
       set_target_properties(${target_name} PROPERTIES BUILD_RPATH "${CUDNN_LIBRARY_DIR}")
     endif()
   endif()

@@ -8,6 +8,12 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+#ifndef NOUSER
+#define NOUSER
+#endif
 #endif
 
 #include "raylib.h"
@@ -31,6 +37,7 @@
 #ifdef _WIN32
 typedef CRITICAL_SECTION WorldMutex;
 typedef HANDLE WorldThread;
+typedef DWORD (WINAPI *WorldThreadFn)(void *);
 #define WORLD_THREAD_RETURN DWORD WINAPI
 #define WORLD_THREAD_OK 0
 
@@ -51,7 +58,7 @@ static void world_mutex_unlock(WorldMutex *m) {
     LeaveCriticalSection(m);
 }
 
-static int world_thread_create(WorldThread *thread, WORLD_THREAD_RETURN (*fn)(void *), void *arg) {
+static int world_thread_create(WorldThread *thread, WorldThreadFn fn, void *arg) {
     *thread = CreateThread(NULL, 0, fn, arg, 0, NULL);
     return *thread == NULL;
 }
@@ -64,6 +71,7 @@ static void world_thread_join(WorldThread thread) {
 #else
 typedef pthread_mutex_t WorldMutex;
 typedef pthread_t WorldThread;
+typedef void *(*WorldThreadFn)(void *);
 #define WORLD_THREAD_RETURN void *
 #define WORLD_THREAD_OK NULL
 
@@ -83,7 +91,7 @@ static void world_mutex_unlock(WorldMutex *m) {
     pthread_mutex_unlock(m);
 }
 
-static int world_thread_create(WorldThread *thread, WORLD_THREAD_RETURN (*fn)(void *), void *arg) {
+static int world_thread_create(WorldThread *thread, WorldThreadFn fn, void *arg) {
     return pthread_create(thread, NULL, fn, arg);
 }
 
