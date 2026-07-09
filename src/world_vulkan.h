@@ -93,6 +93,7 @@ int world_vulkan_cache_frame_indices_probe(void);
 int world_vulkan_patchify_f32_probe(void);
 int world_vulkan_unpatchify_f32_probe(void);
 int world_vulkan_indexed_attention_f32_probe(void);
+int world_vulkan_gemm_autotune_main(int argc, char **argv);
 
 #ifdef __cplusplus
 }

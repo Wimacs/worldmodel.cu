@@ -1,0 +1,7 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define GEMM_INPUT_F16 0
+#define GEMM_TILE_N 8
+#define GEMM_STAGE_B 1
+#define GEMM_EPILOGUE 2
+#include "gemm_wf16_coopmat_template.comp"

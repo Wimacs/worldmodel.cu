@@ -90,6 +90,9 @@ if(WORLD_ENABLE_VULKAN)
   find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
   set(WORLD_VULKAN_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders/vulkan)
+  set(WORLD_VULKAN_SHADER_INCLUDE_DEPS
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/gemm_wf16_coopmat_template.comp
+  )
   set(WORLD_VULKAN_SHADER_SOURCES
     add_bias_silu_f32.comp
     add_channel_silu_f32.comp
@@ -98,6 +101,7 @@ if(WORLD_ENABLE_VULKAN)
     cache_frame_indices.comp
     fill_rgba.comp
     gated_residual_add_f32.comp
+    cast_f32_to_f16.comp
     indexed_attention_d64_flash24w_f32.comp
     indexed_attention_d64_flash24w_k96_f32.comp
     indexed_attention_d64_flash32w_f32.comp
@@ -106,6 +110,8 @@ if(WORLD_ENABLE_VULKAN)
     indexed_attention_d64_flash_f32.comp
     indexed_attention_d64_splitk32_part_f32.comp
     indexed_attention_d64_splitk64_part_f32.comp
+    indexed_attention_d64_splitk64_w32_part_f32.comp
+    indexed_attention_d64_splitk64_part_kvf16_f32.comp
     indexed_attention_d64_splitk96_part_f32.comp
     indexed_attention_d64_splitk64_reduce_f32.comp
     indexed_attention_d64_warp_f32.comp
@@ -114,13 +120,33 @@ if(WORLD_ENABLE_VULKAN)
     kv_cache_upsert_copy_f16.comp
     kv_cache_upsert_copy_f32.comp
     lerp_inplace_f32.comp
+    gemm_f16x_wf16_n8.comp
+    gemm_f16x_wf16_n16.comp
+    gemm_f16x_wf16_n32.comp
+    gemm_f32x_wf16_n8_stageb.comp
+    gemm_f32x_wf16_n16_stageb.comp
+    gemm_f32x_wf16_n32.comp
+    gemm_f32x_wf16_silu_f16_n8_stageb.comp
+    gemm_f32x_wf16_silu_f16_n16_stageb.comp
+    gemm_f32x_wf16_silu_f16_n32.comp
+    gemm_f16x_wf16_silu_f16_n8.comp
+    gemm_f16x_wf16_silu_f16_n16.comp
+    gemm_f16x_wf16_silu_f16_n32.comp
+    gemm_f32x_wf16_gated_n8_stageb.comp
+    gemm_f32x_wf16_gated_n16_stageb.comp
+    gemm_f32x_wf16_gated_n32.comp
+    gemm_f16x_wf16_gated_n8.comp
+    gemm_f16x_wf16_gated_n16.comp
+    gemm_f16x_wf16_gated_n32.comp
     linear_f16_coopmat.comp
     linear_f16x_wf16_gated_residual.comp
     linear_f16x_wf16_gated_residual_n16.comp
     linear_f16x_wf16_gated_residual_n32.comp
+    linear_f16x_wf16_gated_residual_wg4.comp
     linear_f16x_wf16_coopmat.comp
     linear_f32_coopmat.comp
     linear_f32_wf16_silu_f16_n32.comp
+    linear_f16x_wf16_silu_f16_n32.comp
     linear_f32_wf16_coopmat.comp
     linear_f32_wf16_coopmat_n16.comp
     linear_f32_wf16_coopmat_n32.comp
@@ -158,8 +184,8 @@ if(WORLD_ENABLE_VULKAN)
     add_custom_command(
       OUTPUT ${shader_spv}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${WORLD_VULKAN_SHADER_OUTPUT_DIR}
-      COMMAND ${GLSLC_EXECUTABLE} -O --target-env=vulkan1.2 ${shader_src} -o ${shader_spv}
-      DEPENDS ${shader_src}
+      COMMAND ${GLSLC_EXECUTABLE} -O --target-env=vulkan1.2 -I ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan ${shader_src} -o ${shader_spv}
+      DEPENDS ${shader_src} ${WORLD_VULKAN_SHADER_INCLUDE_DEPS}
       VERBATIM
     )
     list(APPEND WORLD_VULKAN_SHADER_SPV ${shader_spv})
@@ -179,6 +205,23 @@ if(WORLD_ENABLE_VULKAN)
     WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
   )
   target_link_libraries(worldmodel_vulkan_probe PRIVATE
+    Vulkan::Vulkan
+    m
+  )
+
+  add_executable(worldmodel_vulkan_gemm_autotune
+    src/world_vulkan_gemm_autotune.c
+    src/world_config.c
+    src/world_vulkan.c
+  )
+  add_dependencies(worldmodel_vulkan_gemm_autotune worldmodel_vulkan_shaders)
+  target_include_directories(worldmodel_vulkan_gemm_autotune PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_compile_definitions(worldmodel_vulkan_gemm_autotune PRIVATE
+    WORLD_VULKAN_SHADER_DIR="${WORLD_VULKAN_SHADER_OUTPUT_DIR}"
+  )
+  target_link_libraries(worldmodel_vulkan_gemm_autotune PRIVATE
     Vulkan::Vulkan
     m
   )
