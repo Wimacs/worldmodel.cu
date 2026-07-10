@@ -56,6 +56,9 @@ VAE：
 - `WORLD_VAE_PROFILE=1` 会在 VAE conv 内部打开 CUDA event 分段计时，输出 direct、1x1 GEMM、3x3 im2col/GEMM/bias 时间。这个模式会同步每段 kernel，只用于诊断，不用于正常 FPS。
 - 当前 1-layer/4-step headless smoke 对照：默认 tile 16384 `vae=69.233ms`；旧 tile 4096 profile-mode `vae=116.244ms`；全 direct conv `vae=294.243ms`。
 - 当前 profiling 结果：默认 tile 16384 per-frame path 是 `1x1_gemm=1.314ms/16 launches`，`3x3_im2col=24.346ms/496 tiles`，`3x3_gemm=34.252ms/496 tiles`，`3x3_bias=1.486ms`；旧 tile 4096 是 `1784 tiles`、`3x3_gemm=65.235ms`。下一步大头仍是 3x3 GEMM，但主要 launch 数已经降了一轮。
+- CUTLASS implicit-GEMM 3x3 NHWC/KRSC probe 已加入 PyTorch extension：`taehv_conv3x3_cutlass_implicit_nhwc`。它使用 F32 SIMT、same padding、alignment=1，先保证任意小 shape 能严格对拍。
+- 小型 CUDA event probe 显示 implicit NHWC core 确实能绕开 im2col 物化：`N=4,Cin=64,Cout=64,H=64,W=128` 时，现有 batched im2col path `0.220ms`，implicit NHWC core `0.115ms`，临时 `NCHW->NHWC->NCHW` 包裹后 `0.157ms`；`Cout=128` 时分别是 `0.282ms`、`0.197ms`、`0.269ms`。
+- 因此这一版的决策是：不把“每层临时转 NHWC 再转回 NCHW”的实现接入默认 runtime；下一版如果继续攻 VAE，应做连续 NHWC VAE island 或完整 NHWC/FP16 路径，让 layout 转换只发生在边界。
 
 Attention：
 
@@ -150,8 +153,9 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
 2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
-3. frame-batched tile 实验证明“简单合并 frame 维”不值得进默认；下一版如果继续攻 VAE，应比较 CUTLASS implicit-GEMM conv 或真正 grouped/batched GEMM，而不是围绕当前 tile 做无休止参数搜索。
-4. 最后考虑 NHWC/FP16 全路径和 bias/ReLU fusion。
+3. frame-batched tile 实验证明“简单合并 frame 维”不值得进默认。
+4. CUTLASS implicit-GEMM NHWC probe 已证明 core 有收益，但逐层临时 layout 转换收益不稳定；下一版应做连续 NHWC VAE island，而不是围绕当前 tile 做无休止参数搜索。
+5. 最后考虑 FP16 全路径、bias/ReLU fusion，以及真实 VAE shape 的少量专用 tensor-op/TF32 变体。
 
 ## 对拍规则
 
