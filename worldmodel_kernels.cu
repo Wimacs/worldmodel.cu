@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cutlass/cutlass.h>
@@ -620,6 +621,73 @@ __global__ void indexed_attention_d64_warp_f32_kernel(
     }
 }
 
+__global__ void indexed_attention_d64_warp_f16_kv_kernel(
+        const float *__restrict__ q,
+        const __half *__restrict__ k,
+        const __half *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        float *__restrict__ out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Nkv,
+        int Tk,
+        float scale) {
+    int warp_row = ((int)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int total_rows = B * Hq * Tq;
+    if (warp_row >= total_rows) return;
+
+    int tq = warp_row % Tq;
+    int hq = (warp_row / Tq) % Hq;
+    int b = warp_row / (Tq * Hq);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const float *qrow = q + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+    const __half *kbase = k + ((int64_t)b * Hkv + hk) * Tk * 64;
+    const __half *vbase = v + ((int64_t)b * Hkv + hk) * Tk * 64;
+    float *orow = out + (((int64_t)b * Hq + hq) * Tq + tq) * 64;
+
+    int d0 = lane << 1;
+    float q0 = qrow[d0];
+    float q1 = qrow[d0 + 1];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        const __half2 *krow = (const __half2 *)(kbase + (int64_t)tk * 64);
+        float2 k2 = __half22float2(krow[lane]);
+        float dot = wm_warp_sum(q0 * k2.x + q1 * k2.y);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        float score = dot * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        const __half2 *vrow = (const __half2 *)(vbase + (int64_t)tk * 64);
+        float2 v2 = __half22float2(vrow[lane]);
+        acc0 = acc0 * alpha + beta * v2.x;
+        acc1 = acc1 * alpha + beta * v2.y;
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (Nkv > 0) {
+        float inv_l = 1.0f / l;
+        orow[d0] = acc0 * inv_l;
+        orow[d0 + 1] = acc1 * inv_l;
+    } else {
+        orow[d0] = 0.0f;
+        orow[d0 + 1] = 0.0f;
+    }
+}
+
 __global__ void indexed_attention_d64_q4_shared_f32_kernel(
         const float *__restrict__ q,
         const float *__restrict__ k,
@@ -928,6 +996,56 @@ __global__ void kv_cache_upsert_copy_f32_kernel(
 
     float kv = k[src];
     float vv = v[src];
+    cache_k[tail] = kv;
+    cache_v[tail] = vv;
+    if (!frozen) {
+        cache_k[dst] = kv;
+        cache_v[dst] = vv;
+    }
+
+    if (b == 0 && h == 0 && d == 0) {
+        written[tail_idx] = true;
+        if (!frozen) {
+            written[dst_idx] = true;
+        }
+    }
+}
+
+__global__ void kv_cache_upsert_copy_f16_kernel(
+        __half *cache_k,
+        __half *cache_v,
+        const float *k,
+        const float *v,
+        bool *written,
+        int B,
+        int H,
+        int T,
+        int D,
+        int L,
+        int base,
+        bool write_step,
+        bool frozen) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * H * T * D;
+    if (i >= total) return;
+
+    int d = i % D;
+    int64_t q = i / D;
+    int t = q % T;
+    q /= T;
+    int h = q % H;
+    int b = q / H;
+
+    int tail_idx = L + t;
+    int ring_idx = base + t;
+    int dst_idx = (!frozen && write_step) ? ring_idx : tail_idx;
+
+    int64_t src = (((int64_t)b * H + h) * T + t) * D + d;
+    int64_t tail = (((int64_t)b * H + h) * (L + T) + tail_idx) * D + d;
+    int64_t dst = (((int64_t)b * H + h) * (L + T) + dst_idx) * D + d;
+
+    __half kv = __float2half_rn(k[src]);
+    __half vv = __float2half_rn(v[src]);
     cache_k[tail] = kv;
     cache_v[tail] = vv;
     if (!frozen) {
@@ -2096,6 +2214,55 @@ torch::Tensor indexed_attention_flash_cuda(
     return out;
 }
 
+torch::Tensor indexed_attention_half_kv_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F16(k);
+    WM_CHECK_F16(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "indexed_attention_half_kv currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+
+    auto out = torch::empty_like(q);
+    indexed_attention_d64_warp_f16_kv_kernel<<<div_up_i64((int64_t)B * Hq * Tq, 4), 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        reinterpret_cast<const __half *>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(v.data_ptr<at::Half>()),
+        indices.data_ptr<int64_t>(),
+        out.data_ptr<float>(),
+        B,
+        Hq,
+        Hkv,
+        Tq,
+        Nkv,
+        Tk,
+        (float)scale);
+    check_last_cuda_error("indexed_attention_d64_warp_f16_kv");
+    return out;
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -2173,6 +2340,87 @@ torch::Tensor kv_cache_upsert_cuda(
         write_step,
         frozen);
     check_last_cuda_error("kv_cache_upsert_copy");
+
+    return mask_written;
+}
+
+torch::Tensor kv_cache_upsert_half_cuda(
+        torch::Tensor cache_k,
+        torch::Tensor cache_v,
+        torch::Tensor written,
+        torch::Tensor k,
+        torch::Tensor v,
+        int64_t frame_idx,
+        int64_t ring_length,
+        int64_t pinned_dilation,
+        bool frozen) {
+    WM_CHECK_CUDA(cache_k);
+    WM_CHECK_CUDA(cache_v);
+    WM_CHECK_CUDA(written);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CONTIGUOUS(cache_k);
+    WM_CHECK_CONTIGUOUS(cache_v);
+    WM_CHECK_CONTIGUOUS(written);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_F16(cache_k);
+    WM_CHECK_F16(cache_v);
+    WM_CHECK_F32(k);
+    WM_CHECK_F32(v);
+    TORCH_CHECK(written.scalar_type() == at::ScalarType::Bool, "written must be bool");
+    TORCH_CHECK(cache_k.sizes() == cache_v.sizes(), "cache_k/cache_v shape mismatch");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k/v shape mismatch");
+    TORCH_CHECK(cache_k.dim() == 4 && k.dim() == 4, "cache and k/v must be [B,H,T,D]");
+    TORCH_CHECK(cache_k.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(cache_k.size(1) == k.size(1), "H mismatch");
+    TORCH_CHECK(cache_k.size(3) == k.size(3), "D mismatch");
+    TORCH_CHECK(frame_idx >= 0, "frame_idx must be non-negative");
+    TORCH_CHECK(ring_length > 0, "ring_length must be positive");
+    TORCH_CHECK(pinned_dilation > 0, "pinned_dilation must be positive");
+
+    int B = (int)k.size(0);
+    int H = (int)k.size(1);
+    int T = (int)k.size(2);
+    int D = (int)k.size(3);
+    int L = (int)ring_length;
+    int capacity = (int)cache_k.size(2);
+    TORCH_CHECK(capacity == L + T, "cache capacity must equal ring_length + T");
+    TORCH_CHECK(written.numel() == capacity, "written length must equal cache capacity");
+    TORCH_CHECK(L % T == 0, "ring_length must be divisible by T");
+    TORCH_CHECK((L / T) % pinned_dilation == 0, "ring frames must be divisible by pinned_dilation");
+
+    int64_t bucket = (frame_idx + (pinned_dilation - 1)) / pinned_dilation;
+    int64_t num_buckets = (L / T) / pinned_dilation;
+    int base = (int)((bucket % num_buckets) * T);
+    bool write_step = (frame_idx % pinned_dilation) == 0;
+
+    auto mask_written = torch::empty_like(written);
+    kv_cache_mask_kernel<<<div_up_i64(capacity, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        written.data_ptr<bool>(),
+        mask_written.data_ptr<bool>(),
+        capacity,
+        T,
+        base,
+        write_step);
+    check_last_cuda_error("kv_cache_mask_half");
+
+    int64_t total = (int64_t)B * H * T * D;
+    kv_cache_upsert_copy_f16_kernel<<<div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<__half *>(cache_k.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(cache_v.data_ptr<at::Half>()),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        written.data_ptr<bool>(),
+        B,
+        H,
+        T,
+        D,
+        L,
+        base,
+        write_step,
+        frozen);
+    check_last_cuda_error("kv_cache_upsert_copy_half");
 
     return mask_written;
 }
@@ -2917,7 +3165,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
     m.def("indexed_attention", &indexed_attention_cuda, "WorldModel indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_flash", &indexed_attention_flash_cuda, "WorldModel fused online-softmax indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("indexed_attention_half_kv", &indexed_attention_half_kv_cuda, "WorldModel indexed GQA attention with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
+    m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
     m.def("patchify", &patchify_cuda, "WorldModel patchify Conv2d + token layout (CUDA, f32)");
     m.def("patchify_cutlass", &patchify_cutlass_cuda, "WorldModel patchify im2row + CUTLASS GEMM (CUDA, f32)");

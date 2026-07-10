@@ -352,6 +352,27 @@ def test_indexed_attention_flash_matches_masked_attention_reference(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=3e-5, atol=3e-5)
 
 
+def test_indexed_attention_half_kv_matches_half_reference(wm_cuda):
+    torch.manual_seed(23)
+    b, hq, hkv, tq, tk, d = 2, 8, 2, 13, 31, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    indices = torch.tensor([0, 1, 4, 8, 13, 21, 30], device="cuda", dtype=torch.long)
+    scale = d ** -0.5
+
+    y = wm_cuda.indexed_attention_half_kv(q, k, v, indices, scale)
+
+    group = hq // hkv
+    k_gqa = k.float().repeat_interleave(group, dim=1)
+    v_gqa = v.float().repeat_interleave(group, dim=1)
+    scores = torch.einsum("bhtd,bhkd->bhtk", q, k_gqa[:, :, indices, :]) * scale
+    probs = torch.softmax(scores, dim=-1)
+    ref = torch.einsum("bhtn,bhnd->bhtd", probs, v_gqa[:, :, indices, :])
+
+    torch.testing.assert_close(y, ref, rtol=8e-4, atol=8e-4)
+
+
 def _ref_kv_cache_upsert(cache_k, cache_v, written, k, v, frame_idx, ring_length, pinned_dilation, frozen):
     t = k.shape[2]
     bucket = (frame_idx + (pinned_dilation - 1)) // pinned_dilation
@@ -420,6 +441,31 @@ def test_kv_cache_upsert_matches_unfrozen_pinned_dilation(wm_cuda):
     ref_mask = _ref_kv_cache_upsert(ref_k, ref_v, ref_written, k, v, frame_idx=5, ring_length=ring_length, pinned_dilation=2, frozen=False)
 
     mask = wm_cuda.kv_cache_upsert(cache_k, cache_v, written, k, v, 5, ring_length, 2, False)
+    torch.testing.assert_close(cache_k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(cache_v, ref_v, rtol=0, atol=0)
+    torch.testing.assert_close(written, ref_written, rtol=0, atol=0)
+    torch.testing.assert_close(mask, ref_mask, rtol=0, atol=0)
+
+
+def test_kv_cache_upsert_half_matches_half_reference(wm_cuda):
+    torch.manual_seed(9)
+    b, h, t, d = 1, 3, 4, 64
+    ring_length = 32
+    capacity = ring_length + t
+    cache_k = torch.zeros(b, h, capacity, d, device="cuda", dtype=torch.float16)
+    cache_v = torch.zeros(b, h, capacity, d, device="cuda", dtype=torch.float16)
+    written = torch.zeros(capacity, device="cuda", dtype=torch.bool)
+    written[0:8] = True
+    written[ring_length:] = True
+    k = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+    v = torch.randn(b, h, t, d, device="cuda", dtype=torch.float32)
+
+    ref_k = cache_k.clone()
+    ref_v = cache_v.clone()
+    ref_written = written.clone()
+    ref_mask = _ref_kv_cache_upsert(ref_k, ref_v, ref_written, k.half(), v.half(), frame_idx=6, ring_length=ring_length, pinned_dilation=2, frozen=False)
+
+    mask = wm_cuda.kv_cache_upsert_half(cache_k, cache_v, written, k, v, 6, ring_length, 2, False)
     torch.testing.assert_close(cache_k, ref_k, rtol=0, atol=0)
     torch.testing.assert_close(cache_v, ref_v, rtol=0, atol=0)
     torch.testing.assert_close(written, ref_written, rtol=0, atol=0)
@@ -634,8 +680,10 @@ if __name__ == "__main__":
         test_masked_attention_matches_torch_gqa_written_mask,
         test_indexed_attention_matches_masked_attention_reference,
         test_indexed_attention_flash_matches_masked_attention_reference,
+        test_indexed_attention_half_kv_matches_half_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
+        test_kv_cache_upsert_half_matches_half_reference,
         test_cache_frame_indices_matches_mask_nonzero_reference,
         test_patchify_matches_torch_conv2d_layout,
         test_patchify_cutlass_matches_torch_conv2d_layout,

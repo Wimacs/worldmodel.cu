@@ -558,6 +558,52 @@ __global__ static void kv_cache_upsert_copy_f32_kernel(
     }
 }
 
+__global__ static void kv_cache_upsert_copy_f16_kernel(
+        __half *cache_k,
+        __half *cache_v,
+        const float *k,
+        const float *v,
+        bool *written,
+        int H,
+        int T,
+        int D,
+        int ring_length,
+        int base,
+        bool write_step,
+        bool frozen) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H * T * D;
+    if (i >= total) return;
+
+    int d = (int)(i % D);
+    int64_t q = i / D;
+    int t = (int)(q % T);
+    int h = (int)(q / T);
+
+    int tail_idx = ring_length + t;
+    int ring_idx = base + t;
+    int dst_idx = (!frozen && write_step) ? ring_idx : tail_idx;
+
+    int capacity = ring_length + T;
+    int64_t src = ((int64_t)h * T + t) * D + d;
+    int64_t tail = ((int64_t)h * capacity + tail_idx) * D + d;
+    int64_t dst = ((int64_t)h * capacity + dst_idx) * D + d;
+
+    __half kv = __float2half_rn(k[src]);
+    __half vv = __float2half_rn(v[src]);
+    cache_k[tail] = kv;
+    cache_v[tail] = vv;
+    if (!frozen) {
+        cache_k[dst] = kv;
+        cache_v[dst] = vv;
+    }
+
+    if (h == 0 && d == 0) {
+        written[tail_idx] = true;
+        if (!frozen) written[dst_idx] = true;
+    }
+}
+
 __global__ static void collect_cache_frame_indices_kernel(
         const bool *written,
         int64_t *indices,
@@ -723,6 +769,72 @@ __global__ static void indexed_attention_cache_d64_warp_f32_kernel(
     } else {
         orow[lane] = 0.0f;
         orow[lane + 32] = 0.0f;
+    }
+}
+
+__global__ static void indexed_attention_cache_d64_warp_f16_kv_kernel(
+        const float *__restrict__ q,
+        const __half *__restrict__ cache_k,
+        const __half *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        const int *__restrict__ index_count,
+        float *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+    int warp_row = ((int)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    int total_rows = Hq * Tq;
+    if (warp_row >= total_rows) return;
+
+    int tq = warp_row % Tq;
+    int hq = warp_row / Tq;
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int Nkv = *index_count;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const float *qrow = q + (((int64_t)hq * Tq + tq) * 64);
+    const __half *kbase = cache_k + (int64_t)hk * Tk * 64;
+    const __half *vbase = cache_v + (int64_t)hk * Tk * 64;
+    float *orow = out_tokens + (int64_t)tq * (Hq * 64) + hq * 64;
+
+    int d0 = lane << 1;
+    float q0 = qrow[d0];
+    float q1 = qrow[d0 + 1];
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n = 0; n < Nkv; ++n) {
+        int tk = (int)indices[n];
+        const __half2 *krow = (const __half2 *)(kbase + (int64_t)tk * 64);
+        float2 k2 = __half22float2(krow[lane]);
+        float dot = wm_warp_sum(q0 * k2.x + q1 * k2.y);
+        dot = __shfl_sync(0xffffffffu, dot, 0);
+        float score = dot * scale;
+        float new_m = fmaxf(m, score);
+        float alpha = expf(m - new_m);
+        float beta = expf(score - new_m);
+        const __half2 *vrow = (const __half2 *)(vbase + (int64_t)tk * 64);
+        float2 v2 = __half22float2(vrow[lane]);
+        acc0 = acc0 * alpha + beta * v2.x;
+        acc1 = acc1 * alpha + beta * v2.y;
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (Nkv > 0) {
+        float inv_l = 1.0f / l;
+        orow[d0] = acc0 * inv_l;
+        orow[d0 + 1] = acc1 * inv_l;
+    } else {
+        orow[d0] = 0.0f;
+        orow[d0 + 1] = 0.0f;
     }
 }
 
@@ -1975,6 +2087,8 @@ typedef struct {
 typedef struct {
     float *k;
     float *v;
+    __half *k_h;
+    __half *v_h;
     bool *written;
     int64_t *indices;
     int *index_count;
@@ -2016,6 +2130,8 @@ static void free_device_world_caches(DeviceWorldLayerCache *caches, int n_layers
     for (int i = 0; i < n_layers; ++i) {
         cudaFree(caches[i].k);
         cudaFree(caches[i].v);
+        cudaFree(caches[i].k_h);
+        cudaFree(caches[i].v_h);
         cudaFree(caches[i].written);
         cudaFree(caches[i].indices);
         cudaFree(caches[i].index_count);
@@ -2029,7 +2145,8 @@ static int alloc_device_world_caches(
         int n_layers,
         int T,
         int n_kv_heads,
-        int d_head) {
+        int d_head,
+        int alloc_half_cache) {
     *dst_caches = NULL;
     DeviceWorldLayerCache *caches = (DeviceWorldLayerCache *)calloc((size_t)n_layers, sizeof(*caches));
     if (!caches) return 1;
@@ -2049,11 +2166,19 @@ static int alloc_device_world_caches(
         size_t kv_elems = (size_t)n_kv_heads * c->capacity * d_head;
         if (cudaMalloc((void **)&c->k, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->v, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        if (alloc_half_cache) {
+            if (cudaMalloc((void **)&c->k_h, kv_elems * sizeof(__half)) != cudaSuccess) goto fail;
+            if (cudaMalloc((void **)&c->v_h, kv_elems * sizeof(__half)) != cudaSuccess) goto fail;
+        }
         if (cudaMalloc((void **)&c->written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->indices, (size_t)c->capacity * sizeof(int64_t)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->index_count, sizeof(int)) != cudaSuccess) goto fail;
         if (cudaMemset(c->k, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (cudaMemset(c->v, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
+        if (alloc_half_cache) {
+            if (cudaMemset(c->k_h, 0, kv_elems * sizeof(__half)) != cudaSuccess) goto fail;
+            if (cudaMemset(c->v_h, 0, kv_elems * sizeof(__half)) != cudaSuccess) goto fail;
+        }
         init_cache_written_kernel<<<div_up_i64(c->capacity, 256), 256>>>(c->written, c->ring_length, T);
         if (cudaGetLastError() != cudaSuccess) goto fail;
     }
@@ -3346,6 +3471,7 @@ struct WorldCudaRuntime {
     void *d_splitk_workspace;
     int attn_flash_enabled;
     int attn_q4_shared_enabled;
+    int attn_half_cache_enabled;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
     cudaEvent_t ev_step_start;
@@ -3774,18 +3900,34 @@ extern "C" int world_cuda_runtime_create(
     if (copy_f32_to_device(&rt->d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto fail;
     if (copy_f32_to_device(&rt->d_unpatch_b, weights->unpatchify_bias, (size_t)rt->C)) goto fail;
     if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
-    if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head)) goto fail;
     flash_attn_env = getenv("WORLD_FLASH_ATTN");
     rt->attn_flash_enabled = flash_attn_env ? flash_attn_env[0] != '0' : 0;
-    if (rt->attn_flash_enabled) {
-        fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for D=64 cache layers\n");
-    }
     {
         const char *q4_env = getenv("WORLD_ATTN_D64_Q4_SHARED");
         rt->attn_q4_shared_enabled = q4_env ? q4_env[0] != '0' : 0;
-        if (rt->attn_q4_shared_enabled && !rt->attn_flash_enabled) {
-            fprintf(stderr, "D=64 attention q4 shared-KV kernel enabled\n");
+    }
+    {
+        const char *half_env = getenv("WORLD_ATTN_D64_HALF_CACHE");
+        rt->attn_half_cache_enabled = half_env ? half_env[0] != '0' : 0;
+        if (rt->attn_half_cache_enabled && rt->d_head != 64) {
+            fprintf(stderr, "WORLD_ATTN_D64_HALF_CACHE ignored because d_head=%d\n", rt->d_head);
+            rt->attn_half_cache_enabled = 0;
         }
+        if (rt->attn_half_cache_enabled) {
+            if (rt->attn_flash_enabled || rt->attn_q4_shared_enabled) {
+                fprintf(stderr, "WORLD_ATTN_D64_HALF_CACHE uses the warp half-KV path and disables flash/q4 attention probes\n");
+            }
+            rt->attn_flash_enabled = 0;
+            rt->attn_q4_shared_enabled = 0;
+            fprintf(stderr, "D=64 attention FP16 KV cache enabled by WORLD_ATTN_D64_HALF_CACHE=1\n");
+        }
+    }
+    if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head, rt->attn_half_cache_enabled)) goto fail;
+    if (rt->attn_flash_enabled) {
+        fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for D=64 cache layers\n");
+    }
+    if (rt->attn_q4_shared_enabled) {
+        fprintf(stderr, "D=64 attention q4 shared-KV kernel enabled\n");
     }
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
@@ -3963,9 +4105,15 @@ extern "C" int world_cuda_runtime_step_rgb(
             int num_buckets = (cache->ring_length / rt->T) / cache->pinned_dilation;
             int base = (bucket % num_buckets) * rt->T;
             bool write_step = (current_frame_idx % cache->pinned_dilation) == 0;
-            kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * rt->T * rt->d_head, 256), 256>>>(
-                cache->k, cache->v, rt->d_k, d_v_cur, cache->written,
-                cfg->n_kv_heads, rt->T, rt->d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
+            if (rt->attn_half_cache_enabled) {
+                kv_cache_upsert_copy_f16_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * rt->T * rt->d_head, 256), 256>>>(
+                    cache->k_h, cache->v_h, rt->d_k, d_v_cur, cache->written,
+                    cfg->n_kv_heads, rt->T, rt->d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
+            } else {
+                kv_cache_upsert_copy_f32_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * rt->T * rt->d_head, 256), 256>>>(
+                    cache->k, cache->v, rt->d_k, d_v_cur, cache->written,
+                    cfg->n_kv_heads, rt->T, rt->d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
+            }
             STEP_CUDA(cudaGetLastError());
             collect_cache_frame_indices_kernel<<<cache->capacity / rt->T, 256>>>(
                 cache->written, cache->indices, cache->index_count,
@@ -3975,6 +4123,13 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_PROFILE_BEGIN();
             if (rt->d_head == 64) {
                 int attn_done = 0;
+                if (rt->attn_half_cache_enabled) {
+                    indexed_attention_cache_d64_warp_f16_kv_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
+                        rt->d_q, cache->k_h, cache->v_h, cache->indices, cache->index_count, rt->d_attn,
+                        cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                        1.0f / 8.0f);
+                    attn_done = 1;
+                }
                 if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
                     int group = cfg->n_heads / cfg->n_kv_heads;
                     int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
@@ -4983,7 +5138,7 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_f32_to_device(&d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto cleanup_device;
     if (copy_f32_to_device(&d_unpatch_b, weights->unpatchify_bias, (size_t)C)) goto cleanup_device;
     if (copy_world_layers_to_device(&d_layers, weights->layers, layers_to_run, D, kv_dim, mlp_hidden)) goto cleanup_device;
-    if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head)) goto cleanup_device;
+    if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head, 0)) goto cleanup_device;
 
     TRY_CUDA2(cudaMemcpy(d_xy_table, h_xy, (size_t)d_xy * sizeof(float), cudaMemcpyHostToDevice));
     TRY_CUDA2(cudaMemcpy(d_inv_t, h_inv_t, (size_t)d_t * sizeof(float), cudaMemcpyHostToDevice));
