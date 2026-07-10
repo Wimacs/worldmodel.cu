@@ -838,6 +838,101 @@ __global__ static void indexed_attention_cache_d64_warp_f16_kv_kernel(
     }
 }
 
+__global__ static void indexed_attention_cache_d64_flash_f16_kv_kernel(
+        const float *__restrict__ q,
+        const __half *__restrict__ cache_k,
+        const __half *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        const int *__restrict__ index_count,
+        float *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+    extern __shared__ __half smem_h[];
+    __half *sh_k = smem_h;
+    __half *sh_v = sh_k + WORLD_ATTN_D64_K_BLOCK * 64;
+
+    int group = Hq / Hkv;
+    int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
+    if (q_per_h < 1) q_per_h = 1;
+    int q_blocks = (Tq + q_per_h - 1) / q_per_h;
+    int q_block = blockIdx.x % q_blocks;
+    int hk = blockIdx.x / q_blocks;
+    if (hk >= Hkv) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int local_h = warp / q_per_h;
+    int tq = q_block * q_per_h + (warp - local_h * q_per_h);
+    bool valid_q = local_h < group && tq < Tq;
+    int hq = hk * group + local_h;
+
+    int Nkv = *index_count;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const __half *kbase = cache_k + (int64_t)hk * Tk * 64;
+    const __half *vbase = cache_v + (int64_t)hk * Tk * 64;
+    const float *qrow = valid_q ? q + ((int64_t)hq * Tq + tq) * 64 : q;
+    float *orow = valid_q ? out_tokens + (int64_t)tq * (Hq * 64) + hq * 64 : out_tokens;
+
+    int d0 = lane << 1;
+    float q0 = valid_q ? qrow[d0] : 0.0f;
+    float q1 = valid_q ? qrow[d0 + 1] : 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n0 = 0; n0 < Nkv; n0 += WORLD_ATTN_D64_K_BLOCK) {
+        int active = Nkv - n0;
+        if (active > WORLD_ATTN_D64_K_BLOCK) active = WORLD_ATTN_D64_K_BLOCK;
+        int tile_elems = active * 64;
+        for (int i = tid; i < tile_elems; i += blockDim.x) {
+            int n = i >> 6;
+            int d = i & 63;
+            int tk = (int)indices[n0 + n];
+            sh_k[i] = kbase[(int64_t)tk * 64 + d];
+            sh_v[i] = vbase[(int64_t)tk * 64 + d];
+        }
+        __syncthreads();
+
+        if (valid_q) {
+            for (int n = 0; n < active; ++n) {
+                const __half2 *krow = (const __half2 *)(sh_k + n * 64);
+                float2 k2 = __half22float2(krow[lane]);
+                float dot = wm_warp_sum(q0 * k2.x + q1 * k2.y);
+                dot = __shfl_sync(0xffffffffu, dot, 0);
+                float score = dot * scale;
+                float new_m = fmaxf(m, score);
+                float alpha = expf(m - new_m);
+                float beta = expf(score - new_m);
+                const __half2 *vrow = (const __half2 *)(sh_v + n * 64);
+                float2 v2 = __half22float2(vrow[lane]);
+                acc0 = acc0 * alpha + beta * v2.x;
+                acc1 = acc1 * alpha + beta * v2.y;
+                l = l * alpha + beta;
+                m = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_q) {
+        if (Nkv > 0) {
+            float inv_l = 1.0f / l;
+            orow[d0] = acc0 * inv_l;
+            orow[d0 + 1] = acc1 * inv_l;
+        } else {
+            orow[d0] = 0.0f;
+            orow[d0 + 1] = 0.0f;
+        }
+    }
+}
+
 __global__ static void indexed_attention_cache_d64_flash_f32_kernel(
         const float *__restrict__ q,
         const float *__restrict__ cache_k,
@@ -3473,6 +3568,7 @@ struct WorldCudaRuntime {
     int attn_flash_enabled;
     int attn_q4_shared_enabled;
     int attn_half_cache_enabled;
+    int attn_half_flash_enabled;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
     cudaEvent_t ev_step_start;
@@ -3911,18 +4007,25 @@ extern "C" int world_cuda_runtime_create(
     }
     {
         const char *half_env = getenv("WORLD_ATTN_D64_HALF_CACHE");
+        const char *half_flash_env = getenv("WORLD_ATTN_D64_HALF_FLASH");
         rt->attn_half_cache_enabled = half_env ? half_env[0] != '0' : 0;
+        rt->attn_half_flash_enabled = half_flash_env ? half_flash_env[0] != '0' : 0;
         if (rt->attn_half_cache_enabled && rt->d_head != 64) {
             fprintf(stderr, "WORLD_ATTN_D64_HALF_CACHE ignored because d_head=%d\n", rt->d_head);
             rt->attn_half_cache_enabled = 0;
+            rt->attn_half_flash_enabled = 0;
         }
         if (rt->attn_half_cache_enabled) {
             if (rt->attn_flash_enabled || rt->attn_q4_shared_enabled) {
-                fprintf(stderr, "WORLD_ATTN_D64_HALF_CACHE uses the warp half-KV path and disables flash/q4 attention probes\n");
+                fprintf(stderr, "WORLD_ATTN_D64_HALF_CACHE disables the f32 flash/q4 attention probes\n");
             }
             rt->attn_flash_enabled = 0;
             rt->attn_q4_shared_enabled = 0;
-            fprintf(stderr, "D=64 attention FP16 KV cache enabled by WORLD_ATTN_D64_HALF_CACHE=1\n");
+            fprintf(stderr, "D=64 attention FP16 KV cache enabled by WORLD_ATTN_D64_HALF_CACHE=1%s\n",
+                    rt->attn_half_flash_enabled ? " with group-flash probe" : "");
+        } else if (rt->attn_half_flash_enabled) {
+            fprintf(stderr, "WORLD_ATTN_D64_HALF_FLASH ignored because WORLD_ATTN_D64_HALF_CACHE is off\n");
+            rt->attn_half_flash_enabled = 0;
         }
     }
     if (alloc_device_world_caches(&rt->d_caches, cfg, layers_to_run, rt->T, cfg->n_kv_heads, rt->d_head, rt->attn_half_cache_enabled)) goto fail;
@@ -4127,10 +4230,22 @@ extern "C" int world_cuda_runtime_step_rgb(
             if (rt->d_head == 64) {
                 int attn_done = 0;
                 if (rt->attn_half_cache_enabled) {
-                    indexed_attention_cache_d64_warp_f16_kv_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
-                        rt->d_q, cache->k_h, cache->v_h, cache->indices, cache->index_count, rt->d_attn,
-                        cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
-                        1.0f / 8.0f);
+                    int group = cfg->n_heads % cfg->n_kv_heads == 0 ? cfg->n_heads / cfg->n_kv_heads : 0;
+                    if (rt->attn_half_flash_enabled && group > 0 && group <= WORLD_ATTN_D64_FLASH_WARPS) {
+                        int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
+                        if (q_per_h < 1) q_per_h = 1;
+                        int q_blocks = div_up_i64(rt->T, q_per_h);
+                        size_t smem = (size_t)2 * WORLD_ATTN_D64_K_BLOCK * 64 * sizeof(__half);
+                        indexed_attention_cache_d64_flash_f16_kv_kernel<<<cfg->n_kv_heads * q_blocks, 32 * WORLD_ATTN_D64_FLASH_WARPS, smem>>>(
+                            rt->d_q, cache->k_h, cache->v_h, cache->indices, cache->index_count, rt->d_attn,
+                            cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                            1.0f / 8.0f);
+                    } else {
+                        indexed_attention_cache_d64_warp_f16_kv_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
+                            rt->d_q, cache->k_h, cache->v_h, cache->indices, cache->index_count, rt->d_attn,
+                            cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                            1.0f / 8.0f);
+                    }
                     attn_done = 1;
                 }
                 if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {

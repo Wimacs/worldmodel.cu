@@ -83,6 +83,7 @@ Attention：
 - 新增 PyTorch 对拍覆盖 `indexed_attention_half_kv` 和 `kv_cache_upsert_half`。reference 明确使用 `k.half().float()` / `v.half().float()`，所以测试验证的是 half-cache 路径本身，而不是要求它和 float-cache 数值完全一致。
 - 360p、24 layer、4 step、`WORLD_VAE_FP16_NHWC=1`、`cache-window=8`、`--warmup 8` 的 profile 结果：默认最后一 chunk 为 `attn=38.654ms/120`、`total=79.825ms`；half KV cache 为 `attn=31.536ms/120`、`total=72.657ms`。正常非 profile 对照：默认 `total=72.278ms`、`chunk_fps=13.835`、`rgb_fps=55.342`；half KV cache 为 `total=65.553ms`、`chunk_fps=15.255`、`rgb_fps=61.019`。
 - 这版仍保持 opt-in，不默认启用。原因是它确实引入 K/V cache 的 FP16 量化；性能收益已经证明，但视觉质量/长序列稳定性还需要窗口实跑确认。下一轮 attention 大优化不应继续在这个 warp kernel 上小修小补，而应做真正的 block-level fused attention：一块处理多 query、多 K tile，用寄存器维护 `(m,l,acc)`，并减少每个 GQA query head 对同一 KV head 的重复读取。
+- attention v1.1 做了一个有边界的负向验证：`WORLD_ATTN_D64_HALF_FLASH=1` 在 half KV cache 上启用 group-flash probe，一个 block 覆盖同一 KV head 下的多个 query head/token，K/V tile 进入 shared memory 后用 online softmax 消费。PyTorch 对拍新增 `indexed_attention_half_kv_flash`，reference 使用 `k.half().float()` / `v.half().float()`。360p、24 layer、4 step、`WORLD_VAE_FP16_NHWC=1`、`WORLD_ATTN_D64_HALF_CACHE=1`、`cache-window=8`、满 cache profile：现有 half-warp path 最后一 chunk `attn=32.875ms/120`、`total=80.337ms`；group-flash probe 为 `attn=35.874ms/120`、`total=83.551ms`。结论：对当前 `group=2`、`Tq=128`、`Nkv=1024`，16-warp block 的同步和 shared-memory 开销吃掉了减少 K/V 全局读取的收益，因此不默认启用，也不继续围绕这个 kernel 调 tile。
 - 后续要么继续优化自写 fused attention，要么用 CUTLASS/CuTe 写专门的 QK/softmax/AV fused kernel；不要回退到 cuBLAS。
 
 ## 从 Triton 优化方案学什么
