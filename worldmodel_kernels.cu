@@ -1395,6 +1395,61 @@ torch::Tensor row_major_linear_fp16_tensorop_cuda(torch::Tensor x, torch::Tensor
     return y;
 }
 
+torch::Tensor row_major_linear_fp16_tensorop_m64n64_cuda(torch::Tensor x, torch::Tensor w) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    auto x_h = x.to(torch::kFloat16);
+    auto w_h = w.to(torch::kFloat16);
+    auto y = torch::empty({m, n}, x.options());
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x_h.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w_h.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y.data_ptr<float>(), n},
+        {y.data_ptr<float>(), n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_tensorop_m64n64.can_implement");
+    check_cutlass_status(gemm(args, nullptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_tensorop_m64n64");
+    check_last_cuda_error("row_major_linear_fp16_tensorop_m64n64");
+    return y;
+}
+
 torch::Tensor row_major_linear_fp16_tensorop_splitk_cuda(torch::Tensor x, torch::Tensor w, int64_t split_k_slices_arg) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(w);
@@ -2634,6 +2689,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu", &silu_cuda, "WorldModel SiLU (CUDA, f32)");
     m.def("row_major_linear_fp16", &row_major_linear_fp16_cuda, "WorldModel row-major Linear using FP16 inputs/weights and FP32 output");
     m.def("row_major_linear_fp16_tensorop", &row_major_linear_fp16_tensorop_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op and FP32 output");
+    m.def("row_major_linear_fp16_tensorop_m64n64", &row_major_linear_fp16_tensorop_m64n64_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile and FP32 output");
     m.def("row_major_linear_fp16_tensorop_splitk", &row_major_linear_fp16_tensorop_splitk_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
     m.def("ada_rms_norm", &ada_rms_norm_cuda, "WorldModel AdaRMSNorm (CUDA, f32)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);

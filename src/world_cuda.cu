@@ -1516,6 +1516,59 @@ static int row_major_linear_fp16_weight_tensorop(
     return 0;
 }
 
+static int row_major_linear_fp16_weight_tensorop_m64n64(
+        const float *x_rm,
+        __half *x_half_tmp,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n) {
+    int64_t x_elems = (int64_t)m * k;
+    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
+    CUDA_OK(cudaGetLastError());
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
+static int should_use_m64n64_tensorop(int enabled, int m, int k, int n) {
+    return enabled && m > 1 && m <= 256 && (m % 64) == 0 &&
+           k >= 1024 && n >= 1024 && (k % 32) == 0 && (n % 64) == 0;
+}
+
 static size_t row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
         int m,
         int k,
@@ -3012,6 +3065,7 @@ struct WorldCudaRuntime {
     int forced_pass_table_idx;
     int frame_stride;
     int mlp_fc2_splitk_slices;
+    int fp16_gemm_m64n64_enabled;
     size_t latent_elems;
     size_t token_elems;
     size_t kv_rope_elems;
@@ -3369,6 +3423,16 @@ extern "C" int world_cuda_runtime_create(
         }
     }
     {
+        const char *tile_env = getenv("WORLD_FP16_GEMM_TILE");
+        rt->fp16_gemm_m64n64_enabled =
+            !(tile_env && tile_env[0] && (strcmp(tile_env, "base") == 0 || strcmp(tile_env, "128x128") == 0));
+        if (rt->fp16_gemm_m64n64_enabled) {
+            fprintf(stderr, "FP16 tensor-op GEMM small-M tile: m64n64\n");
+        } else {
+            fprintf(stderr, "FP16 tensor-op GEMM small-M tile disabled by WORLD_FP16_GEMM_TILE=base\n");
+        }
+    }
+    {
         const char *splitk_env = getenv("WORLD_MLP_FC2_SPLITK");
         if (splitk_env && splitk_env[0]) {
             rt->mlp_fc2_splitk_slices = atoi(splitk_env);
@@ -3548,7 +3612,11 @@ extern "C" int world_cuda_runtime_step_rgb(
 #define STEP_LINEAR_FAST(x, w, wh, y, m, k, n) do { \
     if (use_fp16_gemm && (wh) && (m) > 1) { \
         if (use_fp16_tensorop) { \
-            if (row_major_linear_fp16_weight_tensorop((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+            if (should_use_m64n64_tensorop(rt->fp16_gemm_m64n64_enabled, (m), (k), (n))) { \
+                if (row_major_linear_fp16_weight_tensorop_m64n64((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+            } else { \
+                if (row_major_linear_fp16_weight_tensorop((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+            } \
         } else { \
             if (row_major_linear_fp16_weight_simt((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
         } \
@@ -3757,6 +3825,16 @@ extern "C" int world_cuda_runtime_step_rgb(
                             rt->mlp_fc2_splitk_slices,
                             rt->d_splitk_workspace,
                             rt->splitk_workspace_bytes)) return 1;
+            } else if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h &&
+                    should_use_m64n64_tensorop(rt->fp16_gemm_m64n64_enabled, rt->T, rt->mlp_hidden, rt->D)) {
+                if (row_major_linear_fp16_weight_tensorop_m64n64(
+                            rt->d_mlp_hidden,
+                            rt->d_linear_half,
+                            lw->dit_mlp_fc2_weight_h,
+                            rt->d_mlp_out,
+                            rt->T,
+                            rt->mlp_hidden,
+                            rt->D)) return 1;
             } else {
                 STEP_LINEAR_FAST(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, lw->dit_mlp_fc2_weight_h,
                                  rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);

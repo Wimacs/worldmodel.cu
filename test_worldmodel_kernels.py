@@ -161,6 +161,26 @@ def test_row_major_linear_fp16_tensorop_splitk_matches_mlp_fc2_shape(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
 
 
+def test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes(wm_cuda):
+    torch.manual_seed(113)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for m, k, n in (
+            (128, 2048, 2048),
+            (128, 2048, 4096),
+            (128, 2048, 8192),
+            (128, 8192, 2048),
+        ):
+            x = torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.125
+            w = torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.125
+            y = wm_cuda.row_major_linear_fp16_tensorop_m64n64(x.contiguous(), w.contiguous())
+            ref = x.half().float().matmul(w.half().float().t())
+            torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def test_rms_norm_matches_torch(wm_cuda):
     torch.manual_seed(2)
     x = torch.randn(5, 17, 128, device="cuda", dtype=torch.float32)
@@ -561,6 +581,7 @@ if __name__ == "__main__":
         test_row_major_linear_fp16_matches_half_rounded_reference,
         test_row_major_linear_fp16_tensorop_matches_real_shapes,
         test_row_major_linear_fp16_tensorop_splitk_matches_mlp_fc2_shape,
+        test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes,
         test_rms_norm_matches_torch,
         test_ada_rms_norm_matches_world_formula,
         test_ortho_rope_matches_world_formula,
