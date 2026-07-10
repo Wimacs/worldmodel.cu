@@ -20,14 +20,16 @@ FP16-weight fast path：
 
 - runtime 仍先把 activation 从 FP32 cast 到 FP16 scratch。
 - weight 预先保存为 FP16。
-- 当前先用 CUTLASS SIMT GEMM 做 `half x half -> float accumulator -> float output`。
-- tile 是 `128x64x8` threadblock，`32x64x8` warp，2 stages，A/B alignment 1。
-- 之前直接用 row-major/column-major tensor-op half GEMM 在真实模型 shape 上会触发 CUTLASS `ldsm RowMajor` unsupported path；下一步要通过权重预打包或 CUTLASS 3.x/CuTe layout 重新上 tensor core，而不是继续在不稳定 layout 上调参。
+- resident runtime 当前仍使用 CUTLASS SIMT GEMM 做 `half x half -> float accumulator -> float output`，这是稳定默认路径。
+- 本迭代新增了 `row_major_linear_fp16_tensorop` PyTorch extension probe，使用 CUTLASS Sm80 tests 覆盖过的 `128x128x32` threadblock，`64x64x32` warp，`16x8x16` instruction，4 stages。
+- probe 已覆盖 resident 主要真实 shape：`(1,2048,8192)`、`(512,2048,2048)`、`(512,2048,4096)`、`(512,2048,8192)`、`(512,8192,2048)`。
+- 但是把同一 typedef 直接接进 resident runtime 后，最小 headless smoke 仍会触发 CUTLASS `ldsm RowMajor` unsupported path。因此这一版不启用 runtime tensor-op；下一版应该先解决 runtime 内存/layout 差异，或做权重/activation 预打包，再接默认路径。
+- `WORLD_FP16_GEMM=0` 可以强制回退到 FP32 SIMT GEMM，用于定位问题。
 
 FP32 path：
 
 - standalone 当前用 CUTLASS SIMT FP32 GEMM，作为不依赖 cuBLAS/cuDNN 的稳定 baseline。
-- TF32 tensor-op 会遇到和 FP16 tensor-op 类似的 row-major shared-load layout 问题，后续应通过 layout/prepack 或 CUTLASS 3.x collective builder 重新实现，而不是直接替换 typedef。
+- TF32 tensor-op 还没有接入 runtime；后续应先加一个独立对拍入口验证真实 shape，再决定是否接到 runtime。
 - PyTorch extension 的 `patchify_cutlass` 也使用 CUTLASS SIMT FP32 GEMM，避免 TF32 误差影响严格对拍。
 
 VAE：
@@ -65,6 +67,12 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 - `GemmSplitKParallel`/stream-K kernel 对应 Triton Split-K 思路。
 
 ## GEMM 优化计划
+
+迭代原则：
+
+- 每一版只推进一个明确目标，例如“FP16 resident GEMM tensor-op 化”或“MLP fc1+SiLU epilogue fusion”。
+- 不在主线里无休止枚举 tile；先用 CUTLASS 已验证的形状或少量真实 shape probe 建立正确性。
+- 只有端到端 profile 指向某个 kernel 仍是最大瓶颈时，才进入下一轮 tile/autotune。
 
 第一阶段：shape inventory
 

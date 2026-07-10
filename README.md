@@ -253,9 +253,10 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 ## 7. CUDA/CUTLASS 状态
 
 - CUDA 目标只链接 `CUDA::cudart`，不链接 cuBLAS/cuDNN。
-- Transformer linear/GEMM 当前走 CUTLASS SIMT baseline，保证真实权重可 load 和完整 4-step 可运行。
-- FP16-weight path 也走 CUTLASS SIMT half x half -> float accumulator。之前直接套 tensor-op row-major/column-major layout 会在真实 shape 上触发 CUTLASS `ldsm RowMajor` unsupported path。
-- 后续高性能路线是权重 load 阶段预打包到 tensor-core friendly layout，或者用 CUTLASS 3.x/CuTe collective builder 专门生成可用 tensor-op kernel。
+- FP32 fallback 仍走 CUTLASS SIMT baseline，保证真实权重可 load 和完整 4-step 可运行。
+- resident FP16-weight path 目前默认仍是 CUTLASS SIMT half x half -> float accumulator；`WORLD_FP16_GEMM=0` 可强制回退 FP32 SIMT。
+- 已新增独立 CUTLASS tensor-op probe，并对 resident 主要 GEMM shape 做 PyTorch 对拍；但直接接入 runtime 的最小 headless smoke 仍触发 CUTLASS `ldsm RowMajor` unsupported path，所以这一版不启用为默认路径。
+- 后续高性能路线按版本推进：先 profile 确认最大瓶颈，再做少量真实 shape CUTLASS probe，最后才接入 runtime；不在主线里无休止搜索 tile。
 - D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
 - VAE decode 当前走内置 F32/NCHW direct conv；后续应迁到 CUTLASS conv/implicit-GEMM 或 im2row + CUTLASS GEMM。
 
