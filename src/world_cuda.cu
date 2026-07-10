@@ -3468,6 +3468,7 @@ struct WorldCudaRuntime {
     int64_t *d_y_pos;
     int64_t *d_t_pos;
     __half *d_linear_half;
+    __half *d_mlp_hidden_half;
     void *d_splitk_workspace;
     int attn_flash_enabled;
     int attn_q4_shared_enabled;
@@ -3692,6 +3693,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_y_pos);
     cudaFree(rt->d_t_pos);
     cudaFree(rt->d_linear_half);
+    cudaFree(rt->d_mlp_hidden_half);
     cudaFree(rt->d_splitk_workspace);
     free(rt->h_latent);
     free(rt->h_noise);
@@ -3880,6 +3882,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_y_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_t_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_linear_half, rt->linear_half_elems * sizeof(__half)));
+    RT_CUDA(cudaMalloc((void **)&rt->d_mlp_hidden_half, (size_t)rt->T * rt->mlp_hidden * sizeof(__half)));
     if (rt->mlp_fc2_splitk_slices > 1) {
         rt->splitk_workspace_bytes = row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
             rt->T, rt->mlp_hidden, rt->D, rt->mlp_fc2_splitk_slices);
@@ -4199,6 +4202,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
             int mlp_hidden_half_ready = 0;
+            __half *d_mlp_hidden_half_cur = NULL;
             STEP_PROFILE_BEGIN();
             if (use_fp16_gemm && use_fp16_tensorop &&
                     rt->mlp_fc1_silu_epilogue_enabled &&
@@ -4209,11 +4213,12 @@ extern "C" int world_cuda_runtime_step_rgb(
                             rt->d_mlp_in,
                             rt->d_linear_half,
                             lw->dit_mlp_fc1_weight_h,
-                            rt->d_linear_half,
+                            rt->d_mlp_hidden_half,
                             rt->T,
                             rt->D,
                             rt->mlp_hidden)) return 1;
                 mlp_hidden_half_ready = 1;
+                d_mlp_hidden_half_cur = rt->d_mlp_hidden_half;
             } else {
                 STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
                                  rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
@@ -4223,8 +4228,9 @@ extern "C" int world_cuda_runtime_step_rgb(
                 STEP_PROFILE_BEGIN();
                 if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
                     silu_f32_to_f16_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
-                        rt->d_mlp_hidden, rt->d_linear_half, (int64_t)rt->T * rt->mlp_hidden);
+                        rt->d_mlp_hidden, rt->d_mlp_hidden_half, (int64_t)rt->T * rt->mlp_hidden);
                     mlp_hidden_half_ready = 1;
+                    d_mlp_hidden_half_cur = rt->d_mlp_hidden_half;
                 } else {
                     silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
                         rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
@@ -4234,8 +4240,9 @@ extern "C" int world_cuda_runtime_step_rgb(
             }
             STEP_PROFILE_BEGIN();
             if (mlp_hidden_half_ready) {
+                if (!d_mlp_hidden_half_cur) return 1;
                 if (row_major_linear_fp16_input_weight_tensorop_splitk(
-                            rt->d_linear_half,
+                            d_mlp_hidden_half_cur,
                             lw->dit_mlp_fc2_weight_h,
                             rt->d_mlp_out,
                             rt->T,
