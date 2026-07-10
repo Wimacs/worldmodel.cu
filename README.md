@@ -288,7 +288,7 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - `WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype，`WORLD_ATTN_D64_Q4_SHARED=1` 可启用 4-row shared-KV probe；两者当前真实 profile 都慢于 CUTLASS 默认路径，保留为诊断开关。
 - `WORLD_ATTN_D64_HALF_CACHE=1` 会把 K/V cache 存为 FP16，并走 half2 warp attention；`WORLD_ATTN_D64_HALF_FLASH=1` 可进一步启用 half-cache group-flash probe。group-flash 已有 PyTorch 对拍，但当前 360p 满 cache profile 慢于 half2 warp path，因此只作为下一轮 attention 设计的对照，不默认启用。
 - `WORLD_ATTN_D64_CUTLASS_GROUPED=1` 会启用 grouped-M GQA materialized CUTLASS 变体，减少 K/V compact 和 GQA B 矩阵重复读取；当前端到端收益很小，作为 opt-in 对照保留。
-- `WORLD_ATTN_D64_FMHA=1` 可启用 CUTLASS fused-MHA bridge：runtime 把 indexed ring-cache K/V gather 到 contiguous BMHK half buffer，再调用 CUTLASS FMHA 样例 kernel，避免写出 `scores/probs`。它目前是 opt-in，因为仍有 Q/K/V layout bridge 开销；同 shape profile 下满 cache attention 从默认 materialized 的 `7.248ms/120` 降到 `5.093ms/120`，端到端最后一 chunk 从 `39.107ms` 降到 `36.617ms`。
+- `WORLD_ATTN_D64_FMHA=1` 可启用 CUTLASS fused-MHA GQA bridge：runtime 把 indexed ring-cache K/V gather 到 contiguous BMHK half buffer，但按 `Hkv` 保存，不再为每个 GQA query head 重复 K/V，然后调用 CUTLASS FMHA 样例 kernel，避免写出 `scores/probs`。它目前是 opt-in，因为仍有 Q/K/V layout bridge 开销；同 shape profile 下满 cache attention 从默认 materialized 的 `7.248ms/120` 降到 `4.696ms/120`，scratch 从 `68.50 MiB` 降到 `9.50 MiB`。
 - VAE decode 默认走 FP16/NHWC 全路径：VAE 权重在 load 阶段额外预打包成 KRSC half，runtime 用 CUTLASS tensor-op implicit conv，bias 仍是单独 half kernel。`WORLD_VAE_FP16_NHWC=0` 可回退 F32/NCHW 主路径。
 - F32/NCHW 回退路径里，1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
 - `WORLD_VAE_3X3_BATCH_COLS=1` 可试验 frame-batched 3x3 tiles；当前 profile 显示它慢于默认 per-frame path，所以默认关闭。

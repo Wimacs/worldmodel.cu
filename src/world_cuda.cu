@@ -113,11 +113,6 @@ __global__ static void f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
     if (i < n) y[i] = __float2half_rn(x[i]);
 }
 
-__global__ static void f16_to_f32_kernel(const __half *x, float *y, int64_t n) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __half2float(x[i]);
-}
-
 __global__ static void silu_f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half_rn(wm_silu(x[i]));
@@ -684,48 +679,72 @@ __global__ static void gather_indexed_kv_d64_hq_f16_kernel(
     v_compact[i] = cache_v[src];
 }
 
-__global__ static void q_d64_htd_f32_to_bmhd_f16_kernel(
+__global__ static void q_d64_htd_f32_to_gqa_bmhd_f16_kernel(
         const float *__restrict__ q,
         __half *__restrict__ q_bmhd,
         int Hq,
+        int Hkv,
         int Tq) {
+    int group = Hq / Hkv;
+    int M = group * Tq;
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)Tq * Hq * 64;
+    int64_t total = (int64_t)M * Hkv * 64;
     if (i >= total) return;
     int d = (int)(i & 63);
     int64_t x = i >> 6;
-    int h = (int)(x % Hq);
-    int t = (int)(x / Hq);
-    q_bmhd[i] = __float2half_rn(q[((int64_t)h * Tq + t) * 64 + d]);
+    int hk = (int)(x % Hkv);
+    int m = (int)(x / Hkv);
+    int g = m / Tq;
+    int t = m - g * Tq;
+    int hq = hk * group + g;
+    q_bmhd[i] = __float2half_rn(q[((int64_t)hq * Tq + t) * 64 + d]);
 }
 
-__global__ static void gather_indexed_kv_d64_bnhd_f16_kernel(
+__global__ static void gather_indexed_kv_d64_bnhd_hkv_f16_kernel(
         const __half *__restrict__ cache_k,
         const __half *__restrict__ cache_v,
         const int64_t *__restrict__ indices,
         int Nkv,
         __half *__restrict__ k_bnhd,
         __half *__restrict__ v_bnhd,
-        int Hq,
         int Hkv,
         int Tk) {
     if (Nkv < 0) Nkv = 0;
     if (Nkv > Tk) Nkv = Tk;
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)Nkv * Hq * 64;
+    int64_t total = (int64_t)Nkv * Hkv * 64;
     if (i >= total) return;
     int d = (int)(i & 63);
     int64_t x = i >> 6;
-    int hq = (int)(x % Hq);
-    int n = (int)(x / Hq);
-    int group = Hq / Hkv;
-    int hk = hq / group;
+    int hk = (int)(x % Hkv);
+    int n = (int)(x / Hkv);
     int tk = (int)indices[n];
     if (tk < 0) tk = 0;
     if (tk >= Tk) tk = Tk - 1;
     int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
     k_bnhd[i] = cache_k[src];
     v_bnhd[i] = cache_v[src];
+}
+
+__global__ static void scatter_gqa_bmhd_f16_to_tokens_f32_kernel(
+        const __half *__restrict__ group_out,
+        float *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int group = Hq / Hkv;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Tq * Hq * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int hq = (int)(x % Hq);
+    int t = (int)(x / Hq);
+    int hk = hq / group;
+    int g = hq - hk * group;
+    int m = g * Tq + t;
+    int64_t src = ((int64_t)m * Hkv + hk) * 64 + d;
+    out_tokens[i] = __half2float(group_out[src]);
 }
 
 __global__ static void gather_indexed_kv_d64_hkv_f16_kernel(
@@ -2485,13 +2504,19 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
         CUDA_OK(cudaMemset(out_tokens, 0, (size_t)out_elems * sizeof(float)));
         return 0;
     }
+    if (Hkv <= 0 || Hq <= 0 || (Hq % Hkv) != 0) {
+        fprintf(stderr, "CUTLASS FMHA GQA bridge requires Hq divisible by Hkv\n");
+        return 1;
+    }
+    int group = Hq / Hkv;
+    int M = group * Tq;
 
-    q_d64_htd_f32_to_bmhd_f16_kernel<<<div_up_i64(out_elems, 256), 256>>>(q, q_bmhd, Hq, Tq);
+    q_d64_htd_f32_to_gqa_bmhd_f16_kernel<<<div_up_i64(out_elems, 256), 256>>>(q, q_bmhd, Hq, Hkv, Tq);
     CUDA_OK(cudaGetLastError());
 
-    int64_t kv_compact_elems = (int64_t)Nkv * Hq * 64;
-    gather_indexed_kv_d64_bnhd_f16_kernel<<<div_up_i64(kv_compact_elems, 256), 256>>>(
-        cache_k, cache_v, indices, Nkv, k_bnhd, v_bnhd, Hq, Hkv, Tk);
+    int64_t kv_compact_elems = (int64_t)Nkv * Hkv * 64;
+    gather_indexed_kv_d64_bnhd_hkv_f16_kernel<<<div_up_i64(kv_compact_elems, 256), 256>>>(
+        cache_k, cache_v, indices, Nkv, k_bnhd, v_bnhd, Hkv, Tk);
     CUDA_OK(cudaGetLastError());
 
     using Attention = AttentionKernel<
@@ -2512,23 +2537,23 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
     p.output_accum_ptr = NULL;
     p.logsumexp_ptr = NULL;
     p.scale = scale;
-    p.num_heads = Hq;
+    p.num_heads = Hkv;
     p.num_batches = 1;
     p.head_dim = 64;
     p.head_dim_value = 64;
-    p.num_queries = Tq;
+    p.num_queries = M;
     p.num_keys = Nkv;
     p.custom_mask_type = Attention::NoCustomMask;
     p.q_strideH = 64;
     p.k_strideH = 64;
     p.v_strideH = 64;
-    p.q_strideM = Hq * 64;
-    p.k_strideM = Hq * 64;
-    p.v_strideM = Hq * 64;
-    p.q_strideB = (int64_t)Tq * Hq * 64;
-    p.k_strideB = (int64_t)Nkv * Hq * 64;
-    p.v_strideB = (int64_t)Nkv * Hq * 64;
-    p.o_strideM = Hq * 64;
+    p.q_strideM = Hkv * 64;
+    p.k_strideM = Hkv * 64;
+    p.v_strideM = Hkv * 64;
+    p.q_strideB = (int64_t)M * Hkv * 64;
+    p.k_strideB = (int64_t)Nkv * Hkv * 64;
+    p.v_strideB = (int64_t)Nkv * Hkv * 64;
+    p.o_strideM = Hkv * 64;
 
     if (!Attention::check_supported(p)) {
         fprintf(stderr, "CUTLASS FMHA does not support this runtime attention shape\n");
@@ -2542,7 +2567,8 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
     kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes>>>(p);
     CUDA_OK(cudaGetLastError());
 
-    f16_to_f32_kernel<<<div_up_i64(out_elems, 256), 256>>>(out_bmhd, out_tokens, out_elems);
+    scatter_gqa_bmhd_f16_to_tokens_f32_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+        out_bmhd, out_tokens, Hq, Hkv, Tq);
     CUDA_OK(cudaGetLastError());
     return 0;
 #else
@@ -4939,7 +4965,8 @@ extern "C" int world_cuda_runtime_create(
         }
         rt->attn_max_capacity = max_window * rt->T + rt->T;
         size_t q_half_elems = rt->q_rope_elems;
-        size_t kv_compact_elems = (size_t)cfg->n_heads * rt->attn_max_capacity * 64;
+        size_t kv_compact_heads = rt->attn_cutlass_fmha_enabled ? (size_t)cfg->n_kv_heads : (size_t)cfg->n_heads;
+        size_t kv_compact_elems = kv_compact_heads * rt->attn_max_capacity * 64;
         size_t score_elems = (size_t)cfg->n_heads * rt->T * rt->attn_max_capacity;
         size_t scratch_bytes = q_half_elems * sizeof(__half) + 2 * kv_compact_elems * sizeof(__half);
         if (rt->attn_cutlass_fmha_enabled) {
@@ -4964,7 +4991,7 @@ extern "C" int world_cuda_runtime_create(
             if (rt->attn_cutlass_fmha_enabled) {
                 RT_CUDA(cudaMalloc((void **)&rt->d_attn_out_half, q_half_elems * sizeof(__half)));
                 fprintf(stderr,
-                        "D=64 attention CUTLASS FMHA bridge enabled (capacity=%d tokens scratch=%.2f MiB)\n",
+                        "D=64 attention CUTLASS FMHA GQA bridge enabled (capacity=%d tokens scratch=%.2f MiB)\n",
                         rt->attn_max_capacity,
                         (double)scratch_bytes / (1024.0 * 1024.0));
             } else {

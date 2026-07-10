@@ -161,6 +161,79 @@ __global__ void gather_indexed_kv_d64_hkv_f16_kernel(
     v_compact[i] = v[src];
 }
 
+__global__ void q_d64_bhtd_f32_to_gqa_bmhd_f16_kernel(
+        const float *__restrict__ q,
+        __half *__restrict__ q_bmhd,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int group = Hq / Hkv;
+    int M = group * Tq;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * M * Hkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int hk = (int)(x % Hkv);
+    int m = (int)((x / Hkv) % M);
+    int b = (int)(x / ((int64_t)M * Hkv));
+    int g = m / Tq;
+    int t = m - g * Tq;
+    int hq = hk * group + g;
+    q_bmhd[i] = __float2half_rn(q[(((int64_t)b * Hq + hq) * Tq + t) * 64 + d]);
+}
+
+__global__ void gather_indexed_kv_d64_bnhd_f16_kernel(
+        const __half *__restrict__ k,
+        const __half *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        __half *__restrict__ k_bmhd,
+        __half *__restrict__ v_bmhd,
+        int B,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Nkv * Hkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int hk = (int)(x % Hkv);
+    int n = (int)((x / Hkv) % Nkv);
+    int b = (int)(x / ((int64_t)Nkv * Hkv));
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = (((int64_t)b * Hkv + hk) * Tk + tk) * 64 + d;
+    k_bmhd[i] = k[src];
+    v_bmhd[i] = v[src];
+}
+
+__global__ void scatter_gqa_bmhd_f16_to_bhtd_f32_kernel(
+        const __half *__restrict__ group_out,
+        float *__restrict__ out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int group = Hq / Hkv;
+    int M = group * Tq;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Hq * Tq * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int t = (int)(x % Tq);
+    int hq = (int)((x / Tq) % Hq);
+    int b = (int)(x / ((int64_t)Tq * Hq));
+    int hk = hq / group;
+    int g = hq - hk * group;
+    int m = g * Tq + t;
+    int64_t src = (((int64_t)b * M + m) * Hkv + hk) * 64 + d;
+    out[i] = __half2float(group_out[src]);
+}
+
 __global__ void scatter_grouped_attn_d64_f32_kernel(
         const float *__restrict__ group_out,
         float *__restrict__ out,
@@ -2987,6 +3060,136 @@ torch::Tensor cutlass_fmha_bmhk_fp16_cuda(
 #endif
 }
 
+torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+#if WM_HAS_CUTLASS_FMHA
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F16(k);
+    WM_CHECK_F16(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "indexed_attention_half_kv_fmha_gqa currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(Nkv > 0, "indices must be non-empty");
+    int group = Hq / Hkv;
+    int M = group * Tq;
+
+    auto half_opts = q.options().dtype(torch::kFloat16);
+    auto q_bmhd = torch::empty({B, M, Hkv, 64}, half_opts);
+    auto k_bmhd = torch::empty({B, Nkv, Hkv, 64}, half_opts);
+    auto v_bmhd = torch::empty({B, Nkv, Hkv, 64}, half_opts);
+    auto out_bmhd = torch::empty({B, M, Hkv, 64}, half_opts);
+    auto out = torch::empty_like(q);
+
+    int64_t q_elems = (int64_t)B * Hq * Tq * 64;
+    q_d64_bhtd_f32_to_gqa_bmhd_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        reinterpret_cast<__half *>(q_bmhd.data_ptr<at::Half>()),
+        B,
+        Hq,
+        Hkv,
+        Tq);
+    check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_q_bridge");
+
+    int64_t kv_elems = (int64_t)B * Nkv * Hkv * 64;
+    gather_indexed_kv_d64_bnhd_f16_kernel<<<div_up_i64(kv_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half *>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(v.data_ptr<at::Half>()),
+        indices.data_ptr<int64_t>(),
+        reinterpret_cast<__half *>(k_bmhd.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(v_bmhd.data_ptr<at::Half>()),
+        B,
+        Hkv,
+        Nkv,
+        Tk);
+    check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_kv_bridge");
+
+    using Attention = AttentionKernel<
+        cutlass::half_t,
+        cutlass::arch::Sm80,
+        true,
+        64,
+        64,
+        64,
+        false,
+        false>;
+
+    typename Attention::Params p;
+    p.query_ptr = reinterpret_cast<cutlass::half_t *>(q_bmhd.data_ptr<at::Half>());
+    p.key_ptr = reinterpret_cast<cutlass::half_t *>(k_bmhd.data_ptr<at::Half>());
+    p.value_ptr = reinterpret_cast<cutlass::half_t *>(v_bmhd.data_ptr<at::Half>());
+    p.output_ptr = reinterpret_cast<cutlass::half_t *>(out_bmhd.data_ptr<at::Half>());
+    p.output_accum_ptr = nullptr;
+    p.logsumexp_ptr = nullptr;
+    p.scale = (float)scale;
+    p.num_heads = Hkv;
+    p.num_batches = B;
+    p.head_dim = 64;
+    p.head_dim_value = 64;
+    p.num_queries = M;
+    p.num_keys = Nkv;
+    p.custom_mask_type = Attention::NoCustomMask;
+    p.q_strideH = 64;
+    p.k_strideH = 64;
+    p.v_strideH = 64;
+    p.q_strideM = Hkv * 64;
+    p.k_strideM = Hkv * 64;
+    p.v_strideM = Hkv * 64;
+    p.q_strideB = (int64_t)M * Hkv * 64;
+    p.k_strideB = (int64_t)Nkv * Hkv * 64;
+    p.v_strideB = (int64_t)Nkv * Hkv * 64;
+    p.o_strideM = Hkv * 64;
+
+    TORCH_CHECK(Attention::check_supported(p), "CUTLASS FMHA does not support this GQA bridge shape");
+    constexpr auto kernel_fn = attention_kernel_batched_impl<Attention>;
+    int smem_bytes = sizeof(typename Attention::SharedStorage);
+    if (smem_bytes > 0xc000) {
+        cudaError_t attr_err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
+    }
+    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, at::cuda::getCurrentCUDAStream()>>>(p);
+    check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_fmha");
+
+    scatter_gqa_bmhd_f16_to_bhtd_f32_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
+        out.data_ptr<float>(),
+        B,
+        Hq,
+        Hkv,
+        Tq);
+    check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_scatter");
+    return out;
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)indices;
+    (void)scale;
+    TORCH_CHECK(false, "CUTLASS FMHA example headers were not available when building this extension");
+#endif
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -3895,6 +4098,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("indexed_attention_half_kv_cutlass", &indexed_attention_half_kv_cutlass_cuda, "WorldModel materialized indexed GQA attention using CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv_cutlass_grouped", &indexed_attention_half_kv_cutlass_grouped_cuda, "WorldModel materialized indexed GQA attention using grouped-M CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("cutlass_fmha_bmhk_fp16", &cutlass_fmha_bmhk_fp16_cuda, "CUTLASS fused MHA probe for contiguous BMHK FP16 tensors (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("scale"));
+    m.def("indexed_attention_half_kv_fmha_gqa", &indexed_attention_half_kv_fmha_gqa_cuda, "WorldModel indexed GQA attention using CUTLASS FMHA with non-repeated K/V bridge (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
