@@ -128,6 +128,7 @@ typedef struct {
     int stop;
     int failed;
     int produced_chunks;
+    int control_debug_enabled;
     float generation_seconds;
     float control_seconds;
     float target_control_seconds;
@@ -283,12 +284,6 @@ static float clamp_mouse_axis(float x) {
     return x;
 }
 
-static float clamp_mouse_accum(float x) {
-    if (x > 8.0f) return 8.0f;
-    if (x < -8.0f) return -8.0f;
-    return x;
-}
-
 static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, float mouse_scale) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
@@ -310,8 +305,8 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
 
 static void merge_frame_control(LiveShared *s, const float *frame_control, float frame_seconds) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    s->control[0] = clamp_mouse_accum(s->control[0] + frame_control[0]);
-    s->control[1] = clamp_mouse_accum(s->control[1] + frame_control[1]);
+    s->control[0] = clamp_mouse_axis(s->control[0] + frame_control[0]);
+    s->control[1] = clamp_mouse_axis(s->control[1] + frame_control[1]);
     if (frame_seconds > 0.0f && frame_seconds < 0.25f) {
         s->control_seconds += frame_seconds;
     }
@@ -342,6 +337,8 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
                 control[0] = clamp_mouse_axis(control[0] * k);
                 control[1] = clamp_mouse_axis(control[1] * k);
             }
+            control[0] = clamp_mouse_axis(control[0]);
+            control[1] = clamp_mouse_axis(control[1]);
             s->control[0] = 0.0f;
             s->control[1] = 0.0f;
             s->control[2 + s->n_buttons] = 0.0f;
@@ -349,6 +346,15 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         }
         world_mutex_unlock(&s->mutex);
         if (stop) break;
+        if (s->control_debug_enabled && s->ctrl_dim >= s->n_buttons + 3) {
+            int active_buttons = 0;
+            for (int i = 0; i < s->n_buttons; ++i) {
+                if (control[2 + i] > 0.5f) ++active_buttons;
+            }
+            fprintf(stderr,
+                    "raylib control: mouse=(%.4f, %.4f) active_buttons=%d wheel=%.0f\n",
+                    control[0], control[1], active_buttons, control[2 + s->n_buttons]);
+        }
 
         const unsigned char *pixels = NULL;
         int width = 0;
@@ -798,6 +804,13 @@ int main(int argc, char **argv) {
     shared.width = rgb_w;
     shared.height = rgb_h;
     shared.frames = rgb_frames;
+    {
+        const char *control_debug_env = getenv("WORLD_CONTROL_DEBUG");
+        shared.control_debug_enabled = control_debug_env ? control_debug_env[0] != '0' : 0;
+        if (shared.control_debug_enabled) {
+            fprintf(stderr, "raylib control debug enabled by WORLD_CONTROL_DEBUG=1\n");
+        }
+    }
     shared.target_control_seconds = cfg.inference_fps > 0 ? (float)rgb_frames / (float)cfg.inference_fps : 0.0f;
     shared.control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
     shared.rgb = (unsigned char *)malloc(rgb_bytes);

@@ -161,13 +161,13 @@ cmake --build build-vulkan -j
 Windows：
 
 ```bat
-.\build-win\Release\worldmodel_raylib.exe --model-dir .\Waypoint-1.5-1B --fast-realtime --mouse-scale 0.1
+.\build-win\Release\worldmodel_raylib.exe --model-dir .\Waypoint-1.5-1B --fast-realtime --mouse-scale 1.0
 ```
 
 Linux：
 
 ```sh
-./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --fast-realtime --mouse-scale 0.1
+./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --fast-realtime --mouse-scale 1.0
 ```
 
 控制：
@@ -183,7 +183,7 @@ Linux：
 
 ```sh
 python export_seed_latent.py --model-dir ./Waypoint-1.5-1B --out ./world_seed_latent.f32
-./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --seed-latent ./world_seed_latent.f32 --steps 4 --cache-window 8 --mouse-scale 0.1
+./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --seed-latent ./world_seed_latent.f32 --steps 4 --cache-window 8 --mouse-scale 1.0
 ```
 
 ### Headless Smoke
@@ -262,7 +262,7 @@ Vulkan shader probe：
 - `--steps 4 --cache-window 8`: 质量更好，但更慢
 - `--cache-window 1`: 仅用于调试，通常没有可控历史
 - `--warmup N`: 用临时 runtime 预热 N 个 chunk，随后丢弃临时 KV/latent 状态；正式窗口从新的 resident runtime 开始
-- `--mouse-scale 0.1`: 鼠标太灵敏时继续调低，太弱时调高
+- `--mouse-scale X`: 鼠标 delta 缩放，默认 `1.0`；最终送入模型的 `CtrlInput.mouse` 会 clamp 到 PyTorch 侧使用的 `[-1, 1]` 范围
 - `--frame-idx N`: 设置第一个 latent frame 的 temporal RoPE/cache 位置
 - `--frames N`: 同一进程生成 N 个 latent frame，并保留 KV cache 历史
 - `--cache-pass`: 每个 frame 生成后追加 sigma=0 的 cache 写入 pass
@@ -270,7 +270,7 @@ Vulkan shader probe：
 - `--latent FILE`: 载入外部 little-endian float32 latent
 - `--vae-only --latent FILE --out FILE`: 只调试 TAEHV decode
 
-raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和滚轮，映射到 PyTorch controller layout。CUDA generation 在 worker thread 里跑，主线程继续轮询输入；收到新 decoded chunk 后按顺序播放一次，然后停在最后一帧等待下一个 chunk。
+raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和滚轮，映射到 PyTorch controller layout。CUDA generation 在 worker thread 里跑，主线程继续轮询输入；收到新 decoded chunk 后按顺序播放一次，然后停在最后一帧等待下一个 chunk。`WORLD_CONTROL_DEBUG=1` 会打印每个 chunk 实际送入模型的 mouse/button/wheel。
 
 ## 7. CUDA/CUTLASS 状态
 
