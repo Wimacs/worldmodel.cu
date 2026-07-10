@@ -282,7 +282,7 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
 - VAE decode 当前是 F32/NCHW 主路径；1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
 - `WORLD_VAE_3X3_BATCH_COLS=1` 可试验 frame-batched 3x3 tiles；当前 profile 显示它慢于默认 per-frame path，所以默认关闭。
-- PyTorch extension 里已有 CUTLASS implicit-GEMM 3x3 NHWC/KRSC probe；core 比 im2col path 快，但逐层临时 layout 转换收益不稳定，所以还未接默认 runtime。下一步应做连续 NHWC VAE island。
+- PyTorch extension 里已有 CUTLASS implicit-GEMM 3x3 NHWC/KRSC 单层和 pair probe；连续 NHWC island 比两层 im2col path 快，下一步应接 runtime 的 FP16/NHWC conv 和 KRSC half 权重预打包。
 - `WORLD_VAE_PROFILE=1` 会同步 CUDA event 并打印 VAE conv 分段时间，只用于 profile，不用于正常 FPS。
 
 ## 8. 测试

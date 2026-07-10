@@ -81,6 +81,13 @@ __global__ void silu_f32_kernel(const float *x, float *y, int64_t n) {
     }
 }
 
+__global__ void relu_inplace_f32_kernel(float *x, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && x[i] < 0.0f) {
+        x[i] = 0.0f;
+    }
+}
+
 __global__ void rms_norm_f32_kernel(const float *x, float *y, int rows, int dim, float eps) {
     __shared__ float red[256];
     int row = blockIdx.x;
@@ -2381,6 +2388,27 @@ torch::Tensor taehv_conv3x3_cutlass_implicit_nhwc_cuda(torch::Tensor x, torch::T
     return out;
 }
 
+torch::Tensor taehv_conv3x3_cutlass_implicit_nhwc_pair_cuda(
+        torch::Tensor x,
+        torch::Tensor weight0,
+        torch::Tensor bias0,
+        torch::Tensor weight1,
+        torch::Tensor bias1) {
+    TORCH_CHECK(x.dim() == 4, "x must be NHWC [N,H,W,C]");
+    TORCH_CHECK(weight0.dim() == 4 && weight1.dim() == 4, "weights must be KRSC [Cout,3,3,Cin]");
+    TORCH_CHECK(weight0.size(3) == x.size(3), "first conv input channel mismatch");
+    TORCH_CHECK(weight1.size(3) == weight0.size(0), "second conv input channel mismatch");
+    TORCH_CHECK(bias0.numel() == weight0.size(0), "bias0 length must equal weight0 Cout");
+    TORCH_CHECK(bias1.numel() == weight1.size(0), "bias1 length must equal weight1 Cout");
+
+    torch::Tensor hidden = taehv_conv3x3_cutlass_implicit_nhwc_cuda(x, weight0, bias0);
+    relu_inplace_f32_kernel<<<div_up_i64(hidden.numel(), 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        hidden.data_ptr<float>(),
+        hidden.numel());
+    check_last_cuda_error("taehv_conv3x3_cutlass_implicit_nhwc_pair_relu");
+    return taehv_conv3x3_cutlass_implicit_nhwc_cuda(hidden, weight1, bias1);
+}
+
 torch::Tensor taehv_concat_past_cuda(torch::Tensor x) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CONTIGUOUS(x);
@@ -2455,6 +2483,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("taehv_conv3x3_cutlass", &taehv_conv3x3_cutlass_cuda, "TAEHV 3x3 Conv2d using im2col tile + CUTLASS GEMM (CUDA, f32)");
     m.def("taehv_conv3x3_cutlass_batched", &taehv_conv3x3_cutlass_batched_cuda, "TAEHV 3x3 Conv2d using batch-spatial im2col tile + CUTLASS GEMM (CUDA, f32)", py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("tile_cols"));
     m.def("taehv_conv3x3_cutlass_implicit_nhwc", &taehv_conv3x3_cutlass_implicit_nhwc_cuda, "TAEHV 3x3 Conv2d using CUTLASS implicit-GEMM NHWC/KRSC probe (CUDA, f32)");
+    m.def("taehv_conv3x3_cutlass_implicit_nhwc_pair", &taehv_conv3x3_cutlass_implicit_nhwc_pair_cuda, "Two TAEHV 3x3 CUTLASS implicit-GEMM NHWC convs with intermediate ReLU (CUDA, f32)");
     m.def("taehv_concat_past", &taehv_concat_past_cuda, "TAEHV MemBlock current+past concat (CUDA, f32)");
     m.def("taehv_upsample2", &taehv_upsample2_cuda, "TAEHV nearest upsample x2 (CUDA, f32)");
     m.def("taehv_tgrow_reshape", &taehv_tgrow_reshape_cuda, "TAEHV TGrow channel-to-time reshape (CUDA, f32)");

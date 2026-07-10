@@ -58,7 +58,9 @@ VAE：
 - 当前 profiling 结果：默认 tile 16384 per-frame path 是 `1x1_gemm=1.314ms/16 launches`，`3x3_im2col=24.346ms/496 tiles`，`3x3_gemm=34.252ms/496 tiles`，`3x3_bias=1.486ms`；旧 tile 4096 是 `1784 tiles`、`3x3_gemm=65.235ms`。下一步大头仍是 3x3 GEMM，但主要 launch 数已经降了一轮。
 - CUTLASS implicit-GEMM 3x3 NHWC/KRSC probe 已加入 PyTorch extension：`taehv_conv3x3_cutlass_implicit_nhwc`。它使用 F32 SIMT、same padding、alignment=1，先保证任意小 shape 能严格对拍。
 - 小型 CUDA event probe 显示 implicit NHWC core 确实能绕开 im2col 物化：`N=4,Cin=64,Cout=64,H=64,W=128` 时，现有 batched im2col path `0.220ms`，implicit NHWC core `0.115ms`，临时 `NCHW->NHWC->NCHW` 包裹后 `0.157ms`；`Cout=128` 时分别是 `0.282ms`、`0.197ms`、`0.269ms`。
-- 因此这一版的决策是：不把“每层临时转 NHWC 再转回 NCHW”的实现接入默认 runtime；下一版如果继续攻 VAE，应做连续 NHWC VAE island 或完整 NHWC/FP16 路径，让 layout 转换只发生在边界。
+- 单层 probe 结论：不把“每层临时转 NHWC 再转回 NCHW”的实现接入默认 runtime；需要用连续 NHWC island 或完整 NHWC/FP16 路径，让 layout 转换只发生在边界。
+- 连续 NHWC island probe 已加入 PyTorch extension：`taehv_conv3x3_cutlass_implicit_nhwc_pair`，执行 `conv3x3 -> ReLU -> conv3x3`，中间不离开 NHWC。小型 probe 显示 `N=4,Cin=64,Cmid=64,H=64,W=128` 时，两层 im2col path 是 `0.456ms`，NHWC pair core 是 `0.246ms`，边界转换一次后是 `0.279ms`；`Cin=128` 时分别是 `0.674ms`、`0.341ms`、`0.421ms`；`H=128,W=256` 时分别是 `1.896ms`、`0.800ms`、`1.016ms`。
+- 因此下一版可以开始接 runtime FP16/NHWC conv：先给 VAE 权重增加 KRSC half 预打包，再实现 `taehv_run_conv_h_nhwc()` 的 CUTLASS implicit conv。仍然不要接 cuDNN，也不要先做大规模 tile 搜索。
 
 Attention：
 
@@ -154,8 +156,9 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
 2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
 3. frame-batched tile 实验证明“简单合并 frame 维”不值得进默认。
-4. CUTLASS implicit-GEMM NHWC probe 已证明 core 有收益，但逐层临时 layout 转换收益不稳定；下一版应做连续 NHWC VAE island，而不是围绕当前 tile 做无休止参数搜索。
-5. 最后考虑 FP16 全路径、bias/ReLU fusion，以及真实 VAE shape 的少量专用 tensor-op/TF32 变体。
+4. CUTLASS implicit-GEMM NHWC 单层和 pair probe 已证明 core 有收益，且连续 NHWC island 能 amortize 边界转换。
+5. 下一版接 runtime FP16/NHWC conv：补 KRSC half 权重预打包，实现 `taehv_run_conv_h_nhwc()`，先用一个保守 CUTLASS implicit conv kernel 跑通并对拍/烟测。
+6. 再考虑 bias/ReLU fusion，以及真实 VAE shape 的少量专用 tensor-op/TF32 变体。
 
 ## 对拍规则
 
