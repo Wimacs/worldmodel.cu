@@ -1516,6 +1516,112 @@ static int row_major_linear_fp16_weight_tensorop(
     return 0;
 }
 
+static size_t row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
+        int m,
+        int k,
+        int n,
+        int split_k_slices) {
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4,
+        8,
+        8,
+        true>;
+
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {static_cast<const cutlass::half_t *>(nullptr), k},
+        {static_cast<const cutlass::half_t *>(nullptr), k},
+        {static_cast<const float *>(nullptr), n},
+        {static_cast<float *>(nullptr), n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    return Gemm::get_workspace_size(args);
+}
+
+static int row_major_linear_fp16_weight_tensorop_splitk(
+        const float *x_rm,
+        __half *x_half_tmp,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n,
+        int split_k_slices,
+        void *workspace,
+        size_t workspace_bytes) {
+    if (split_k_slices <= 1) {
+        return row_major_linear_fp16_weight_tensorop(x_rm, x_half_tmp, w_rm_h, y_rm, m, k, n);
+    }
+    int64_t x_elems = (int64_t)m * k;
+    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
+    CUDA_OK(cudaGetLastError());
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4,
+        8,
+        8,
+        true>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    size_t needed_workspace = Gemm::get_workspace_size(args);
+    if (needed_workspace > workspace_bytes || (needed_workspace > 0 && !workspace)) {
+        fprintf(stderr,
+                "split-K workspace too small: need %zu bytes have %zu bytes\n",
+                needed_workspace,
+                workspace_bytes);
+        return 1;
+    }
+    Gemm gemm;
+    CUTLASS_OK(gemm(args, workspace));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int copy_f32_to_device(float **dst, const float *src, size_t n) {
     *dst = NULL;
     CUDA_OK(cudaMalloc((void **)dst, n * sizeof(float)));
@@ -2905,11 +3011,13 @@ struct WorldCudaRuntime {
     int precomputed_total_passes;
     int forced_pass_table_idx;
     int frame_stride;
+    int mlp_fc2_splitk_slices;
     size_t latent_elems;
     size_t token_elems;
     size_t kv_rope_elems;
     size_t q_rope_elems;
     size_t linear_half_elems;
+    size_t splitk_workspace_bytes;
     const float *h_latent_override;
     float *h_latent;
     float *h_noise;
@@ -2965,6 +3073,7 @@ struct WorldCudaRuntime {
     int64_t *d_y_pos;
     int64_t *d_t_pos;
     __half *d_linear_half;
+    void *d_splitk_workspace;
     int attn_flash_enabled;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
@@ -2972,6 +3081,37 @@ struct WorldCudaRuntime {
     cudaEvent_t ev_after_setup;
     cudaEvent_t ev_after_transformer;
     cudaEvent_t ev_after_vae;
+    int profile_enabled;
+    cudaEvent_t prof_start;
+    cudaEvent_t prof_stop;
+    float prof_patch_ms;
+    float prof_norm_ms;
+    float prof_qkv_gemm_ms;
+    float prof_qkv_rope_ms;
+    float prof_cache_ms;
+    float prof_attn_ms;
+    float prof_attn_out_gemm_ms;
+    float prof_attn_residual_ms;
+    float prof_ctrl_ms;
+    float prof_mlp_fc1_ms;
+    float prof_mlp_silu_ms;
+    float prof_mlp_fc2_ms;
+    float prof_mlp_residual_ms;
+    float prof_out_ms;
+    int prof_patch_calls;
+    int prof_norm_calls;
+    int prof_qkv_gemm_calls;
+    int prof_qkv_rope_calls;
+    int prof_cache_calls;
+    int prof_attn_calls;
+    int prof_attn_out_gemm_calls;
+    int prof_attn_residual_calls;
+    int prof_ctrl_calls;
+    int prof_mlp_fc1_calls;
+    int prof_mlp_silu_calls;
+    int prof_mlp_fc2_calls;
+    int prof_mlp_residual_calls;
+    int prof_out_calls;
     DeviceVaeDecoder d_vae;
 };
 
@@ -3028,9 +3168,80 @@ static double monotonic_seconds(void) {
 #endif
 }
 
+static void runtime_profile_reset(WorldCudaRuntime *rt) {
+    if (!rt || !rt->profile_enabled) return;
+    rt->prof_patch_ms = 0.0f;
+    rt->prof_norm_ms = 0.0f;
+    rt->prof_qkv_gemm_ms = 0.0f;
+    rt->prof_qkv_rope_ms = 0.0f;
+    rt->prof_cache_ms = 0.0f;
+    rt->prof_attn_ms = 0.0f;
+    rt->prof_attn_out_gemm_ms = 0.0f;
+    rt->prof_attn_residual_ms = 0.0f;
+    rt->prof_ctrl_ms = 0.0f;
+    rt->prof_mlp_fc1_ms = 0.0f;
+    rt->prof_mlp_silu_ms = 0.0f;
+    rt->prof_mlp_fc2_ms = 0.0f;
+    rt->prof_mlp_residual_ms = 0.0f;
+    rt->prof_out_ms = 0.0f;
+    rt->prof_patch_calls = 0;
+    rt->prof_norm_calls = 0;
+    rt->prof_qkv_gemm_calls = 0;
+    rt->prof_qkv_rope_calls = 0;
+    rt->prof_cache_calls = 0;
+    rt->prof_attn_calls = 0;
+    rt->prof_attn_out_gemm_calls = 0;
+    rt->prof_attn_residual_calls = 0;
+    rt->prof_ctrl_calls = 0;
+    rt->prof_mlp_fc1_calls = 0;
+    rt->prof_mlp_silu_calls = 0;
+    rt->prof_mlp_fc2_calls = 0;
+    rt->prof_mlp_residual_calls = 0;
+    rt->prof_out_calls = 0;
+}
+
+static int runtime_profile_begin(WorldCudaRuntime *rt) {
+    if (!rt || !rt->profile_enabled) return 0;
+    CUDA_OK(cudaEventRecord(rt->prof_start, 0));
+    return 0;
+}
+
+static int runtime_profile_accum(WorldCudaRuntime *rt, float *accum, int *calls) {
+    if (!rt || !rt->profile_enabled) return 0;
+    float ms = 0.0f;
+    CUDA_OK(cudaEventRecord(rt->prof_stop, 0));
+    CUDA_OK(cudaEventSynchronize(rt->prof_stop));
+    CUDA_OK(cudaEventElapsedTime(&ms, rt->prof_start, rt->prof_stop));
+    *accum += ms;
+    *calls += 1;
+    return 0;
+}
+
+static void runtime_profile_print(const WorldCudaRuntime *rt) {
+    if (!rt || !rt->profile_enabled) return;
+    fprintf(stderr,
+            "transformer profile: patch=%.3fms/%d norm=%.3fms/%d qkv_gemm=%.3fms/%d qkv_rope=%.3fms/%d cache=%.3fms/%d attn=%.3fms/%d attn_out_gemm=%.3fms/%d attn_residual=%.3fms/%d ctrl=%.3fms/%d mlp_fc1=%.3fms/%d mlp_silu=%.3fms/%d mlp_fc2=%.3fms/%d mlp_residual=%.3fms/%d out=%.3fms/%d\n",
+            rt->prof_patch_ms, rt->prof_patch_calls,
+            rt->prof_norm_ms, rt->prof_norm_calls,
+            rt->prof_qkv_gemm_ms, rt->prof_qkv_gemm_calls,
+            rt->prof_qkv_rope_ms, rt->prof_qkv_rope_calls,
+            rt->prof_cache_ms, rt->prof_cache_calls,
+            rt->prof_attn_ms, rt->prof_attn_calls,
+            rt->prof_attn_out_gemm_ms, rt->prof_attn_out_gemm_calls,
+            rt->prof_attn_residual_ms, rt->prof_attn_residual_calls,
+            rt->prof_ctrl_ms, rt->prof_ctrl_calls,
+            rt->prof_mlp_fc1_ms, rt->prof_mlp_fc1_calls,
+            rt->prof_mlp_silu_ms, rt->prof_mlp_silu_calls,
+            rt->prof_mlp_fc2_ms, rt->prof_mlp_fc2_calls,
+            rt->prof_mlp_residual_ms, rt->prof_mlp_residual_calls,
+            rt->prof_out_ms, rt->prof_out_calls);
+}
+
 extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     if (!rt) return;
     taehv_decoder_free(&rt->d_vae);
+    if (rt->prof_stop) cudaEventDestroy(rt->prof_stop);
+    if (rt->prof_start) cudaEventDestroy(rt->prof_start);
     if (rt->ev_after_vae) cudaEventDestroy(rt->ev_after_vae);
     if (rt->ev_after_transformer) cudaEventDestroy(rt->ev_after_transformer);
     if (rt->ev_after_setup) cudaEventDestroy(rt->ev_after_setup);
@@ -3084,6 +3295,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_y_pos);
     cudaFree(rt->d_t_pos);
     cudaFree(rt->d_linear_half);
+    cudaFree(rt->d_splitk_workspace);
     free(rt->h_latent);
     free(rt->h_noise);
     free(rt->h_xy);
@@ -3148,6 +3360,28 @@ extern "C" int world_cuda_runtime_create(
             if (v > 0.0f) rt->rms_eps = v;
         }
         fprintf(stderr, "runtime RMSNorm eps: %.8g\n", rt->rms_eps);
+    }
+    {
+        const char *profile_env = getenv("WORLD_TRANSFORMER_PROFILE");
+        rt->profile_enabled = profile_env ? profile_env[0] != '0' : 0;
+        if (rt->profile_enabled) {
+            fprintf(stderr, "transformer profiling enabled by WORLD_TRANSFORMER_PROFILE=1\n");
+        }
+    }
+    {
+        const char *splitk_env = getenv("WORLD_MLP_FC2_SPLITK");
+        if (splitk_env && splitk_env[0]) {
+            rt->mlp_fc2_splitk_slices = atoi(splitk_env);
+        } else if (rt->T <= 256 && rt->mlp_hidden >= 8192 && rt->D >= 2048) {
+            rt->mlp_fc2_splitk_slices = 4;
+        } else {
+            rt->mlp_fc2_splitk_slices = 1;
+        }
+        if (rt->mlp_fc2_splitk_slices < 1) rt->mlp_fc2_splitk_slices = 1;
+        if (rt->mlp_fc2_splitk_slices > 32) rt->mlp_fc2_splitk_slices = 32;
+        if (rt->mlp_fc2_splitk_slices > 1) {
+            fprintf(stderr, "MLP fc2 CUTLASS split-K enabled: slices=%d\n", rt->mlp_fc2_splitk_slices);
+        }
     }
     rt->total_passes = steps_to_run + 1;
     rt->precomputed_total_passes = rt->total_passes;
@@ -3232,6 +3466,16 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_y_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_t_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_linear_half, rt->linear_half_elems * sizeof(__half)));
+    if (rt->mlp_fc2_splitk_slices > 1) {
+        rt->splitk_workspace_bytes = row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
+            rt->T, rt->mlp_hidden, rt->D, rt->mlp_fc2_splitk_slices);
+        if (rt->splitk_workspace_bytes > 0) {
+            RT_CUDA(cudaMalloc(&rt->d_splitk_workspace, rt->splitk_workspace_bytes));
+        }
+        fprintf(stderr,
+                "MLP fc2 split-K workspace: %.2f MiB\n",
+                (double)rt->splitk_workspace_bytes / (1024.0 * 1024.0));
+    }
 
     if (copy_f32_to_device(&rt->d_patch, weights->patchify_weight, patch_weight_elems)) goto fail;
     if (copy_f32_to_device(&rt->d_denoise_fc1, weights->denoise_fc1_weight, (size_t)rt->mlp_hidden * 512)) goto fail;
@@ -3255,6 +3499,10 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaEventCreate(&rt->ev_after_setup));
     RT_CUDA(cudaEventCreate(&rt->ev_after_transformer));
     RT_CUDA(cudaEventCreate(&rt->ev_after_vae));
+    if (rt->profile_enabled) {
+        RT_CUDA(cudaEventCreate(&rt->prof_start));
+        RT_CUDA(cudaEventCreate(&rt->prof_stop));
+    }
     if (taehv_decoder_init(&rt->d_vae, cfg, vae)) goto fail;
     RT_CUDA(cudaDeviceSynchronize());
 
@@ -3308,6 +3556,12 @@ extern "C" int world_cuda_runtime_step_rgb(
         STEP_LINEAR((x), (w), (y), (m), (k), (n)); \
     } \
 } while (0)
+#define STEP_PROFILE_BEGIN() do { \
+    if (runtime_profile_begin(rt)) return 1; \
+} while (0)
+#define STEP_PROFILE_ACCUM(ms_field, calls_field) do { \
+    if (runtime_profile_accum(rt, &rt->ms_field, &rt->calls_field)) return 1; \
+} while (0)
 
     STEP_CUDA(cudaEventRecord(rt->ev_step_start, 0));
     int current_frame_idx = rt->next_frame_idx;
@@ -3341,6 +3595,7 @@ extern "C" int world_cuda_runtime_step_rgb(
     fprintf(stderr, "live frame %d: frame_idx=%d frame_timestamp=%d\n",
             rt->frame_ordinal, current_frame_idx, frame_timestamp);
     STEP_CUDA(cudaEventRecord(rt->ev_after_setup, 0));
+    runtime_profile_reset(rt);
 
     for (int pass_idx = 0; pass_idx < rt->total_passes; ++pass_idx) {
         int is_cache_pass = pass_idx >= rt->steps_to_run;
@@ -3357,10 +3612,12 @@ extern "C" int world_cuda_runtime_step_rgb(
         }
 
         int patch_elems = rt->C * rt->ph * rt->pw;
+        STEP_PROFILE_BEGIN();
         patchify_im2row_f32_kernel<<<div_up_i64((int64_t)rt->T * patch_elems, 256), 256>>>(
             rt->d_latent, rt->d_patch_rows, rt->C, rt->H, rt->W, rt->ph, rt->pw, cfg->height, cfg->width);
         STEP_CUDA(cudaGetLastError());
         STEP_LINEAR(rt->d_patch_rows, rt->d_patch, rt->d_tokens, rt->T, patch_elems, rt->D);
+        STEP_PROFILE_ACCUM(prof_patch_ms, prof_patch_calls);
         float *d_tokens_cur = rt->d_tokens;
         float *d_tokens_next = rt->d_tokens_after_mlp;
 
@@ -3376,11 +3633,16 @@ extern "C" int world_cuda_runtime_step_rgb(
             float *d_b1 = d_layer_mod + 4 * rt->D;
             float *d_g1 = d_layer_mod + 5 * rt->D;
 
+            STEP_PROFILE_BEGIN();
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, rt->rms_eps);
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
+            STEP_PROFILE_BEGIN();
             STEP_LINEAR_FAST(rt->d_norm, lw->qkv_proj_weight, lw->qkv_proj_weight_h,
                              rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
+            STEP_PROFILE_ACCUM(prof_qkv_gemm_ms, prof_qkv_gemm_calls);
             float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? rt->d_v_first : rt->d_v;
+            STEP_PROFILE_BEGIN();
             {
                 dim3 grid(rt->T, cfg->n_heads + 2 * cfg->n_kv_heads);
                 size_t smem = (size_t)(rt->d_head + 256) * sizeof(float);
@@ -3395,7 +3657,9 @@ extern "C" int world_cuda_runtime_step_rgb(
                     rt->d_v, rt->d_v_first, lw->v_lamb, (int64_t)rt->kv_rope_elems);
                 STEP_CUDA(cudaGetLastError());
             }
+            STEP_PROFILE_ACCUM(prof_qkv_rope_ms, prof_qkv_rope_calls);
 
+            STEP_PROFILE_BEGIN();
             int bucket = (current_frame_idx + (cache->pinned_dilation - 1)) / cache->pinned_dilation;
             int num_buckets = (cache->ring_length / rt->T) / cache->pinned_dilation;
             int base = (bucket % num_buckets) * rt->T;
@@ -3408,6 +3672,8 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache->written, cache->indices, cache->index_count,
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_cache_ms, prof_cache_calls);
+            STEP_PROFILE_BEGIN();
             if (rt->d_head == 64) {
                 int attn_done = 0;
                 if (rt->attn_flash_enabled && cfg->n_heads % cfg->n_kv_heads == 0 && (cfg->n_heads / cfg->n_kv_heads) <= WORLD_ATTN_D64_FLASH_WARPS) {
@@ -3435,14 +3701,20 @@ extern "C" int world_cuda_runtime_step_rgb(
                     1.0f / sqrtf((float)rt->d_head));
             }
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_attn_ms, prof_attn_calls);
+            STEP_PROFILE_BEGIN();
             STEP_LINEAR_FAST(rt->d_attn, lw->out_proj_weight, lw->out_proj_weight_h,
                              rt->d_attn_out, rt->T, rt->D, rt->D);
+            STEP_PROFILE_ACCUM(prof_attn_out_gemm_ms, prof_attn_out_gemm_calls);
+            STEP_PROFILE_BEGIN();
             gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                 d_tokens_cur, rt->d_attn_out, d_g0, rt->d_tokens_after_attn, rt->T, rt->D);
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_attn_residual_ms, prof_attn_residual_calls);
 
             float *d_tokens_ctrl = rt->d_tokens_after_attn;
             if (lw->has_ctrl) {
+                STEP_PROFILE_BEGIN();
                 rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, rt->rms_eps);
                 STEP_CUDA(cudaGetLastError());
                 STEP_LINEAR_FAST(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, lw->ctrl_fc1_x_weight_h,
@@ -3456,20 +3728,45 @@ extern "C" int world_cuda_runtime_step_rgb(
                     rt->d_tokens_after_attn, rt->d_ctrl_out, rt->d_tokens_after_ctrl, rt->token_elems);
                 STEP_CUDA(cudaGetLastError());
                 d_tokens_ctrl = rt->d_tokens_after_ctrl;
+                STEP_PROFILE_ACCUM(prof_ctrl_ms, prof_ctrl_calls);
             }
 
+            STEP_PROFILE_BEGIN();
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, rt->rms_eps);
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
+            STEP_PROFILE_BEGIN();
             STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
                              rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
+            STEP_PROFILE_ACCUM(prof_mlp_fc1_ms, prof_mlp_fc1_calls);
+            STEP_PROFILE_BEGIN();
             silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
                 rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
             STEP_CUDA(cudaGetLastError());
-            STEP_LINEAR_FAST(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, lw->dit_mlp_fc2_weight_h,
-                             rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);
+            STEP_PROFILE_ACCUM(prof_mlp_silu_ms, prof_mlp_silu_calls);
+            STEP_PROFILE_BEGIN();
+            if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
+                if (row_major_linear_fp16_weight_tensorop_splitk(
+                            rt->d_mlp_hidden,
+                            rt->d_linear_half,
+                            lw->dit_mlp_fc2_weight_h,
+                            rt->d_mlp_out,
+                            rt->T,
+                            rt->mlp_hidden,
+                            rt->D,
+                            rt->mlp_fc2_splitk_slices,
+                            rt->d_splitk_workspace,
+                            rt->splitk_workspace_bytes)) return 1;
+            } else {
+                STEP_LINEAR_FAST(rt->d_mlp_hidden, lw->dit_mlp_fc2_weight, lw->dit_mlp_fc2_weight_h,
+                                 rt->d_mlp_out, rt->T, rt->mlp_hidden, rt->D);
+            }
+            STEP_PROFILE_ACCUM(prof_mlp_fc2_ms, prof_mlp_fc2_calls);
+            STEP_PROFILE_BEGIN();
             gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
                 d_tokens_ctrl, rt->d_mlp_out, d_g1, d_tokens_next, rt->T, rt->D);
             STEP_CUDA(cudaGetLastError());
+            STEP_PROFILE_ACCUM(prof_mlp_residual_ms, prof_mlp_residual_calls);
 
             float *d_swap = d_tokens_cur;
             d_tokens_cur = d_tokens_next;
@@ -3479,6 +3776,7 @@ extern "C" int world_cuda_runtime_step_rgb(
         if (is_cache_pass) continue;
 
         float *d_out_mod = rt->d_out_mod_table + (int64_t)table_pass_idx * 2 * rt->D;
+        STEP_PROFILE_BEGIN();
         out_norm_silu_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_out_mod, rt->d_final_tokens, rt->T, rt->D, rt->rms_eps);
         STEP_CUDA(cudaGetLastError());
         unpatchify_orig_f32_kernel<<<rt->T * (rt->C * rt->ph * rt->pw), 256>>>(
@@ -3488,6 +3786,7 @@ extern "C" int world_cuda_runtime_step_rgb(
         latent_update_f32_kernel<<<div_up_i64((int64_t)rt->latent_elems, 256), 256>>>(
             rt->d_latent, rt->d_latent_out, dsigma, (int64_t)rt->latent_elems);
         STEP_CUDA(cudaGetLastError());
+        STEP_PROFILE_ACCUM(prof_out_ms, prof_out_calls);
     }
 
     STEP_CUDA(cudaEventRecord(rt->ev_after_transformer, 0));
@@ -3532,9 +3831,12 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache_tokens_l0,
                 (rt->T > 0 && cache_tokens_l0 >= 0) ? (float)cache_tokens_l0 / (float)rt->T : -1.0f);
     }
+    runtime_profile_print(rt);
 #undef STEP_CUDA
 #undef STEP_LINEAR
 #undef STEP_LINEAR_FAST
+#undef STEP_PROFILE_BEGIN
+#undef STEP_PROFILE_ACCUM
     return 0;
 }
 

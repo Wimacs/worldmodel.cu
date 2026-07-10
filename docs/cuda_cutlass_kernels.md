@@ -23,6 +23,8 @@ FP16-weight fast path：
 - resident runtime 默认使用 CUTLASS tensor-op GEMM 做 `half x half -> float accumulator -> float output`。
 - tensor-op kernel 使用 CUTLASS Sm80 tests 覆盖过的 `128x128x32` threadblock，`64x64x32` warp，`16x8x16` instruction，4 stages。
 - probe 已覆盖 resident 主要真实 shape：`(1,2048,8192)`、`(512,2048,2048)`、`(512,2048,4096)`、`(512,2048,8192)`、`(512,8192,2048)`。
+- MLP fc2 的真实 360p 形状是 `M=128,K=8192,N=2048`，默认 tensor-op GEMM 只有 `1x16` 个 CTA，profile 显示它是 transformer 最大单块。新增 CUTLASS serial split-K 专用路径，默认只在小 M、大 K 形状自动用 `split_k_slices=4`；`WORLD_MLP_FC2_SPLITK=1` 可关闭，显式设置 `2/4/8/...` 可覆盖。
+- 360p、24 layer、4 step、`WORLD_VAE_FP16_NHWC=1`、`cache-window=8` 的 profile 对照：默认无 split-K 时 `mlp_fc2=26.413ms/120`、`total=80.033ms`；`splitK=2` 为 `14.241ms/120`、`66.900ms`；`splitK=4` 为 `8.637ms/120`、`62.249ms`；`splitK=8` 为 `9.976ms/120`、`63.275ms`。正常非 profile smoke 默认启发式为 `total=53.422ms`、`chunk_fps=18.719`、`rgb_fps=74.875`。所以这一版选择 4，不继续做无边界 tile 搜索。
 - CMake/NVCC 独立探针 `worldmodel_cuda_gemm_probe --tensorop` 现在通过；此前 `ldsm RowMajor` 失败的原因是 CMake 实际编译成了 `sm_52`，导致 CUTLASS SM80 `ldsm` 实现没有启用。
 - CMake 默认 `CMAKE_CUDA_ARCHITECTURES=89` 已移到 `enable_language(CUDA)` 之前设置，并在 configure 时打印实际架构。
 - `WORLD_FP16_GEMM=simt` 可以强制回退旧的 FP16 SIMT GEMM；`WORLD_FP16_GEMM=0` 可以强制回退到 FP32 SIMT GEMM，用于定位问题。
