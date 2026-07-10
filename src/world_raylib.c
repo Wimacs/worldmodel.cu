@@ -142,6 +142,8 @@ typedef struct {
     int stop;
     int failed;
     int produced_chunks;
+    int input_epoch;
+    int consumed_epoch;
     float generation_seconds;
     float control_seconds;
     float target_control_seconds;
@@ -161,7 +163,7 @@ enum {
 
 static void ray_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
+            "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-generate N] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
             "\n"
             "Raylib realtime frontend. Loads weights, optionally prewarms a temporary runtime,\n"
             "then renders decoded frames from a fresh resident runtime without writing images.\n",
@@ -324,16 +326,26 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
 
 static void merge_frame_control(LiveShared *s, const float *frame_control, float frame_seconds) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
+    int new_input = 0;
     s->control[0] = clamp_mouse_accum(s->control[0] + frame_control[0]);
     s->control[1] = clamp_mouse_accum(s->control[1] + frame_control[1]);
     if (frame_seconds > 0.0f && frame_seconds < 0.25f) {
         s->control_seconds += frame_seconds;
     }
     for (int i = 0; i < s->n_buttons; ++i) {
+        if (frame_control[2 + i] > 0.5f && s->control[2 + i] <= 0.5f) {
+            new_input = 1;
+        }
         s->control[2 + i] = frame_control[2 + i];
+    }
+    if (fabsf(frame_control[2 + s->n_buttons]) > 0.5f) {
+        new_input = 1;
     }
     s->control[2 + s->n_buttons] =
         clamp_scroll_sign(s->control[2 + s->n_buttons] + frame_control[2 + s->n_buttons]);
+    if (new_input) {
+        s->input_epoch += 1;
+    }
 }
 
 static int control_has_activity(const float *control, int ctrl_dim, int n_buttons) {
@@ -359,6 +371,7 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
     for (;;) {
         world_mutex_lock(&s->mutex);
         int stop = s->stop;
+        int input_ready = s->input_epoch != s->consumed_epoch;
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
             if (s->target_control_seconds > 0.0f && s->control_seconds > s->target_control_seconds) {
@@ -371,9 +384,12 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
             s->control[2 + s->n_buttons] = 0.0f;
             s->control_seconds = 0.0f;
         }
+        if (input_ready) {
+            s->consumed_epoch = s->input_epoch;
+        }
         world_mutex_unlock(&s->mutex);
         if (stop) break;
-        if (!control_has_activity(control, s->ctrl_dim, s->n_buttons)) {
+        if (!input_ready || !control_has_activity(control, s->ctrl_dim, s->n_buttons)) {
             world_sleep_ms(5);
             continue;
         }
@@ -512,6 +528,7 @@ int main(int argc, char **argv) {
     int window_height = 720;
     int warmup_chunks = 1;
     int headless_smoke = 0;
+    int headless_generate_chunks = 0;
     int fast_realtime = 0;
     int cache_window_override = -1;
     int headless_has_mouse = 0;
@@ -565,6 +582,12 @@ int main(int argc, char **argv) {
             warmup_chunks = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--headless-smoke") == 0) {
             headless_smoke = 1;
+        } else if (strcmp(argv[i], "--headless-generate") == 0 && i + 1 < argc) {
+            headless_generate_chunks = atoi(argv[++i]);
+            if (headless_generate_chunks < 0) {
+                fprintf(stderr, "invalid --headless-generate %d\n", headless_generate_chunks);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--headless-out") == 0 && i + 1 < argc) {
             headless_out_path = argv[++i];
         } else if (strcmp(argv[i], "--headless-mouse") == 0 && i + 2 < argc) {
@@ -749,6 +772,16 @@ int main(int argc, char **argv) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
+        }
+    }
+    if (headless_smoke) {
+        for (int i = 0; i < headless_generate_chunks; ++i) {
+            fprintf(stderr, "headless generated chunk %d/%d\n", i + 1, headless_generate_chunks);
+            if (world_runtime_step_pixels(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+                free(seed_control);
+                free(warm_control);
+                goto cleanup_before_window;
+            }
         }
     }
     free(seed_control);
