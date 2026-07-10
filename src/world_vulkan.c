@@ -542,6 +542,11 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout runtime_indexed_attention_d64_splitk_reduce_set_layout;
     VkPipelineLayout runtime_indexed_attention_d64_splitk_reduce_pipeline_layout;
     VkPipeline runtime_indexed_attention_d64_splitk_reduce_pipeline;
+    VkShaderModule runtime_sparse_gqa_fmha_shader;
+    VkPipelineLayout runtime_sparse_gqa_fmha_pipeline_layout;
+    VkPipeline runtime_sparse_gqa_fmha_pipeline;
+    int runtime_sparse_gqa_fmha_requested;
+    int runtime_sparse_gqa_fmha_enabled;
     int runtime_indexed_attention_d64_splitk_enabled;
     int runtime_indexed_attention_d64_splitk_dynamic_tiles;
     uint32_t runtime_indexed_attention_d64_splitk_block;
@@ -616,6 +621,8 @@ struct WorldVulkanRuntime {
     VkDescriptorSet *indexed_attention_splitk_part_descriptor_sets;
     VkDescriptorPool *indexed_attention_splitk_reduce_descriptor_pools;
     VkDescriptorSet *indexed_attention_splitk_reduce_descriptor_sets;
+    VkDescriptorPool *sparse_gqa_fmha_descriptor_pools;
+    VkDescriptorSet *sparse_gqa_fmha_descriptor_sets;
     VkDescriptorPool *attn_out_proj_descriptor_pools;
     VkDescriptorSet *attn_out_proj_descriptor_sets;
     VkDescriptorPool *attn_out_proj_wf16_descriptor_pools;
@@ -884,6 +891,8 @@ struct WorldVulkanRuntime {
     VkBuffer cache_indices_buffer;
     VkDeviceMemory cache_indices_memory;
     void *cache_indices_mapped;
+    VkBuffer cache_block_ids_buffer;
+    VkDeviceMemory cache_block_ids_memory;
     VkBuffer cache_index_count_buffer;
     VkDeviceMemory cache_index_count_memory;
     void *cache_index_count_mapped;
@@ -3358,14 +3367,33 @@ static int create_runtime_model_slice(
     }
     {
         const char *kv_f16_env = getenv("WORLD_VULKAN_KV_CACHE_F16");
-        if (kv_f16_env && kv_f16_env[0] == '1') {
-            if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+        const char *sparse_env = getenv("WORLD_VULKAN_SPARSE_GQA_FMHA");
+        int sparse_explicit = sparse_env && sparse_env[0] != '0';
+        int sparse_requested = !sparse_env || sparse_env[0] != '0';
+        rt->runtime_sparse_gqa_fmha_requested = sparse_requested;
+        if ((kv_f16_env && kv_f16_env[0] == '1') || sparse_requested) {
+            if (rt->shader_float16_enabled && rt->storage_16bit_enabled &&
+                    (!sparse_requested || rt->cooperative_matrix_enabled)) {
                 rt->runtime_kv_cache_f16_enabled = 1;
             } else {
-                fprintf(stderr,
-                        "warning: WORLD_VULKAN_KV_CACHE_F16=1 ignored; shaderFloat16=%d storage16=%d\n",
-                        rt->shader_float16_enabled, rt->storage_16bit_enabled);
+                if (sparse_explicit || (kv_f16_env && kv_f16_env[0] == '1')) {
+                    fprintf(stderr,
+                            "warning: Vulkan FP16 KV/sparse GQA request ignored; shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
+                            rt->shader_float16_enabled, rt->storage_16bit_enabled,
+                            rt->cooperative_matrix_enabled);
+                }
+                rt->runtime_sparse_gqa_fmha_requested = 0;
             }
+        }
+        if (rt->runtime_sparse_gqa_fmha_requested &&
+                (rt->d_head != 64 || rt->T % 128 != 0 ||
+                 rt->cfg.n_kv_heads <= 0 ||
+                 (rt->cfg.n_heads % rt->cfg.n_kv_heads) != 0)) {
+            if (sparse_explicit) {
+                fprintf(stderr,
+                        "warning: WORLD_VULKAN_SPARSE_GQA_FMHA=1 ignored; requires D=64, T%%128=0 and Hq%%Hkv=0\n");
+            }
+            rt->runtime_sparse_gqa_fmha_requested = 0;
         }
     }
 
@@ -3456,8 +3484,9 @@ static int create_runtime_model_slice(
             }
         }
     }
+    uint32_t partial_block = rt->runtime_sparse_gqa_fmha_requested ? 128u : splitk_block;
     size_t splitk_tiles_max = max_cache_capacity > 0 ?
-        (size_t)(((uint32_t)max_cache_capacity + splitk_block - 1u) / splitk_block) : 0;
+        (size_t)(((uint32_t)max_cache_capacity + partial_block - 1u) / partial_block) : 0;
     size_t attn_splitk_partial_bytes = splitk_tiles_max *
         (size_t)rt->T * (size_t)rt->cfg.n_heads * 66u * sizeof(float);
     uint32_t splitk_shared_bytes = splitk_block * 64u * 2u * (uint32_t)sizeof(float);
@@ -3567,11 +3596,16 @@ static int create_runtime_model_slice(
         if (rt->layer_attention_enabled) {
             int splitk_requested =
                 splitk_env_enabled &&
+                !rt->runtime_sparse_gqa_fmha_requested &&
                 rt->d_head == 64 &&
                 rt->max_compute_work_group_invocations >= 768u &&
                 rt->max_compute_work_group_size_x >= 768u &&
                 rt->max_compute_shared_memory_size >= splitk_shared_bytes &&
                 attn_splitk_partial_bytes > 0;
+            int sparse_requested =
+                rt->runtime_sparse_gqa_fmha_requested &&
+                attn_splitk_partial_bytes > 0;
+            int partial_requested = splitk_requested || sparse_requested;
             rt->kv_upsert_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
             rt->kv_upsert_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
             rt->cache_indices_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
@@ -3581,17 +3615,27 @@ static int create_runtime_model_slice(
             if (splitk_requested) {
                 rt->indexed_attention_splitk_part_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
                 rt->indexed_attention_splitk_part_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+            }
+            if (partial_requested) {
                 rt->indexed_attention_splitk_reduce_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
                 rt->indexed_attention_splitk_reduce_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
+            }
+            if (sparse_requested) {
+                rt->sparse_gqa_fmha_descriptor_pools = (VkDescriptorPool *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorPool));
+                rt->sparse_gqa_fmha_descriptor_sets = (VkDescriptorSet *)calloc((size_t)rt->layers_to_run, sizeof(VkDescriptorSet));
             }
             if (!rt->kv_upsert_descriptor_pools || !rt->kv_upsert_descriptor_sets ||
                     !rt->cache_indices_descriptor_pools || !rt->cache_indices_descriptor_sets ||
                     !rt->indexed_attention_descriptor_pools || !rt->indexed_attention_descriptor_sets ||
                     (splitk_requested &&
                      (!rt->indexed_attention_splitk_part_descriptor_pools ||
-                      !rt->indexed_attention_splitk_part_descriptor_sets ||
-                      !rt->indexed_attention_splitk_reduce_descriptor_pools ||
-                      !rt->indexed_attention_splitk_reduce_descriptor_sets))) return 1;
+                      !rt->indexed_attention_splitk_part_descriptor_sets)) ||
+                    (partial_requested &&
+                     (!rt->indexed_attention_splitk_reduce_descriptor_pools ||
+                      !rt->indexed_attention_splitk_reduce_descriptor_sets)) ||
+                    (sparse_requested &&
+                     (!rt->sparse_gqa_fmha_descriptor_pools ||
+                      !rt->sparse_gqa_fmha_descriptor_sets))) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_bytes,
                         &rt->cache_k_buffer, &rt->cache_k_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_kv_bytes,
@@ -3606,11 +3650,13 @@ static int create_runtime_model_slice(
                         &rt->cache_written_buffer, &rt->cache_written_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
                         &rt->cache_indices_buffer, &rt->cache_indices_memory)) return 1;
+            if (create_device_storage_buffer(rt, (VkDeviceSize)cache_meta_bytes,
+                        &rt->cache_block_ids_buffer, &rt->cache_block_ids_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)cache_count_bytes,
                         &rt->cache_index_count_buffer, &rt->cache_index_count_memory)) return 1;
             if (create_device_storage_buffer(rt, (VkDeviceSize)token_bytes,
                         &rt->attn_buffer, &rt->attn_memory)) return 1;
-            if (splitk_requested) {
+            if (partial_requested) {
                 if (create_device_storage_buffer(rt, (VkDeviceSize)attn_splitk_partial_bytes,
                             &rt->attn_splitk_partial_buffer,
                             &rt->attn_splitk_partial_memory)) return 1;
@@ -3876,6 +3922,7 @@ static int create_runtime_model_slice(
             if (rt->cache_v_f16_buffer &&
                     clear_device_buffer(rt, rt->cache_v_f16_buffer, (VkDeviceSize)cache_kv_f16_bytes)) return 1;
             if (clear_device_buffer(rt, rt->cache_indices_buffer, (VkDeviceSize)cache_meta_bytes)) return 1;
+            if (clear_device_buffer(rt, rt->cache_block_ids_buffer, (VkDeviceSize)cache_meta_bytes)) return 1;
             if (clear_device_buffer(rt, rt->cache_index_count_buffer, (VkDeviceSize)cache_count_bytes)) return 1;
             if (clear_device_buffer(rt, rt->attn_buffer, (VkDeviceSize)token_bytes)) return 1;
             {
@@ -4285,7 +4332,7 @@ static int create_runtime_model_slice(
                             &rt->runtime_kv_upsert_f16_pipeline_layout,
                             &rt->runtime_kv_upsert_f16_pipeline)) return 1;
             }
-            if (create_storage_pipeline(rt, "cache_frame_indices.comp", 3, sizeof(WorldVulkanCacheFrameIndicesPush),
+            if (create_storage_pipeline(rt, "cache_frame_indices.comp", 4, sizeof(WorldVulkanCacheFrameIndicesPush),
                         &rt->runtime_cache_indices_shader, &rt->runtime_cache_indices_set_layout,
                         &rt->runtime_cache_indices_pipeline_layout, &rt->runtime_cache_indices_pipeline)) return 1;
             if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 6, sizeof(WorldVulkanIndexedAttentionPush),
@@ -4298,7 +4345,7 @@ static int create_runtime_model_slice(
                             &rt->runtime_indexed_attention_d64_pipeline_layout,
                             &rt->runtime_indexed_attention_d64_pipeline)) return 1;
                 {
-                    if (splitk_env_enabled) {
+                    if (splitk_env_enabled && !rt->runtime_sparse_gqa_fmha_requested) {
                         if (rt->max_compute_work_group_invocations >= splitk_need_invocations &&
                                 rt->max_compute_work_group_size_x >= splitk_need_invocations &&
                                 rt->max_compute_shared_memory_size >= splitk_shared_bytes) {
@@ -4350,6 +4397,33 @@ static int create_runtime_model_slice(
                                     splitk_need_invocations,
                                     splitk_shared_bytes);
                         }
+                    }
+                }
+                if (rt->runtime_sparse_gqa_fmha_requested) {
+                    if (rt->attn_splitk_partial_buffer) {
+                        if (!rt->runtime_indexed_attention_d64_splitk_reduce_pipeline) {
+                            if (create_storage_pipeline(rt,
+                                        "indexed_attention_d64_splitk64_reduce_f32.comp",
+                                        3, sizeof(WorldVulkanIndexedAttentionPush),
+                                        &rt->runtime_indexed_attention_d64_splitk_reduce_shader,
+                                        &rt->runtime_indexed_attention_d64_splitk_reduce_set_layout,
+                                        &rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout,
+                                        &rt->runtime_indexed_attention_d64_splitk_reduce_pipeline)) return 1;
+                        }
+                        if (create_storage_pipeline_with_set_layout(rt,
+                                    "sparse_gqa_fmha_d64_wf16_coopmat.comp",
+                                    rt->runtime_indexed_attention_set_layout,
+                                    sizeof(WorldVulkanIndexedAttentionPush),
+                                    &rt->runtime_sparse_gqa_fmha_shader,
+                                    &rt->runtime_sparse_gqa_fmha_pipeline_layout,
+                                    &rt->runtime_sparse_gqa_fmha_pipeline)) return 1;
+                        rt->runtime_sparse_gqa_fmha_enabled = 1;
+                        fprintf(stderr,
+                                "Vulkan native sparse GQA FMHA enabled (block=128 query_tile=16, FP16 Q/K/V, FP32 accum)\n");
+                    } else {
+                        fprintf(stderr,
+                                "warning: WORLD_VULKAN_SPARSE_GQA_FMHA ignored because partial workspace is unavailable\n");
+                        rt->runtime_sparse_gqa_fmha_requested = 0;
                     }
                 }
                 const char *flash_env = getenv("WORLD_VULKAN_FLASH_ATTN");
@@ -4693,7 +4767,8 @@ static int create_runtime_model_slice(
                     rt->cache_k_f16_buffer &&
                     rt->cache_v_f16_buffer &&
                     (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline ||
-                     rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline);
+                     rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline ||
+                     rt->runtime_sparse_gqa_fmha_pipeline);
                 VkBuffer buffers[5] = {
                     use_kv_f16 ? rt->cache_k_f16_buffer : rt->cache_k_buffer,
                     use_kv_f16 ? rt->cache_v_f16_buffer : rt->cache_v_buffer,
@@ -4715,12 +4790,16 @@ static int create_runtime_model_slice(
                             &rt->kv_upsert_descriptor_pools[layer_idx],
                             &rt->kv_upsert_descriptor_sets[layer_idx])) return 1;
                 {
-                    VkBuffer index_buffers[3] = {
-                        rt->cache_written_buffer, rt->cache_indices_buffer, rt->cache_index_count_buffer
+                    VkBuffer index_buffers[4] = {
+                        rt->cache_written_buffer, rt->cache_indices_buffer,
+                        rt->cache_index_count_buffer, rt->cache_block_ids_buffer
                     };
-                    VkDeviceSize index_sizes[3] = {layer_cache_meta_bytes, layer_cache_meta_bytes, sizeof(uint32_t)};
-                    VkDeviceSize index_offsets[3] = {meta_offset, meta_offset, count_offset};
-                    if (create_storage_descriptor_set(rt, rt->runtime_cache_indices_set_layout, 3,
+                    VkDeviceSize index_sizes[4] = {
+                        layer_cache_meta_bytes, layer_cache_meta_bytes,
+                        sizeof(uint32_t), layer_cache_meta_bytes
+                    };
+                    VkDeviceSize index_offsets[4] = {meta_offset, meta_offset, count_offset, meta_offset};
+                    if (create_storage_descriptor_set(rt, rt->runtime_cache_indices_set_layout, 4,
                                 index_buffers, index_sizes, index_offsets,
                                 &rt->cache_indices_descriptor_pools[layer_idx],
                                 &rt->cache_indices_descriptor_sets[layer_idx])) return 1;
@@ -4797,6 +4876,54 @@ static int create_runtime_model_slice(
                                 splitk_reduce_buffers, splitk_reduce_sizes, splitk_reduce_offsets,
                                 &rt->indexed_attention_splitk_reduce_descriptor_pools[layer_idx],
                                 &rt->indexed_attention_splitk_reduce_descriptor_sets[layer_idx])) return 1;
+                }
+                if (rt->runtime_sparse_gqa_fmha_enabled &&
+                        rt->sparse_gqa_fmha_descriptor_pools &&
+                        rt->sparse_gqa_fmha_descriptor_sets) {
+                    if (rt->indexed_attention_splitk_reduce_descriptor_pools &&
+                            rt->indexed_attention_splitk_reduce_descriptor_sets &&
+                            !rt->indexed_attention_splitk_reduce_descriptor_sets[layer_idx]) {
+                        VkBuffer reduce_buffers[3] = {
+                            rt->attn_splitk_partial_buffer,
+                            rt->attn_buffer,
+                            rt->cache_index_count_buffer
+                        };
+                        VkDeviceSize reduce_sizes[3] = {
+                            (VkDeviceSize)attn_splitk_partial_bytes,
+                            token_bytes,
+                            sizeof(uint32_t)
+                        };
+                        VkDeviceSize reduce_offsets[3] = {0, 0, count_offset};
+                        if (create_storage_descriptor_set(rt,
+                                    rt->runtime_indexed_attention_d64_splitk_reduce_set_layout, 3,
+                                    reduce_buffers, reduce_sizes, reduce_offsets,
+                                    &rt->indexed_attention_splitk_reduce_descriptor_pools[layer_idx],
+                                    &rt->indexed_attention_splitk_reduce_descriptor_sets[layer_idx])) return 1;
+                    }
+                    VkBuffer sparse_buffers[6] = {
+                        rt->q_buffer,
+                        rt->cache_k_f16_buffer,
+                        rt->cache_v_f16_buffer,
+                        rt->cache_block_ids_buffer,
+                        rt->attn_splitk_partial_buffer,
+                        rt->cache_index_count_buffer
+                    };
+                    VkDeviceSize sparse_sizes[6] = {
+                        q_rope_bytes,
+                        layer_cache_kv_f16_bytes,
+                        layer_cache_kv_f16_bytes,
+                        layer_cache_meta_bytes,
+                        (VkDeviceSize)attn_splitk_partial_bytes,
+                        sizeof(uint32_t)
+                    };
+                    VkDeviceSize sparse_offsets[6] = {
+                        0, kv_offset_f16, kv_offset_f16, meta_offset, 0, count_offset
+                    };
+                    if (create_storage_descriptor_set(rt,
+                                rt->runtime_indexed_attention_set_layout, 6,
+                                sparse_buffers, sparse_sizes, sparse_offsets,
+                                &rt->sparse_gqa_fmha_descriptor_pools[layer_idx],
+                                &rt->sparse_gqa_fmha_descriptor_sets[layer_idx])) return 1;
                 }
             }
             if (rt->layer_attn_out_enabled) {
@@ -5584,7 +5711,8 @@ static int record_runtime_model_slice(
                     rt->runtime_kv_cache_f16_enabled &&
                     rt->runtime_kv_upsert_f16_pipeline &&
                     (rt->runtime_indexed_attention_d64_flash_kvf16_pipeline ||
-                     rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline);
+                     rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline ||
+                     rt->runtime_sparse_gqa_fmha_pipeline);
                 VkPipeline kv_upsert_pipeline = use_kv_f16 ?
                     rt->runtime_kv_upsert_f16_pipeline : rt->runtime_kv_upsert_pipeline;
                 VkPipelineLayout kv_upsert_layout = use_kv_f16 ?
@@ -5705,7 +5833,52 @@ static int record_runtime_model_slice(
                     group <= (rt->runtime_indexed_attention_d64_splitk_warps ?
                         rt->runtime_indexed_attention_d64_splitk_warps : 24u) &&
                     (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads;
-                if (use_splitk_attention) {
+                int use_sparse_gqa_fmha =
+                    rt->runtime_sparse_gqa_fmha_enabled &&
+                    rt->runtime_sparse_gqa_fmha_pipeline &&
+                    rt->runtime_indexed_attention_d64_splitk_reduce_pipeline &&
+                    rt->sparse_gqa_fmha_descriptor_sets &&
+                    rt->indexed_attention_splitk_reduce_descriptor_sets &&
+                    rt->sparse_gqa_fmha_descriptor_sets[layer_idx] &&
+                    rt->indexed_attention_splitk_reduce_descriptor_sets[layer_idx] &&
+                    use_kv_f16 && rt->d_head == 64 && d64_allowed &&
+                    group > 0u &&
+                    (uint32_t)rt->cfg.n_heads == group * (uint32_t)rt->cfg.n_kv_heads &&
+                    (rt->T % 128) == 0;
+                if (use_sparse_gqa_fmha) {
+                    uint32_t visible_tokens = runtime_estimated_visible_cache_tokens(rt, layer_idx);
+                    uint32_t block_count = visible_tokens / 128u;
+                    uint32_t max_blocks = (uint32_t)cache_capacity / 128u;
+                    if (block_count == 0u || block_count > max_blocks) block_count = max_blocks;
+                    uint32_t folded_rows = group * (uint32_t)rt->T;
+                    uint32_t q_blocks = (folded_rows + 15u) / 16u;
+                    WorldVulkanIndexedAttentionPush sparse_push = attn_push;
+                    sparse_push.Nkv = block_count;
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_sparse_gqa_fmha_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_sparse_gqa_fmha_pipeline_layout, 0, 1,
+                            &rt->sparse_gqa_fmha_descriptor_sets[layer_idx], 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer,
+                            rt->runtime_sparse_gqa_fmha_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sparse_push), &sparse_push);
+                    PROFILE_DISPATCH("attention.sparse_gqa_fmha.part",
+                            (uint32_t)rt->cfg.n_kv_heads * q_blocks * block_count, 1, 1);
+                    cmd_shader_barrier(rt->command_buffer);
+
+                    vkCmdBindPipeline(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_indexed_attention_d64_splitk_reduce_pipeline);
+                    vkCmdBindDescriptorSets(rt->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout, 0, 1,
+                            &rt->indexed_attention_splitk_reduce_descriptor_sets[layer_idx], 0, NULL);
+                    vkCmdPushConstants(rt->command_buffer,
+                            rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sparse_push), &sparse_push);
+                    PROFILE_DISPATCH("attention.sparse_gqa_fmha.reduce",
+                            (uint32_t)(rt->T * rt->cfg.n_heads), 1, 1);
+                    cmd_shader_barrier(rt->command_buffer);
+                } else if (use_splitk_attention) {
                     int use_splitk_kvf16 =
                         use_kv_f16 && rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline;
                     uint32_t splitk_warps = rt->runtime_indexed_attention_d64_splitk_warps ?
@@ -12160,7 +12333,7 @@ cleanup:
 }
 
 int world_vulkan_cache_frame_indices_probe(void) {
-    enum { T = 4, slots = 9, capacity = T * slots };
+    enum { T = 128, slots = 9, capacity = T * slots };
     int rc = 1;
     WorldConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -12180,27 +12353,34 @@ int world_vulkan_cache_frame_indices_probe(void) {
     VkBuffer written_buffer = VK_NULL_HANDLE;
     VkBuffer indices_buffer = VK_NULL_HANDLE;
     VkBuffer count_buffer = VK_NULL_HANDLE;
+    VkBuffer blocks_buffer = VK_NULL_HANDLE;
     VkDeviceMemory written_memory = VK_NULL_HANDLE;
     VkDeviceMemory indices_memory = VK_NULL_HANDLE;
     VkDeviceMemory count_memory = VK_NULL_HANDLE;
+    VkDeviceMemory blocks_memory = VK_NULL_HANDLE;
     void *written_mapped = NULL;
     void *indices_mapped = NULL;
     void *count_mapped = NULL;
+    void *blocks_mapped = NULL;
 
     if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0, 1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
     size_t written_bytes = (size_t)capacity * sizeof(uint32_t);
     size_t indices_bytes = (size_t)capacity * sizeof(uint32_t);
     size_t count_bytes = sizeof(uint32_t);
+    size_t blocks_bytes = (size_t)slots * sizeof(uint32_t);
     if (create_host_buffer(rt, written_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &written_buffer, &written_memory, &written_mapped)) goto cleanup;
     if (create_host_buffer(rt, indices_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &indices_buffer, &indices_memory, &indices_mapped)) goto cleanup;
     if (create_host_buffer(rt, count_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 &count_buffer, &count_memory, &count_mapped)) goto cleanup;
+    if (create_host_buffer(rt, blocks_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &blocks_buffer, &blocks_memory, &blocks_mapped)) goto cleanup;
 
     uint32_t *written = (uint32_t *)written_mapped;
     uint32_t *indices = (uint32_t *)indices_mapped;
     uint32_t *count = (uint32_t *)count_mapped;
+    uint32_t *block_ids = (uint32_t *)blocks_mapped;
     memset(written, 0, written_bytes);
     const uint32_t written_slots[4] = {0u, 2u, 5u, 8u};
     for (uint32_t s = 0; s < 4u; ++s) {
@@ -12208,16 +12388,17 @@ int world_vulkan_cache_frame_indices_probe(void) {
         for (uint32_t t = 0; t < T; ++t) written[slot * T + t] = 1u;
     }
 
-    if (create_storage_pipeline(rt, "cache_frame_indices.comp", 3, sizeof(WorldVulkanCacheFrameIndicesPush),
+    if (create_storage_pipeline(rt, "cache_frame_indices.comp", 4, sizeof(WorldVulkanCacheFrameIndicesPush),
                 &shader, &set_layout, &pipeline_layout, &pipeline)) goto cleanup;
-    VkBuffer buffers[3] = {written_buffer, indices_buffer, count_buffer};
-    VkDeviceSize sizes[3] = {written_bytes, indices_bytes, count_bytes};
-    if (create_storage_descriptor_set(rt, set_layout, 3, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
+    VkBuffer buffers[4] = {written_buffer, indices_buffer, count_buffer, blocks_buffer};
+    VkDeviceSize sizes[4] = {written_bytes, indices_bytes, count_bytes, blocks_bytes};
+    if (create_storage_descriptor_set(rt, set_layout, 4, buffers, sizes, NULL, &descriptor_pool, &descriptor_set)) goto cleanup;
 
     for (uint32_t case_id = 0; case_id < 2u; ++case_id) {
         uint32_t base = case_id == 0u ? 2u * T : 0u;
         uint32_t write_step = case_id == 0u ? 1u : 0u;
         for (uint32_t i = 0; i < capacity; ++i) indices[i] = 0xffffffffu;
+        for (uint32_t i = 0; i < slots; ++i) block_ids[i] = 0xffffffffu;
         count[0] = 0u;
 
         WorldVulkanCacheFrameIndicesPush push;
@@ -12230,11 +12411,14 @@ int world_vulkan_cache_frame_indices_probe(void) {
 
         uint32_t ref_indices[capacity];
         uint32_t ref_count = 0u;
+        uint32_t ref_blocks[slots];
+        uint32_t ref_block_count = 0u;
         for (uint32_t slot = 0; slot < slots; ++slot) {
             uint32_t slot_base = slot * T;
             uint32_t slot_written = written[slot_base] && !(write_step && slot_base == base);
             if (slot_written) {
                 for (uint32_t t = 0; t < T; ++t) ref_indices[ref_count++] = slot_base + t;
+                ref_blocks[ref_block_count++] = slot;
             }
         }
 
@@ -12242,8 +12426,11 @@ int world_vulkan_cache_frame_indices_probe(void) {
         for (uint32_t i = 0; i < ref_count; ++i) {
             if (indices[i] != ref_indices[i]) ++mismatches;
         }
-        fprintf(stderr, "vulkan cache_frame_indices probe (%s): count=%u mismatches=%u\n",
-                write_step ? "write_step" : "read_step", count[0], mismatches);
+        for (uint32_t i = 0; i < ref_block_count; ++i) {
+            if (block_ids[i] != ref_blocks[i]) ++mismatches;
+        }
+        fprintf(stderr, "vulkan cache_frame_indices probe (%s): count=%u blocks=%u mismatches=%u\n",
+                write_step ? "write_step" : "read_step", count[0], ref_block_count, mismatches);
         if (mismatches != 0u) goto cleanup;
     }
     rc = 0;
@@ -12259,6 +12446,7 @@ cleanup:
         destroy_host_buffer(rt, written_buffer, written_memory, written_mapped);
         destroy_host_buffer(rt, indices_buffer, indices_memory, indices_mapped);
         destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
+        destroy_host_buffer(rt, blocks_buffer, blocks_memory, blocks_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
@@ -12487,6 +12675,238 @@ cleanup:
         destroy_host_buffer(rt, weight_buffer, weight_memory, weight_mapped);
         destroy_host_buffer(rt, bias_buffer, bias_memory, bias_mapped);
         destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+    }
+    world_vulkan_runtime_destroy(rt);
+    return rc;
+}
+
+int world_vulkan_sparse_gqa_fmha_probe(void) {
+    enum {
+        B = 1,
+        HQ = 4,
+        HKV = 2,
+        TQ = 32,
+        TK = 384,
+        D = 64,
+        BLOCKS = 2,
+        BLOCK_SIZE = 128,
+        PART_STRIDE = 66,
+    };
+    int rc = 1;
+    WorldConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channels = 32;
+    cfg.height = 1;
+    cfg.width = 1;
+    cfg.patch_h = 1;
+    cfg.patch_w = 1;
+
+    WorldVulkanRuntime *rt = NULL;
+    VkShaderModule part_shader = VK_NULL_HANDLE, reduce_shader = VK_NULL_HANDLE;
+    VkDescriptorSetLayout part_set_layout = VK_NULL_HANDLE, reduce_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout part_pipeline_layout = VK_NULL_HANDLE, reduce_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline part_pipeline = VK_NULL_HANDLE, reduce_pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool part_pool = VK_NULL_HANDLE, reduce_pool = VK_NULL_HANDLE;
+    VkDescriptorSet part_set = VK_NULL_HANDLE, reduce_set = VK_NULL_HANDLE;
+    VkBuffer q_buffer = VK_NULL_HANDLE, k_buffer = VK_NULL_HANDLE, v_buffer = VK_NULL_HANDLE;
+    VkBuffer blocks_buffer = VK_NULL_HANDLE, partial_buffer = VK_NULL_HANDLE;
+    VkBuffer out_buffer = VK_NULL_HANDLE, count_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory q_memory = VK_NULL_HANDLE, k_memory = VK_NULL_HANDLE, v_memory = VK_NULL_HANDLE;
+    VkDeviceMemory blocks_memory = VK_NULL_HANDLE, partial_memory = VK_NULL_HANDLE;
+    VkDeviceMemory out_memory = VK_NULL_HANDLE, count_memory = VK_NULL_HANDLE;
+    void *q_mapped = NULL, *k_mapped = NULL, *v_mapped = NULL;
+    void *blocks_mapped = NULL, *partial_mapped = NULL, *out_mapped = NULL, *count_mapped = NULL;
+
+    if (world_vulkan_runtime_create(&rt, &cfg, NULL, 0, 0, 0,
+                1234, WORLD_NOISE_NORMAL, NULL)) goto cleanup;
+    if (!rt->shader_float16_enabled || !rt->storage_16bit_enabled ||
+            !rt->cooperative_matrix_enabled) {
+        fprintf(stderr, "vulkan sparse GQA FMHA probe: skipped (required features unavailable)\n");
+        rc = 0;
+        goto cleanup;
+    }
+
+    const size_t q_elems = (size_t)B * HQ * TQ * D;
+    const size_t kv_elems = (size_t)B * HKV * TK * D;
+    const size_t rows = (size_t)B * TQ * HQ;
+    const size_t q_bytes = q_elems * sizeof(float);
+    const size_t kv_bytes = kv_elems * sizeof(uint16_t);
+    const size_t blocks_bytes = BLOCKS * sizeof(uint32_t);
+    const size_t partial_bytes = (size_t)BLOCKS * rows * PART_STRIDE * sizeof(float);
+    const size_t out_bytes = rows * D * sizeof(float);
+    if (create_host_buffer(rt, q_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &q_buffer, &q_memory, &q_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &k_buffer, &k_memory, &k_mapped)) goto cleanup;
+    if (create_host_buffer(rt, kv_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &v_buffer, &v_memory, &v_mapped)) goto cleanup;
+    if (create_host_buffer(rt, blocks_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &blocks_buffer, &blocks_memory, &blocks_mapped)) goto cleanup;
+    if (create_host_buffer(rt, partial_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &partial_buffer, &partial_memory, &partial_mapped)) goto cleanup;
+    if (create_host_buffer(rt, out_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &out_buffer, &out_memory, &out_mapped)) goto cleanup;
+    if (create_host_buffer(rt, sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                &count_buffer, &count_memory, &count_mapped)) goto cleanup;
+
+    float *q = (float *)q_mapped;
+    uint16_t *k = (uint16_t *)k_mapped;
+    uint16_t *v = (uint16_t *)v_mapped;
+    uint32_t *block_ids = (uint32_t *)blocks_mapped;
+    float *out = (float *)out_mapped;
+    for (size_t i = 0; i < q_elems; ++i) {
+        q[i] = probe_value((int)(i % 131071u) + 3109, 0.01171875f);
+    }
+    for (size_t i = 0; i < kv_elems; ++i) {
+        k[i] = probe_f32_to_f16(probe_value((int)(i % 131071u) + 3301, 0.009765625f));
+        v[i] = probe_f32_to_f16(probe_value((int)(i % 131071u) + 3511, 0.013671875f));
+    }
+    block_ids[0] = 2u;
+    block_ids[1] = 0u;
+    ((uint32_t *)count_mapped)[0] = BLOCKS * BLOCK_SIZE;
+    memset(partial_mapped, 0, partial_bytes);
+    memset(out, 0, out_bytes);
+
+    if (create_storage_pipeline(rt, "sparse_gqa_fmha_d64_wf16_coopmat.comp", 6,
+                sizeof(WorldVulkanIndexedAttentionPush),
+                &part_shader, &part_set_layout, &part_pipeline_layout, &part_pipeline)) goto cleanup;
+    VkBuffer part_buffers[6] = {
+        q_buffer, k_buffer, v_buffer, blocks_buffer, partial_buffer, count_buffer
+    };
+    VkDeviceSize part_sizes[6] = {
+        q_bytes, kv_bytes, kv_bytes, blocks_bytes, partial_bytes, sizeof(uint32_t)
+    };
+    if (create_storage_descriptor_set(rt, part_set_layout, 6, part_buffers, part_sizes, NULL,
+                &part_pool, &part_set)) goto cleanup;
+    if (create_storage_pipeline(rt, "indexed_attention_d64_splitk64_reduce_f32.comp", 3,
+                sizeof(WorldVulkanIndexedAttentionPush),
+                &reduce_shader, &reduce_set_layout, &reduce_pipeline_layout, &reduce_pipeline)) goto cleanup;
+    VkBuffer reduce_buffers[3] = {partial_buffer, out_buffer, count_buffer};
+    VkDeviceSize reduce_sizes[3] = {partial_bytes, out_bytes, sizeof(uint32_t)};
+    if (create_storage_descriptor_set(rt, reduce_set_layout, 3,
+                reduce_buffers, reduce_sizes, NULL, &reduce_pool, &reduce_set)) goto cleanup;
+
+    WorldVulkanIndexedAttentionPush push;
+    memset(&push, 0, sizeof(push));
+    push.B = B;
+    push.Hq = HQ;
+    push.Hkv = HKV;
+    push.Tq = TQ;
+    push.Nkv = BLOCKS;
+    push.Tk = TK;
+    push.D = D;
+    push.scale = 1.0f / 8.0f;
+    const uint32_t group = HQ / HKV;
+    const uint32_t folded_rows = group * TQ;
+    const uint32_t q_blocks = (folded_rows + 15u) / 16u;
+    if (submit_compute(rt, part_pipeline, part_pipeline_layout, part_set,
+                &push, sizeof(push), B * HKV * q_blocks * BLOCKS, 1, 1)) goto cleanup;
+    if (submit_compute(rt, reduce_pipeline, reduce_pipeline_layout, reduce_set,
+                &push, sizeof(push), (uint32_t)rows, 1, 1)) goto cleanup;
+
+    const char *dump_prefix = getenv("WORLD_VULKAN_SPARSE_PROBE_DUMP");
+    if (dump_prefix && dump_prefix[0]) {
+        char path[1024];
+#define DUMP_PROBE_DATA(suffix, ptr, bytes) do { \
+            int n = snprintf(path, sizeof(path), "%s.%s.bin", dump_prefix, (suffix)); \
+            if (n <= 0 || (size_t)n >= sizeof(path)) goto cleanup; \
+            FILE *f = fopen(path, "wb"); \
+            if (!f) goto cleanup; \
+            size_t wrote = fwrite((ptr), 1, (bytes), f); \
+            fclose(f); \
+            if (wrote != (bytes)) goto cleanup; \
+        } while (0)
+        DUMP_PROBE_DATA("q_f32", q, q_bytes);
+        DUMP_PROBE_DATA("k_f16", k, kv_bytes);
+        DUMP_PROBE_DATA("v_f16", v, kv_bytes);
+        DUMP_PROBE_DATA("blocks_u32", block_ids, blocks_bytes);
+        DUMP_PROBE_DATA("out_f32", out, out_bytes);
+#undef DUMP_PROBE_DATA
+    }
+
+    float max_abs = 0.0f;
+    double mean_abs = 0.0;
+    for (int b = 0; b < B; ++b) {
+        for (int tq = 0; tq < TQ; ++tq) {
+            for (int hq = 0; hq < HQ; ++hq) {
+                int hk = hq / (int)group;
+                float merged[D];
+                memset(merged, 0, sizeof(merged));
+                float merged_m = -INFINITY;
+                float merged_l = 0.0f;
+                for (int block = 0; block < BLOCKS; ++block) {
+                    int physical_start = (int)block_ids[block] * BLOCK_SIZE;
+                    float scores[BLOCK_SIZE];
+                    float block_m = -INFINITY;
+                    for (int n = 0; n < BLOCK_SIZE; ++n) {
+                        float dot = 0.0f;
+                        for (int d = 0; d < D; ++d) {
+                            size_t qi = (size_t)(((b * HQ + hq) * TQ + tq) * D + d);
+                            size_t ki = (size_t)(((b * HKV + hk) * TK + physical_start + n) * D + d);
+                            float qh = probe_f16_to_f32(probe_f32_to_f16(q[qi]));
+                            dot += qh * probe_f16_to_f32(k[ki]);
+                        }
+                        scores[n] = dot * push.scale;
+                        if (scores[n] > block_m) block_m = scores[n];
+                    }
+                    float block_l = 0.0f;
+                    float block_acc[D];
+                    memset(block_acc, 0, sizeof(block_acc));
+                    for (int n = 0; n < BLOCK_SIZE; ++n) {
+                        float p = expf(scores[n] - block_m);
+                        block_l += p;
+                        float ph = probe_f16_to_f32(probe_f32_to_f16(p));
+                        for (int d = 0; d < D; ++d) {
+                            size_t vi = (size_t)(((b * HKV + hk) * TK + physical_start + n) * D + d);
+                            block_acc[d] += ph * probe_f16_to_f32(v[vi]);
+                        }
+                    }
+                    float new_m = fmaxf(merged_m, block_m);
+                    float alpha = expf(merged_m - new_m);
+                    float beta = expf(block_m - new_m);
+                    for (int d = 0; d < D; ++d) {
+                        merged[d] = merged[d] * alpha + block_acc[d] * beta;
+                    }
+                    merged_l = merged_l * alpha + block_l * beta;
+                    merged_m = new_m;
+                }
+                size_t out_base = (size_t)((tq * HQ + hq) * D);
+                for (int d = 0; d < D; ++d) {
+                    float ref = merged[d] / merged_l;
+                    float diff = fabsf(out[out_base + d] - ref);
+                    if (diff > max_abs) max_abs = diff;
+                    mean_abs += diff;
+                }
+            }
+        }
+    }
+    mean_abs /= (double)(rows * D);
+    fprintf(stderr,
+            "vulkan sparse_gqa_fmha_d64_wf16_coopmat probe: max_abs=%g mean_abs=%g blocks={2,0}\n",
+            max_abs, mean_abs);
+    if (max_abs > 2.0e-3f || mean_abs > 2.0e-4) goto cleanup;
+    rc = 0;
+
+cleanup:
+    if (rt && rt->device) vkDeviceWaitIdle(rt->device);
+    if (part_pipeline) vkDestroyPipeline(rt->device, part_pipeline, NULL);
+    if (reduce_pipeline) vkDestroyPipeline(rt->device, reduce_pipeline, NULL);
+    if (part_pipeline_layout) vkDestroyPipelineLayout(rt->device, part_pipeline_layout, NULL);
+    if (reduce_pipeline_layout) vkDestroyPipelineLayout(rt->device, reduce_pipeline_layout, NULL);
+    if (part_pool) vkDestroyDescriptorPool(rt->device, part_pool, NULL);
+    if (reduce_pool) vkDestroyDescriptorPool(rt->device, reduce_pool, NULL);
+    if (part_set_layout) vkDestroyDescriptorSetLayout(rt->device, part_set_layout, NULL);
+    if (reduce_set_layout) vkDestroyDescriptorSetLayout(rt->device, reduce_set_layout, NULL);
+    if (part_shader) vkDestroyShaderModule(rt->device, part_shader, NULL);
+    if (reduce_shader) vkDestroyShaderModule(rt->device, reduce_shader, NULL);
+    if (rt) {
+        destroy_host_buffer(rt, q_buffer, q_memory, q_mapped);
+        destroy_host_buffer(rt, k_buffer, k_memory, k_mapped);
+        destroy_host_buffer(rt, v_buffer, v_memory, v_mapped);
+        destroy_host_buffer(rt, blocks_buffer, blocks_memory, blocks_mapped);
+        destroy_host_buffer(rt, partial_buffer, partial_memory, partial_mapped);
+        destroy_host_buffer(rt, out_buffer, out_memory, out_mapped);
+        destroy_host_buffer(rt, count_buffer, count_memory, count_mapped);
     }
     world_vulkan_runtime_destroy(rt);
     return rc;
@@ -13082,6 +13502,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
         if (rt->indexed_attention_descriptor_pools && rt->indexed_attention_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_descriptor_pools[i], NULL);
         if (rt->indexed_attention_splitk_part_descriptor_pools && rt->indexed_attention_splitk_part_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_splitk_part_descriptor_pools[i], NULL);
         if (rt->indexed_attention_splitk_reduce_descriptor_pools && rt->indexed_attention_splitk_reduce_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->indexed_attention_splitk_reduce_descriptor_pools[i], NULL);
+        if (rt->sparse_gqa_fmha_descriptor_pools && rt->sparse_gqa_fmha_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->sparse_gqa_fmha_descriptor_pools[i], NULL);
         if (rt->attn_out_proj_descriptor_pools && rt->attn_out_proj_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_descriptor_pools[i], NULL);
         if (rt->attn_out_proj_wf16_descriptor_pools && rt->attn_out_proj_wf16_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->attn_out_proj_wf16_descriptor_pools[i], NULL);
         if (rt->ctrl_cond_descriptor_pools && rt->ctrl_cond_descriptor_pools[i]) vkDestroyDescriptorPool(rt->device, rt->ctrl_cond_descriptor_pools[i], NULL);
@@ -13149,6 +13570,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_d64_splitk_part_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_splitk_part_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_reduce_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_splitk_reduce_pipeline, NULL);
+    if (rt->runtime_sparse_gqa_fmha_pipeline) vkDestroyPipeline(rt->device, rt->runtime_sparse_gqa_fmha_pipeline, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline) vkDestroyPipeline(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline, NULL);
     if (rt->runtime_gated_residual_pipeline) vkDestroyPipeline(rt->device, rt->runtime_gated_residual_pipeline, NULL);
     if (rt->runtime_add_channel_silu_pipeline) vkDestroyPipeline(rt->device, rt->runtime_add_channel_silu_pipeline, NULL);
@@ -13205,6 +13627,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_d64_splitk_part_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_splitk_part_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_splitk_part_kvf16_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_splitk_reduce_pipeline_layout, NULL);
+    if (rt->runtime_sparse_gqa_fmha_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_sparse_gqa_fmha_pipeline_layout, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_indexed_attention_d64_flash96_pipeline_layout, NULL);
     if (rt->runtime_gated_residual_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_gated_residual_pipeline_layout, NULL);
     if (rt->runtime_add_channel_silu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->runtime_add_channel_silu_pipeline_layout, NULL);
@@ -13296,6 +13719,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->runtime_indexed_attention_d64_splitk_part_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_splitk_part_shader, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_part_kvf16_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_splitk_part_kvf16_shader, NULL);
     if (rt->runtime_indexed_attention_d64_splitk_reduce_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_splitk_reduce_shader, NULL);
+    if (rt->runtime_sparse_gqa_fmha_shader) vkDestroyShaderModule(rt->device, rt->runtime_sparse_gqa_fmha_shader, NULL);
     if (rt->runtime_indexed_attention_d64_flash96_shader) vkDestroyShaderModule(rt->device, rt->runtime_indexed_attention_d64_flash96_shader, NULL);
     if (rt->runtime_gated_residual_shader) vkDestroyShaderModule(rt->device, rt->runtime_gated_residual_shader, NULL);
     if (rt->runtime_add_channel_silu_shader) vkDestroyShaderModule(rt->device, rt->runtime_add_channel_silu_shader, NULL);
@@ -13367,6 +13791,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->cache_v_f16_buffer, rt->cache_v_f16_memory, NULL);
     destroy_host_buffer(rt, rt->cache_written_buffer, rt->cache_written_memory, rt->cache_written_mapped);
     destroy_host_buffer(rt, rt->cache_indices_buffer, rt->cache_indices_memory, rt->cache_indices_mapped);
+    destroy_host_buffer(rt, rt->cache_block_ids_buffer, rt->cache_block_ids_memory, NULL);
     destroy_host_buffer(rt, rt->cache_index_count_buffer, rt->cache_index_count_memory, rt->cache_index_count_mapped);
     destroy_host_buffer(rt, rt->attn_buffer, rt->attn_memory, rt->attn_mapped);
     destroy_host_buffer(rt, rt->attn_splitk_partial_buffer, rt->attn_splitk_partial_memory, NULL);
@@ -13433,6 +13858,8 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     free(rt->indexed_attention_splitk_part_descriptor_sets);
     free(rt->indexed_attention_splitk_reduce_descriptor_pools);
     free(rt->indexed_attention_splitk_reduce_descriptor_sets);
+    free(rt->sparse_gqa_fmha_descriptor_pools);
+    free(rt->sparse_gqa_fmha_descriptor_sets);
     free(rt->attn_out_proj_descriptor_pools);
     free(rt->attn_out_proj_descriptor_sets);
     free(rt->attn_out_proj_wf16_descriptor_pools);

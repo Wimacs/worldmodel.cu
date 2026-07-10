@@ -211,6 +211,7 @@ if(WORLD_ENABLE_VULKAN)
     rms_norm_f32.comp
     silu_f32_to_f16.comp
     silu_f32.comp
+    sparse_gqa_fmha_d64_wf16_coopmat.comp
     taehv_add_relu_f32.comp
     taehv_concat_past_nchw_f32.comp
     taehv_conv2d_nchw_1x1_c4_f32.comp

@@ -86,3 +86,34 @@ v2 把输出 tile 扩成 32 通道：同一个 subgroup 维护四个 `16x8` FP32
 完整 24-layer、4-step、`cache-window=8` 连续生成到满 cache 后做 `new -> fallback -> new` 夹测。最后 4 个 chunk 的 fallback 墙钟均值为 `154.87 ms/chunk`、`25.83 RGB fps`；两次默认新路径分别为 `136.31` 和 `136.12 ms/chunk`，平均约 `29.37 RGB fps`。端到端延迟下降约 `12.0%`，吞吐提升约 `13.7%`。同一 latent 的最终 RGB 与 F32 路径平均绝对像素差为 `0.031-0.034/255`，最大 `3/255`，目视一致。
 
 这条路径仍保留 F32/NCHW activation 边界，所以不是 CUDA FP16/NHWC VAE 的终点。若后续 profile 再次指向 VAE，下一步应把 repeat/conv/ReLU/concat/upsample/tgrow 整条流改成 FP16/NHWC；不能继续只缩小 cooperative-matrix tile。
+
+## v3: Native Sparse GQA FMHA
+
+旧 attention split-K kernel 仍然按 query head 读取 K/V，并在每个 split 内用标量 FMA 完成 QK 和 PV。v3 针对当前模型固定的 `D=64` 和 128-token frame block 实现原生 sparse GQA FMHA：
+
+- cache index collector 在原 dispatch 中同时生成有序物理 block table；ring wrap 后也不需要 gather K/V。
+- 一个 subgroup 负责 16 个 folded GQA query 和一个 128-token 稀疏块。`Hq/Hkv` 个 query head 折叠到同一个 KV head，K/V 不复制到 query-head 维度。
+- QK 和 PV 使用 `GL_KHR_cooperative_matrix`；Q、K、V 和 block-local probability 为 FP16，累加、softmax 统计和 split merge 为 FP32。
+- score 和 probability 只存在于 shared memory。每个 sparse block 仅写出 64 维 accumulator 及 `(m, l)`，再由 reduce kernel按 online-softmax 公式合并。
+
+当前 shader 固定 `QUERY_TILE=16`、`SPARSE_BLOCK=128`。实验过单 workgroup 处理 64 个 query 的四 subgroup 版本，但 shared memory 增至约 74 KiB，满 cache part 时间由 `10.966 ms/120` 退化为 `12.087 ms/120`，因此没有保留。支持 shader FP16、16-bit storage 和 cooperative matrix 的 `D=64` GQA 模型默认启用；`WORLD_VULKAN_SPARSE_GQA_FMHA=0` 可回退到旧 attention。
+
+### Correctness
+
+独立 probe 使用 `B=1, Hq=4, Hkv=2, Tq=32, Tk=384, D=64`，并故意按 `{2, 0}` 读取非连续物理块，覆盖 GQA 映射、稀疏 block table 和 ring wrap：
+
+- cache index/block probe：write/read 两阶段均为 `mismatches=0`。
+- Vulkan 对逐块 CPU online-softmax reference：`max_abs=1.397e-9`，`mean_abs=7.903e-11`。
+- `test_vulkan_sparse_gqa_fmha.py` 读取 probe 原始张量并重建 PyTorch blockwise GQA reference，对拍通过。
+
+完整 24-layer、4-step、`cache-window=8` 连续生成 11 个 chunk，所有 latent 均为 finite。相对旧路径，最后一个 chunk 的 latent 平均绝对误差约 `4.16e-4`、最大误差 `1.31e-2`；最终 RGB 平均绝对像素误差约 `0.054-0.057/255`、最大 `4/255`，目视一致。
+
+### Performance
+
+满 cache timestamp profile：
+
+- 旧 split-K part/reduce：`28.260 + 0.994 = 29.254 ms/120`。
+- sparse GQA FMHA part/reduce：`10.966 + 0.764 = 11.730 ms/120`。
+- attention bucket 延迟降低 `59.9%`，完整 GPU dispatch 从 `136.087 ms` 降到 `117.024 ms`，降低 `14.0%`。
+
+正常无 profile 的最后 4 个满 cache chunk：旧路径为 `135.81 ms/chunk`、`29.45 RGB FPS`；新路径为 `116.87 ms/chunk`、`34.23 RGB FPS`。端到端延迟降低 `14.0%`，吞吐提升 `16.2%`。

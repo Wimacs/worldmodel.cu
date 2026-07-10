@@ -69,8 +69,11 @@ Use WASD and the mouse in the interactive window. Run an executable without argu
 ```sh
 python test_worldmodel_kernels.py
 python test_standalone_probe.py
+python test_vulkan_sparse_gqa_fmha.py
 ./build/worldmodel_cuda_gemm_probe --tensorop
 ./build-vulkan/worldmodel_vulkan_probe --taehv
+./build-vulkan/worldmodel_vulkan_probe --cache-indices
+./build-vulkan/worldmodel_vulkan_probe --sparse-fmha
 ```
 
 Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md) and [docs/vulkan_optimization.md](docs/vulkan_optimization.md).

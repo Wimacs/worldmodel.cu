@@ -14,6 +14,10 @@ layout(std430, binding = 2) buffer Count {
     uint count[];
 } out_count;
 
+layout(std430, binding = 3) buffer BlockIds {
+    uint block_ids[];
+} out_blocks;
+
 layout(push_constant) uniform Push {
     uint capacity;
     uint T;
@@ -55,6 +59,13 @@ void main() {
     if (slot_written) {
         for (uint t = lane; t < pc.T; t += 256u) {
             out_indices.indices[out_base + t] = slot_base + t;
+        }
+        if ((pc.T % 128u) == 0u) {
+            uint blocks_per_frame = pc.T / 128u;
+            for (uint block = lane; block < blocks_per_frame; block += 256u) {
+                out_blocks.block_ids[out_base / 128u + block] =
+                    slot_base / 128u + block;
+            }
         }
     }
 }
