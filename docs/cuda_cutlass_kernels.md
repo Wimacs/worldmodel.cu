@@ -46,8 +46,10 @@ FP32 path：
 VAE：
 
 - cuDNN 路径已经移除。
-- 当前 VAE decode 只走内置 F32/NCHW direct conv。
-- 后续性能优化应该用 CUTLASS conv/implicit-GEMM 或显式 im2row + CUTLASS GEMM，不再接 cuDNN。
+- 当前 VAE decode 仍是 F32/NCHW 主路径。
+- 1x1 conv 已接入 CUTLASS GEMM baseline：每个 frame 把 NCHW 平面视作 `B = [Cin, H*W]` row-major，权重视作 `A = [Cout, Cin]` row-major，输出直接落到该 frame 的 `[Cout, H*W]` NCHW 平面。
+- `WORLD_VAE_1X1_GEMM=0` 可以回退旧 direct 1x1 conv，用于性能和数值定位。
+- 3x3 conv 仍走内置 direct conv，是下一版 VAE 优化的大头；优先做显式 im2row + CUTLASS GEMM baseline，再根据带宽开销决定是否换 CUTLASS implicit-GEMM conv。
 
 Attention：
 
@@ -140,8 +142,8 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 建议顺序：
 
-1. 先把 1x1 conv 改成 CUTLASS GEMM。
-2. 再做 3x3 conv 的 im2row + CUTLASS GEMM baseline。
+1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
+2. 下一步做 3x3 conv 的 im2row + CUTLASS GEMM baseline。
 3. 如果 im2row 带宽太重，再换 CUTLASS implicit-GEMM conv。
 4. 最后考虑 NHWC/FP16 全路径和 bias/ReLU fusion。
 

@@ -949,6 +949,20 @@ __global__ static void taehv_conv2d_nchw_kernel(
     out[i] = sum;
 }
 
+__global__ static void taehv_add_bias_nchw_kernel(
+        float *out,
+        const float *bias,
+        int N,
+        int C,
+        int H,
+        int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * C * H * W;
+    if (i >= total) return;
+    int c = (int)((i / ((int64_t)H * W)) % C);
+    out[i] += bias[c];
+}
+
 __global__ static void taehv_concat_past_nchw_kernel(
         const float *x,
         float *out,
@@ -1761,6 +1775,7 @@ typedef struct {
     int H_pre_shuffle;
     int W_pre_shuffle;
     int fp16_nhwc_enabled;
+    int cutlass_1x1_enabled;
 } DeviceVaeDecoder;
 
 static void taehv_pick_scratch(float *cur, float *buf0, float *buf1, float *buf2, float **tmp, float **aux) {
@@ -1845,6 +1860,8 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->out_w = dec->W_pre_shuffle * 2;
     dec->max_elems = (size_t)16 * 64 * dec->H_pre_shuffle * dec->W_pre_shuffle;
     dec->rgb_elems = (size_t)4 * dec->out_h * dec->out_w * 3;
+    const char *vae_1x1_env = getenv("WORLD_VAE_1X1_GEMM");
+    dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
 
 #define VAE_INIT_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -1861,8 +1878,11 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, built-in F32/NCHW conv, pinned RGB host buffer\n",
-            dec->out_w, dec->out_h, (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0));
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, pinned RGB host buffer\n",
+            dec->out_w,
+            dec->out_h,
+            (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
+            dec->cutlass_1x1_enabled ? "on" : "off");
 #undef VAE_INIT_CUDA
     return 0;
 
@@ -1872,8 +1892,60 @@ fail:
     return 1;
 }
 
+static int taehv_run_conv1x1_cutlass_nchw(
+        const float *in,
+        float *out,
+        const DeviceVaeConvWeight *conv,
+        int N,
+        int H,
+        int W) {
+    int spatial = H * W;
+    using Gemm = cutlass::gemm::device::Gemm<
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassSimt,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 128, 8>,
+        cutlass::gemm::GemmShape<32, 64, 8>,
+        cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        2,
+        1,
+        1>;
+
+    Gemm gemm;
+    for (int n = 0; n < N; ++n) {
+        const float *in_frame = in + (int64_t)n * conv->in_c * spatial;
+        float *out_frame = out + (int64_t)n * conv->out_c * spatial;
+        typename Gemm::Arguments args(
+            {conv->out_c, spatial, conv->in_c},
+            {conv->weight, conv->in_c},
+            {in_frame, spatial},
+            {out_frame, spatial},
+            {out_frame, spatial},
+            {1.0f, 0.0f});
+        CUTLASS_OK(gemm(args));
+    }
+    CUDA_OK(cudaGetLastError());
+
+    if (conv->has_bias) {
+        int64_t total = (int64_t)N * conv->out_c * H * W;
+        taehv_add_bias_nchw_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias, N, conv->out_c, H, W);
+        CUDA_OK(cudaGetLastError());
+    }
+    return 0;
+}
+
 static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
-    (void)dec;
+    if (dec && dec->cutlass_1x1_enabled && conv->kernel == 1) {
+        return taehv_run_conv1x1_cutlass_nchw(in, out, conv, N, H, W);
+    }
     int64_t total = (int64_t)N * conv->out_c * H * W;
     taehv_conv2d_nchw_kernel<<<div_up_i64(total, 256), 256>>>(
         in, conv->weight, conv->bias, out, N, conv->in_c, conv->out_c, H, W, conv->kernel, conv->has_bias);

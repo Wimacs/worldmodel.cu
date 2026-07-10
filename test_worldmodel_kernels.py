@@ -426,6 +426,18 @@ def test_taehv_conv2d_matches_torch_same_padding(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
 
 
+def test_taehv_conv1x1_cutlass_matches_torch(wm_cuda):
+    torch.manual_seed(121)
+    n, cin, cout, h, w = 4, 6, 9, 8, 13
+    x = torch.randn(n, cin, h, w, device="cuda", dtype=torch.float32)
+    weight = torch.randn(cout, cin, 1, 1, device="cuda", dtype=torch.float32) * 0.2
+    bias = torch.randn(cout, device="cuda", dtype=torch.float32) * 0.1
+
+    y = wm_cuda.taehv_conv1x1_cutlass(x, weight, bias)
+    ref = F.conv2d(x, weight, bias=bias)
+    torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
 def test_taehv_concat_past_matches_reference(wm_cuda):
     torch.manual_seed(13)
     x = torch.randn(5, 4, 6, 7, device="cuda", dtype=torch.float32)
@@ -472,6 +484,7 @@ if __name__ == "__main__":
         test_patchify_cutlass_matches_torch_conv2d_layout,
         test_unpatchify_matches_torch_linear_layout,
         test_taehv_conv2d_matches_torch_same_padding,
+        test_taehv_conv1x1_cutlass_matches_torch,
         test_taehv_concat_past_matches_reference,
         test_taehv_upsample2_matches_nearest,
         test_taehv_tgrow_reshape_matches_torch_view,
