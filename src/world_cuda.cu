@@ -103,6 +103,11 @@ __global__ static void f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
     if (i < n) y[i] = __float2half_rn(x[i]);
 }
 
+__global__ static void silu_f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(wm_silu(x[i]));
+}
+
 __global__ static void add_bias_silu_f32_kernel(const float *x, const float *bias, float *y, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = wm_silu(x[i] + bias[i]);
@@ -1609,9 +1614,8 @@ static size_t row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
     return Gemm::get_workspace_size(args);
 }
 
-static int row_major_linear_fp16_weight_tensorop_splitk(
-        const float *x_rm,
-        __half *x_half_tmp,
+static int row_major_linear_fp16_input_weight_tensorop_splitk(
+        const __half *x_rm_h,
         const __half *w_rm_h,
         float *y_rm,
         int m,
@@ -1620,13 +1624,6 @@ static int row_major_linear_fp16_weight_tensorop_splitk(
         int split_k_slices,
         void *workspace,
         size_t workspace_bytes) {
-    if (split_k_slices <= 1) {
-        return row_major_linear_fp16_weight_tensorop(x_rm, x_half_tmp, w_rm_h, y_rm, m, k, n);
-    }
-    int64_t x_elems = (int64_t)m * k;
-    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
-    CUDA_OK(cudaGetLastError());
-
     using Gemm = cutlass::gemm::device::Gemm<
         cutlass::half_t,
         cutlass::layout::RowMajor,
@@ -1651,7 +1648,7 @@ static int row_major_linear_fp16_weight_tensorop_splitk(
         8,
         true>;
 
-    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_rm_h);
     const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
     typename Gemm::Arguments args(
         {m, n, k},
@@ -1670,6 +1667,7 @@ static int row_major_linear_fp16_weight_tensorop_splitk(
         return 1;
     }
     Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
     CUTLASS_OK(gemm(args, workspace));
     CUDA_OK(cudaGetLastError());
     return 0;
@@ -3807,15 +3805,21 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
                              rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
             STEP_PROFILE_ACCUM(prof_mlp_fc1_ms, prof_mlp_fc1_calls);
+            int mlp_hidden_half_ready = 0;
             STEP_PROFILE_BEGIN();
-            silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
-                rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
+            if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
+                silu_f32_to_f16_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
+                    rt->d_mlp_hidden, rt->d_linear_half, (int64_t)rt->T * rt->mlp_hidden);
+                mlp_hidden_half_ready = 1;
+            } else {
+                silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
+                    rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
+            }
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_mlp_silu_ms, prof_mlp_silu_calls);
             STEP_PROFILE_BEGIN();
-            if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
-                if (row_major_linear_fp16_weight_tensorop_splitk(
-                            rt->d_mlp_hidden,
+            if (mlp_hidden_half_ready) {
+                if (row_major_linear_fp16_input_weight_tensorop_splitk(
                             rt->d_linear_half,
                             lw->dit_mlp_fc2_weight_h,
                             rt->d_mlp_out,

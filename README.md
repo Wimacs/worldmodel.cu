@@ -281,6 +281,7 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - 后续高性能路线按版本推进：先 profile 确认最大瓶颈，再做少量真实 shape CUTLASS probe，最后才接入 runtime；不在主线里无休止搜索 tile。
 - `WORLD_TRANSFORMER_PROFILE=1` 会打印 transformer 分段 CUDA event timing。360p 24 layer/4 step 当前最大块是 MLP fc2；小 M、大 K 形状默认启用 `WORLD_MLP_FC2_SPLITK=4` 的 CUTLASS serial split-K，`WORLD_MLP_FC2_SPLITK=1` 可关闭，`2/8/...` 可手动覆盖。
 - 360p token GEMM 默认对小 M 形状启用 CUTLASS `64x64x32` tensor-op tile；`WORLD_FP16_GEMM_TILE=base` 可回退旧 `128x128x32` tile，`./build/worldmodel_cuda_gemm_probe --bench` 可复测候选 tile。
+- MLP `fc1 -> SiLU -> fc2` 默认在 split-K 路径中融合 `SiLU + cast-to-half`，fc2 直接消费 half activation，减少一次大 hidden buffer 的 float 写回/重读/cast。
 - D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
 - VAE decode 默认仍是 F32/NCHW 主路径；1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
 - `WORLD_VAE_FP16_NHWC=1` 可启用实验性的 VAE FP16/NHWC 全路径：VAE 权重在 load 阶段额外预打包成 KRSC half，runtime 用 CUTLASS tensor-op implicit conv，bias 仍是单独 half kernel。当前保持默认关闭，方便和 F32/NCHW 对照及定位画面问题。

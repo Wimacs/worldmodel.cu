@@ -107,6 +107,14 @@ def test_silu_matches_torch(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=1e-6, atol=1e-6)
 
 
+def test_silu_to_half_matches_torch_half(wm_cuda):
+    torch.manual_seed(10)
+    x = torch.randn(128, 8192, device="cuda", dtype=torch.float32) * 3
+    y = wm_cuda.silu_to_half(x.contiguous())
+    ref = F.silu(x).half()
+    torch.testing.assert_close(y, ref, rtol=1e-3, atol=4e-3)
+
+
 def test_row_major_linear_fp16_matches_half_rounded_reference(wm_cuda):
     torch.manual_seed(11)
     x = torch.randn(32, 256, device="cuda", dtype=torch.float32) * 0.5
@@ -179,6 +187,23 @@ def test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes(wm_cuda):
             torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+def test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference(wm_cuda):
+    torch.manual_seed(114)
+    m, k, n = 128, 8192, 2048
+    x = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.125).half()
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.125).half()
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        y = wm_cuda.row_major_linear_fp16_input_tensorop_splitk(x.contiguous(), w.contiguous(), 4)
+        ref = x.float().matmul(w.float().t())
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+    torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
 
 
 def test_rms_norm_matches_torch(wm_cuda):
@@ -578,10 +603,12 @@ if __name__ == "__main__":
     ext = load_wm_cuda()
     for test in (
         test_silu_matches_torch,
+        test_silu_to_half_matches_torch_half,
         test_row_major_linear_fp16_matches_half_rounded_reference,
         test_row_major_linear_fp16_tensorop_matches_real_shapes,
         test_row_major_linear_fp16_tensorop_splitk_matches_mlp_fc2_shape,
         test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes,
+        test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference,
         test_rms_norm_matches_torch,
         test_ada_rms_norm_matches_world_formula,
         test_ortho_rope_matches_world_formula,

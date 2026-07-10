@@ -82,6 +82,13 @@ __global__ void silu_f32_kernel(const float *x, float *y, int64_t n) {
     }
 }
 
+__global__ void silu_f32_to_f16_kernel(const float *x, cutlass::half_t *y, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = cutlass::half_t(wm_silu(x[i]));
+    }
+}
+
 __global__ void relu_inplace_f32_kernel(float *x, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && x[i] < 0.0f) {
@@ -1289,6 +1296,21 @@ torch::Tensor silu_cuda(torch::Tensor x) {
     return y;
 }
 
+torch::Tensor silu_to_half_cuda(torch::Tensor x) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_F32(x);
+
+    auto y = torch::empty(x.sizes(), x.options().dtype(torch::kFloat16));
+    int64_t n = x.numel();
+    silu_f32_to_f16_kernel<<<div_up_i64(n, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        reinterpret_cast<cutlass::half_t *>(y.data_ptr<at::Half>()),
+        n);
+    check_last_cuda_error("silu_f32_to_f16");
+    return y;
+}
+
 torch::Tensor row_major_linear_fp16_cuda(torch::Tensor x, torch::Tensor w) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(w);
@@ -1511,6 +1533,68 @@ torch::Tensor row_major_linear_fp16_tensorop_splitk_cuda(torch::Tensor x, torch:
     check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_tensorop_splitk.can_implement");
     check_cutlass_status(gemm(args, workspace_ptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_tensorop_splitk");
     check_last_cuda_error("row_major_linear_fp16_tensorop_splitk");
+    return y;
+}
+
+torch::Tensor row_major_linear_fp16_input_tensorop_splitk_cuda(torch::Tensor x, torch::Tensor w, int64_t split_k_slices_arg) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F16(x);
+    WM_CHECK_F16(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+    TORCH_CHECK(split_k_slices_arg > 1 && split_k_slices_arg <= 32, "split_k_slices must be in [2,32]");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    int split_k_slices = (int)split_k_slices_arg;
+    auto y = torch::empty({m, n}, x.options().dtype(torch::kFloat32));
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4,
+        8,
+        8,
+        true>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y.data_ptr<float>(), n},
+        {y.data_ptr<float>(), n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    size_t workspace_size = Gemm::get_workspace_size(args);
+    auto workspace = torch::empty({(int64_t)workspace_size}, x.options().dtype(torch::kUInt8));
+    void *workspace_ptr = workspace_size ? workspace.data_ptr<uint8_t>() : nullptr;
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_input_tensorop_splitk.can_implement");
+    check_cutlass_status(gemm(args, workspace_ptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_input_tensorop_splitk");
+    check_last_cuda_error("row_major_linear_fp16_input_tensorop_splitk");
     return y;
 }
 
@@ -2687,10 +2771,12 @@ torch::Tensor taehv_tgrow_reshape_cuda(torch::Tensor x, int64_t stride) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("silu", &silu_cuda, "WorldModel SiLU (CUDA, f32)");
+    m.def("silu_to_half", &silu_to_half_cuda, "WorldModel SiLU fused with FP16 cast (CUDA)");
     m.def("row_major_linear_fp16", &row_major_linear_fp16_cuda, "WorldModel row-major Linear using FP16 inputs/weights and FP32 output");
     m.def("row_major_linear_fp16_tensorop", &row_major_linear_fp16_tensorop_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op and FP32 output");
     m.def("row_major_linear_fp16_tensorop_m64n64", &row_major_linear_fp16_tensorop_m64n64_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile and FP32 output");
     m.def("row_major_linear_fp16_tensorop_splitk", &row_major_linear_fp16_tensorop_splitk_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
+    m.def("row_major_linear_fp16_input_tensorop_splitk", &row_major_linear_fp16_input_tensorop_splitk_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
     m.def("ada_rms_norm", &ada_rms_norm_cuda, "WorldModel AdaRMSNorm (CUDA, f32)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");
