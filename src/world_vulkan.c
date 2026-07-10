@@ -309,6 +309,13 @@ static int vae_conv_uses_1x1_c4(const WorldVulkanVaeOp *op) {
     return op && op->kind == WORLD_VULKAN_VAE_CONV && op->stride == 1 && (op->C_out % 4) == 0;
 }
 
+static int vae_conv_is_wf16_compatible(const WorldVulkanVaeOp *op) {
+    return op && op->kind == WORLD_VULKAN_VAE_CONV &&
+        op->stride == 3 &&
+        (op->C_out % 32) == 0 &&
+        ((op->C * op->stride * op->stride) % 16) == 0;
+}
+
 struct WorldVulkanRuntime {
     WorldConfig cfg;
     VkInstance instance;
@@ -684,6 +691,7 @@ struct WorldVulkanRuntime {
     VkDescriptorPool latent_rgba_descriptor_pool;
     VkDescriptorSet latent_rgba_descriptor_set;
     int vae_enabled;
+    int vae_wf16_coopmat_enabled;
     int vae_op_count;
     size_t vae_max_elems;
     size_t vae_scratch_bytes;
@@ -704,6 +712,10 @@ struct WorldVulkanRuntime {
     VkDescriptorSetLayout taehv_conv_1x1_c4_set_layout;
     VkPipelineLayout taehv_conv_1x1_c4_pipeline_layout;
     VkPipeline taehv_conv_1x1_c4_pipeline;
+    VkShaderModule taehv_conv_wf16_coopmat_shader;
+    VkDescriptorSetLayout taehv_conv_wf16_coopmat_set_layout;
+    VkPipelineLayout taehv_conv_wf16_coopmat_pipeline_layout;
+    VkPipeline taehv_conv_wf16_coopmat_pipeline;
     VkShaderModule taehv_conv_out_rgba_shader;
     VkDescriptorSetLayout taehv_conv_out_rgba_set_layout;
     VkPipelineLayout taehv_conv_out_rgba_pipeline_layout;
@@ -745,6 +757,9 @@ struct WorldVulkanRuntime {
     VkDeviceMemory vae_weight_memory[WORLD_VAE_DECODER_CONV_COUNT];
     void *vae_weight_mapped[WORLD_VAE_DECODER_CONV_COUNT];
     size_t vae_weight_bytes[WORLD_VAE_DECODER_CONV_COUNT];
+    VkBuffer vae_weight_f16_buffer[WORLD_VAE_DECODER_CONV_COUNT];
+    VkDeviceMemory vae_weight_f16_memory[WORLD_VAE_DECODER_CONV_COUNT];
+    size_t vae_weight_f16_bytes[WORLD_VAE_DECODER_CONV_COUNT];
     VkBuffer vae_bias_buffer[WORLD_VAE_DECODER_CONV_COUNT];
     VkDeviceMemory vae_bias_memory[WORLD_VAE_DECODER_CONV_COUNT];
     void *vae_bias_mapped[WORLD_VAE_DECODER_CONV_COUNT];
@@ -2794,15 +2809,21 @@ static int create_runtime_vae_op_descriptor(WorldVulkanRuntime *rt, WorldVulkanV
         case WORLD_VULKAN_VAE_CONV: {
             const int idx = op->conv_idx;
             buffers[0] = vae_scratch_buffer(rt, op->src);
-            buffers[1] = rt->vae_weight_buffer[idx];
+            int use_wf16 = rt->vae_wf16_coopmat_enabled && vae_conv_is_wf16_compatible(op);
+            buffers[1] = use_wf16 ? rt->vae_weight_f16_buffer[idx] : rt->vae_weight_buffer[idx];
             buffers[2] = rt->vae_bias_buffer[idx] ? rt->vae_bias_buffer[idx] : rt->dummy_bias_buffer;
             buffers[3] = vae_scratch_buffer(rt, op->dst);
             sizes[0] = rt->vae_scratch_bytes;
-            sizes[1] = rt->vae_weight_bytes[idx];
+            sizes[1] = use_wf16 ? rt->vae_weight_f16_bytes[idx] : rt->vae_weight_bytes[idx];
             sizes[2] = rt->vae_bias_buffer[idx] ? rt->vae_bias_bytes[idx] : sizeof(float);
             sizes[3] = rt->vae_scratch_bytes;
             VkDescriptorSetLayout conv_layout = rt->taehv_conv_set_layout;
-            if (vae_conv_uses_1x1_c4(op)) {
+            if (use_wf16) {
+                conv_layout = rt->taehv_conv_wf16_coopmat_set_layout;
+                snprintf(op->profile_label, sizeof(op->profile_label),
+                        "vae.conv_wf16.k%d.%dx%d.c%di%d",
+                        op->stride, op->H, op->W, op->C_out, op->C);
+            } else if (vae_conv_uses_1x1_c4(op)) {
                 conv_layout = rt->taehv_conv_1x1_c4_set_layout;
             } else if ((op->C_out % 4) == 0) {
                 conv_layout = rt->taehv_conv_c4_set_layout;
@@ -2872,6 +2893,16 @@ static int create_runtime_vae_op_descriptor(WorldVulkanRuntime *rt, WorldVulkanV
 
 static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeights *vae) {
     if (!vae || !rt->model_slice_enabled || !rt->latent_buffer || !rt->dummy_bias_buffer) return 0;
+    const char *wf16_env = getenv("WORLD_VULKAN_VAE_WF16_COOPMAT");
+    int wf16_requested = !wf16_env || atoi(wf16_env) != 0;
+    rt->vae_wf16_coopmat_enabled = wf16_requested &&
+        rt->shader_float16_enabled &&
+        rt->storage_16bit_enabled &&
+        rt->cooperative_matrix_enabled;
+    if (wf16_env && wf16_requested && !rt->vae_wf16_coopmat_enabled) {
+        fprintf(stderr,
+                "WORLD_VULKAN_VAE_WF16_COOPMAT=1 requested, but required Vulkan features are unavailable\n");
+    }
     if (build_runtime_vae_ops(rt, vae)) return 1;
     rt->vae_scratch_bytes = rt->vae_max_elems * sizeof(float);
     if (rt->vae_scratch_bytes == 0) return 0;
@@ -2896,6 +2927,20 @@ static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeigh
                     &rt->vae_weight_buffer[i], &rt->vae_weight_memory[i])) return 1;
         if (upload_to_device_buffer(rt, rt->vae_weight_buffer[i], conv->weight,
                     (VkDeviceSize)rt->vae_weight_bytes[i])) return 1;
+        int use_wf16_weight = rt->vae_wf16_coopmat_enabled &&
+            conv->kernel == 3 &&
+            (conv->out_c % 32) == 0 &&
+            ((conv->in_c * conv->kernel * conv->kernel) % 16) == 0;
+        if (use_wf16_weight) {
+            size_t weight_elems = (size_t)conv->out_c * conv->in_c *
+                (size_t)conv->kernel * conv->kernel;
+            rt->vae_weight_f16_bytes[i] = weight_elems * sizeof(uint16_t);
+            if (create_device_buffer(rt, rt->vae_weight_f16_bytes[i],
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        &rt->vae_weight_f16_buffer[i], &rt->vae_weight_f16_memory[i])) return 1;
+            if (upload_f32_as_f16_to_device_buffer(rt, rt->vae_weight_f16_buffer[i],
+                        0, conv->weight, weight_elems)) return 1;
+        }
         if (conv->has_bias) {
             if (!conv->bias) {
                 fprintf(stderr, "missing Vulkan VAE bias for conv %d\n", i);
@@ -2922,6 +2967,12 @@ static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeigh
     if (create_storage_pipeline(rt, "taehv_conv2d_nchw_1x1_c4_f32.comp", 4, sizeof(WorldVulkanTaehvConv2dPush),
                 &rt->taehv_conv_1x1_c4_shader, &rt->taehv_conv_1x1_c4_set_layout,
                 &rt->taehv_conv_1x1_c4_pipeline_layout, &rt->taehv_conv_1x1_c4_pipeline)) return 1;
+    if (rt->vae_wf16_coopmat_enabled &&
+            create_storage_pipeline(rt, "taehv_conv2d_nchw_wf16_coopmat_n32.comp", 4,
+                sizeof(WorldVulkanTaehvConv2dPush),
+                &rt->taehv_conv_wf16_coopmat_shader, &rt->taehv_conv_wf16_coopmat_set_layout,
+                &rt->taehv_conv_wf16_coopmat_pipeline_layout,
+                &rt->taehv_conv_wf16_coopmat_pipeline)) return 1;
     if (create_storage_pipeline(rt, "taehv_conv_out_rgba_f32.comp", 4, sizeof(WorldVulkanTaehvConv2dPush),
                 &rt->taehv_conv_out_rgba_shader, &rt->taehv_conv_out_rgba_set_layout,
                 &rt->taehv_conv_out_rgba_pipeline_layout, &rt->taehv_conv_out_rgba_pipeline)) return 1;
@@ -2949,9 +3000,10 @@ static int create_runtime_vae(WorldVulkanRuntime *rt, const WorldVaeDecoderWeigh
     }
 
     rt->vae_enabled = 1;
-    fprintf(stderr, "Vulkan VAE F32/NCHW decode enabled: ops=%d device_scratch=%.2f MiB RGB=%dx%d frames=%d\n",
+    fprintf(stderr, "Vulkan VAE F32/NCHW decode enabled: ops=%d device_scratch=%.2f MiB RGB=%dx%d frames=%d wf16_coopmat_3x3=%s\n",
             rt->vae_op_count, (double)(3 * rt->vae_scratch_bytes) / (1024.0 * 1024.0),
-            rt->width, rt->height, rt->frames);
+            rt->width, rt->height, rt->frames,
+            rt->vae_wf16_coopmat_enabled ? "on" : "off");
     return 0;
 }
 
@@ -2988,7 +3040,11 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                 push.has_bias = rt->vae_bias_buffer[op->conv_idx] ? 1u : 0u;
                 VkPipeline conv_pipeline = rt->taehv_conv_pipeline;
                 VkPipelineLayout conv_layout = rt->taehv_conv_pipeline_layout;
-                if (vae_conv_uses_1x1_c4(op)) {
+                int use_wf16 = rt->vae_wf16_coopmat_enabled && vae_conv_is_wf16_compatible(op);
+                if (use_wf16) {
+                    conv_pipeline = rt->taehv_conv_wf16_coopmat_pipeline;
+                    conv_layout = rt->taehv_conv_wf16_coopmat_pipeline_layout;
+                } else if (vae_conv_uses_1x1_c4(op)) {
                     conv_pipeline = rt->taehv_conv_1x1_c4_pipeline;
                     conv_layout = rt->taehv_conv_1x1_c4_pipeline_layout;
                 } else if ((op->C_out % 4) == 0) {
@@ -3003,10 +3059,16 @@ static void record_runtime_vae_decode(WorldVulkanRuntime *rt) {
                 uint32_t conv_work = (op->C_out % 4) == 0 ?
                     (uint32_t)vae_elems(op->N, op->C_out / 4, op->H, op->W) :
                     (uint32_t)vae_elems(op->N, op->C_out, op->H, op->W);
-                PROFILE_DISPATCH(op->profile_label[0] ? op->profile_label :
-                        (vae_conv_uses_1x1_c4(op) ? "vae.conv_1x1_c4" :
-                        ((op->C_out % 4) == 0 ? "vae.conv_c4" : "vae.conv")),
-                        (conv_work + 255u) / 256u, 1, 1);
+                if (use_wf16) {
+                    PROFILE_DISPATCH(op->profile_label[0] ? op->profile_label : "vae.conv_wf16",
+                            (uint32_t)(op->C_out / 32),
+                            ((uint32_t)vae_elems(op->N, 1, op->H, op->W) + 15u) / 16u, 1);
+                } else {
+                    PROFILE_DISPATCH(op->profile_label[0] ? op->profile_label :
+                            (vae_conv_uses_1x1_c4(op) ? "vae.conv_1x1_c4" :
+                            ((op->C_out % 4) == 0 ? "vae.conv_c4" : "vae.conv")),
+                            (conv_work + 255u) / 256u, 1, 1);
+                }
                 break;
             }
             case WORLD_VULKAN_VAE_RELU: {
@@ -9545,6 +9607,89 @@ int world_vulkan_taehv_primitives_probe(void) {
         if (!ok) goto cleanup;
     }
 
+    if (rt->shader_float16_enabled && rt->storage_16bit_enabled && rt->cooperative_matrix_enabled) {
+        enum { N = 2, C_IN = 16, C_OUT = 32, H = 5, W = 4, K = 3 };
+        int ok = 1;
+        VkBuffer x_buffer = VK_NULL_HANDLE, w_buffer = VK_NULL_HANDLE, b_buffer = VK_NULL_HANDLE, y_buffer = VK_NULL_HANDLE;
+        VkDeviceMemory x_memory = VK_NULL_HANDLE, w_memory = VK_NULL_HANDLE, b_memory = VK_NULL_HANDLE, y_memory = VK_NULL_HANDLE;
+        void *x_mapped = NULL, *w_mapped = NULL, *b_mapped = NULL, *y_mapped = NULL;
+        size_t x_bytes = (size_t)N * C_IN * H * W * sizeof(float);
+        size_t w_bytes = (size_t)C_OUT * C_IN * K * K * sizeof(uint16_t);
+        size_t b_bytes = (size_t)C_OUT * sizeof(float);
+        size_t y_bytes = (size_t)N * C_OUT * H * W * sizeof(float);
+        if (create_host_buffer(rt, x_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &x_buffer, &x_memory, &x_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, w_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &w_buffer, &w_memory, &w_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, b_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b_buffer, &b_memory, &b_mapped)) ok = 0;
+        if (ok && create_host_buffer(rt, y_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &y_buffer, &y_memory, &y_mapped)) ok = 0;
+        if (ok) {
+            float *x = (float *)x_mapped;
+            uint16_t *w = (uint16_t *)w_mapped;
+            float *b = (float *)b_mapped;
+            float *y = (float *)y_mapped;
+            for (int i = 0; i < N * C_IN * H * W; ++i) x[i] = probe_value(i + 911, 0.03125f);
+            for (int i = 0; i < C_OUT * C_IN * K * K; ++i) {
+                w[i] = probe_f32_to_f16(probe_value(i + 1231, 0.0234375f));
+            }
+            for (int i = 0; i < C_OUT; ++i) b[i] = probe_value(i + 1531, 0.015625f);
+            VkBuffer buffers[4] = {x_buffer, w_buffer, b_buffer, y_buffer};
+            VkDeviceSize sizes[4] = {x_bytes, w_bytes, b_bytes, y_bytes};
+
+            for (int kernel = 3; ok && kernel >= 1; kernel -= 2) {
+                int inner = C_IN * kernel * kernel;
+                if (kernel == 1) {
+                    for (int i = 0; i < C_OUT * C_IN; ++i) {
+                        w[i] = probe_f32_to_f16(probe_value(i + 1693, 0.02734375f));
+                    }
+                }
+                memset(y, 0, y_bytes);
+                WorldVulkanTaehvConv2dPush push = {N, C_IN, C_OUT, H, W, (uint32_t)kernel, 1};
+                if (run_probe_compute(rt, "taehv_conv2d_nchw_wf16_coopmat_n32.comp", 4, sizeof(push),
+                            buffers, sizes, &push, (uint32_t)(C_OUT / 32),
+                            (uint32_t)((N * H * W + 15) / 16), 1)) ok = 0;
+
+                float max_abs = 0.0f, mean_abs = 0.0f;
+                for (int n = 0; ok && n < N; ++n) {
+                    for (int co = 0; co < C_OUT; ++co) {
+                        for (int oy = 0; oy < H; ++oy) {
+                            for (int ox = 0; ox < W; ++ox) {
+                                float ref = b[co];
+                                for (int k = 0; k < inner; ++k) {
+                                    int ci = k / (kernel * kernel);
+                                    int kp = k - ci * kernel * kernel;
+                                    int ky = kp / kernel;
+                                    int kx = kp - ky * kernel;
+                                    int iy = oy + ky - kernel / 2;
+                                    int ix = ox + kx - kernel / 2;
+                                    if (iy < 0 || iy >= H || ix < 0 || ix >= W) continue;
+                                    float xh = probe_f16_to_f32(probe_f32_to_f16(
+                                            x[((n * C_IN + ci) * H + iy) * W + ix]));
+                                    float wh = probe_f16_to_f32(w[co * inner + k]);
+                                    ref += xh * wh;
+                                }
+                                int idx = ((n * C_OUT + co) * H + oy) * W + ox;
+                                float diff = fabsf(y[idx] - ref);
+                                if (diff > max_abs) max_abs = diff;
+                                mean_abs += diff;
+                            }
+                        }
+                    }
+                }
+                mean_abs /= (float)(N * C_OUT * H * W);
+                fprintf(stderr,
+                        "vulkan taehv_conv2d_nchw_wf16_coopmat_n32 k%d probe: max_abs=%g mean_abs=%g\n",
+                        kernel, max_abs, mean_abs);
+                if (max_abs > 2.0e-4f) ok = 0;
+            }
+        }
+        destroy_host_buffer(rt, x_buffer, x_memory, x_mapped);
+        destroy_host_buffer(rt, w_buffer, w_memory, w_mapped);
+        destroy_host_buffer(rt, b_buffer, b_memory, b_mapped);
+        destroy_host_buffer(rt, y_buffer, y_memory, y_mapped);
+        if (!ok) goto cleanup;
+    } else {
+        fprintf(stderr, "vulkan taehv_conv2d_nchw_wf16_coopmat_n32 probe: skipped (unsupported)\n");
+    }
+
     {
         enum { N = 4, C = 2, H = 3, W = 5 };
         int ok = 1;
@@ -13018,6 +13163,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_conv_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_pipeline, NULL);
     if (rt->taehv_conv_c4_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_c4_pipeline, NULL);
     if (rt->taehv_conv_1x1_c4_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_1x1_c4_pipeline, NULL);
+    if (rt->taehv_conv_wf16_coopmat_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_wf16_coopmat_pipeline, NULL);
     if (rt->taehv_conv_out_rgba_pipeline) vkDestroyPipeline(rt->device, rt->taehv_conv_out_rgba_pipeline, NULL);
     if (rt->taehv_relu_pipeline) vkDestroyPipeline(rt->device, rt->taehv_relu_pipeline, NULL);
     if (rt->taehv_concat_past_pipeline) vkDestroyPipeline(rt->device, rt->taehv_concat_past_pipeline, NULL);
@@ -13073,6 +13219,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_conv_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_pipeline_layout, NULL);
     if (rt->taehv_conv_c4_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_c4_pipeline_layout, NULL);
     if (rt->taehv_conv_1x1_c4_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_1x1_c4_pipeline_layout, NULL);
+    if (rt->taehv_conv_wf16_coopmat_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_wf16_coopmat_pipeline_layout, NULL);
     if (rt->taehv_conv_out_rgba_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_conv_out_rgba_pipeline_layout, NULL);
     if (rt->taehv_relu_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_relu_pipeline_layout, NULL);
     if (rt->taehv_concat_past_pipeline_layout) vkDestroyPipelineLayout(rt->device, rt->taehv_concat_past_pipeline_layout, NULL);
@@ -13107,6 +13254,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_conv_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_set_layout, NULL);
     if (rt->taehv_conv_c4_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_c4_set_layout, NULL);
     if (rt->taehv_conv_1x1_c4_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_1x1_c4_set_layout, NULL);
+    if (rt->taehv_conv_wf16_coopmat_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_wf16_coopmat_set_layout, NULL);
     if (rt->taehv_conv_out_rgba_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_conv_out_rgba_set_layout, NULL);
     if (rt->taehv_relu_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_relu_set_layout, NULL);
     if (rt->taehv_concat_past_set_layout) vkDestroyDescriptorSetLayout(rt->device, rt->taehv_concat_past_set_layout, NULL);
@@ -13162,6 +13310,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     if (rt->taehv_conv_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_shader, NULL);
     if (rt->taehv_conv_c4_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_c4_shader, NULL);
     if (rt->taehv_conv_1x1_c4_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_1x1_c4_shader, NULL);
+    if (rt->taehv_conv_wf16_coopmat_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_wf16_coopmat_shader, NULL);
     if (rt->taehv_conv_out_rgba_shader) vkDestroyShaderModule(rt->device, rt->taehv_conv_out_rgba_shader, NULL);
     if (rt->taehv_relu_shader) vkDestroyShaderModule(rt->device, rt->taehv_relu_shader, NULL);
     if (rt->taehv_concat_past_shader) vkDestroyShaderModule(rt->device, rt->taehv_concat_past_shader, NULL);
@@ -13174,6 +13323,7 @@ void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt) {
     destroy_host_buffer(rt, rt->vae_buf2_buffer, rt->vae_buf2_memory, rt->vae_buf2_mapped);
     for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
         destroy_host_buffer(rt, rt->vae_weight_buffer[i], rt->vae_weight_memory[i], rt->vae_weight_mapped[i]);
+        destroy_host_buffer(rt, rt->vae_weight_f16_buffer[i], rt->vae_weight_f16_memory[i], NULL);
         destroy_host_buffer(rt, rt->vae_bias_buffer[i], rt->vae_bias_memory[i], rt->vae_bias_mapped[i]);
     }
     destroy_host_buffer(rt, rt->latent_buffer, rt->latent_memory, rt->latent_mapped);

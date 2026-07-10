@@ -68,3 +68,21 @@ v1 后满 cache 主要耗时变为：
 - F32/NCHW VAE：约 `33 ms`
 
 下一版先分别建立 cooperative-matrix FMHA 和 FP16/NHWC VAE 的最小 probe。两者都必须先对拍，再由完整 profile 决定谁进入 runtime；不根据 CUDA 的百分比直接假设 Vulkan 会得到相同收益。
+
+## v2: VAE 3x3 cooperative-matrix convolution
+
+CUDA 的 FP16/NHWC VAE 不能直接照搬成一个 NCHW tensor-op kernel。第一版 Vulkan probe 保持 F32/NCHW activation 和 output，只把 OIHW weight 量化为 FP16，并让一个 subgroup 用 `16x16x8` cooperative matrix 计算 8 个输出通道。3x3 和 1x1 的 CPU reference 都在相同位置量化 activation/weight，两个 probe 都是 `max_abs=0`；但完整 VAE 的卷积时间从约 `32.7 ms` 增加到 `44.9 ms`。原因是每 8 个输出通道都重复一次带 padding 的 NCHW implicit-im2col gather。
+
+v2 把输出 tile 扩成 32 通道：同一个 subgroup 维护四个 `16x8` FP32 accumulator，同一块 activation gather 在 32 个输出通道间复用。真实 VAE 的内部输出通道都是 64/128/256，能完整覆盖这条路径。N32 的 3x3 和 1x1 probe 同样为 `max_abs=0`。
+
+连续 11 次 512x256、4-frame 的 VAE-only profile（去掉前三次后取后 8 次平均）：
+
+- 旧 F32/NCHW C4：GPU dispatch `37.45 ms/chunk`，墙钟 `37.95 ms/chunk`
+- N32 cooperative matrix：GPU dispatch `20.50 ms/chunk`，墙钟 `20.96 ms/chunk`
+- VAE GPU 时间下降 `45.3%`，独立 VAE 吞吐约从 `105` 提到 `191 RGB fps`
+
+1x1 在高分辨率下没有 padding/gather 负担，旧 C4 仍更快，因此 runtime 只把内部 3x3 卷积切到 N32 cooperative matrix；1x1 和最终 12-channel RGBA 卷积保留旧路径。这个混合策略的连续 VAE-only profile 稳定在 GPU dispatch `18.36 ms/chunk`、墙钟 `18.98 ms/chunk`，比把 1x1 也交给 cooperative matrix 再省约 `1.5 ms`。支持 `shaderFloat16`、16-bit storage 和 `VK_KHR_cooperative_matrix` 的设备默认启用，`WORLD_VULKAN_VAE_WF16_COOPMAT=0` 可回退。
+
+完整 24-layer、4-step、`cache-window=8` 连续生成到满 cache 后做 `new -> fallback -> new` 夹测。最后 4 个 chunk 的 fallback 墙钟均值为 `154.87 ms/chunk`、`25.83 RGB fps`；两次默认新路径分别为 `136.31` 和 `136.12 ms/chunk`，平均约 `29.37 RGB fps`。端到端延迟下降约 `12.0%`，吞吐提升约 `13.7%`。同一 latent 的最终 RGB 与 F32 路径平均绝对像素差为 `0.031-0.034/255`，最大 `3/255`，目视一致。
+
+这条路径仍保留 F32/NCHW activation 边界，所以不是 CUDA FP16/NHWC VAE 的终点。若后续 profile 再次指向 VAE，下一步应把 repeat/conv/ReLU/concat/upsample/tgrow 整条流改成 FP16/NHWC；不能继续只缩小 cooperative-matrix tile。

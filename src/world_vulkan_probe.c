@@ -1,6 +1,7 @@
 #include "world_vulkan.h"
 
 #include <stdio.h>
+#include <string.h>
 
 int world_vulkan_linear_f32_probe(void);
 int world_vulkan_linear_f16_coopmat_probe(void);
@@ -37,7 +38,19 @@ int world_vulkan_patchify_f32_probe(void);
 int world_vulkan_unpatchify_f32_probe(void);
 int world_vulkan_indexed_attention_f32_probe(void);
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--taehv") == 0) {
+        if (world_vulkan_taehv_primitives_probe()) {
+            fprintf(stderr, "world_vulkan_taehv_primitives_probe: failed\n");
+            return 1;
+        }
+        fprintf(stderr, "world_vulkan_taehv_primitives_probe: ok\n");
+        return 0;
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--taehv]\n", argv[0]);
+        return 2;
+    }
     if (world_vulkan_linear_f32_probe()) {
         fprintf(stderr, "world_vulkan_linear_f32_probe: failed\n");
         return 1;
