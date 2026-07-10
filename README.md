@@ -72,4 +72,4 @@ python test_standalone_probe.py
 ./build/worldmodel_cuda_gemm_probe --tensorop
 ```
 
-Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md).
+Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md) and [docs/vulkan_optimization.md](docs/vulkan_optimization.md).

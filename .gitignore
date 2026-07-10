@@ -1,5 +1,6 @@
 .torch_extensions/
 build/
+build-vulkan/
 build-win*/
 __pycache__/
 *.pyc

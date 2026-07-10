@@ -3261,7 +3261,8 @@ static int create_runtime_model_slice(
 
     {
         const char *wf16_env = getenv("WORLD_VULKAN_LINEAR_WF16_COOPMAT");
-        if (wf16_env && wf16_env[0] == '1') {
+        int wf16_requested = !wf16_env || wf16_env[0] != '0';
+        if (wf16_requested) {
             if (rt->shader_float16_enabled && rt->storage_16bit_enabled && rt->cooperative_matrix_enabled) {
                 rt->runtime_linear_wf16_coopmat_enabled = 1;
                 if (runtime_load_gemm_autotune_cache(rt)) return 1;
@@ -3286,7 +3287,7 @@ static int create_runtime_model_slice(
                         rt->runtime_linear_f16x_mlp_fc1_enabled = 1;
                     }
                 }
-            } else {
+            } else if (wf16_env && wf16_env[0] == '1') {
                 fprintf(stderr,
                         "warning: WORLD_VULKAN_LINEAR_WF16_COOPMAT=1 ignored; shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
                         rt->shader_float16_enabled, rt->storage_16bit_enabled, rt->cooperative_matrix_enabled);
@@ -4173,7 +4174,8 @@ static int create_runtime_model_slice(
                         rt->max_compute_work_group_size_x);
             }
         }
-        fprintf(stderr, "Vulkan linear f32 input + f16 weight cooperative-matrix path enabled for qkv/attn_out/MLP (WORLD_VULKAN_LINEAR_WF16_COOPMAT=1)\n");
+        fprintf(stderr,
+                "Vulkan linear f32 input + f16 weight cooperative-matrix path enabled for qkv/attn_out/MLP; set WORLD_VULKAN_LINEAR_WF16_COOPMAT=0 to disable\n");
     }
     {
         const char *tile64_env = getenv("WORLD_VULKAN_LINEAR_TILE64");
