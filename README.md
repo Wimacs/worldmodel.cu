@@ -261,6 +261,7 @@ Vulkan shader probe：
 - `--fast-realtime`: 低延迟预设，会用较少 steps 和较小 KV cache
 - `--steps 4 --cache-window 8`: 质量更好，但更慢
 - `--cache-window 1`: 仅用于调试，通常没有可控历史
+- `--warmup N`: 用临时 runtime 预热 N 个 chunk，随后丢弃临时 KV/latent 状态；正式窗口从新的 resident runtime 开始
 - `--mouse-scale 0.1`: 鼠标太灵敏时继续调低，太弱时调高
 - `--frame-idx N`: 设置第一个 latent frame 的 temporal RoPE/cache 位置
 - `--frames N`: 同一进程生成 N 个 latent frame，并保留 KV cache 历史

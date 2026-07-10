@@ -21,6 +21,9 @@
 
 #include <math.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -100,6 +103,17 @@ static void world_thread_join(WorldThread thread) {
 }
 #endif
 
+static void world_sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
 typedef struct {
     WorldModelProbeWeights probe;
     WorldLayerWeights *layers;
@@ -149,8 +163,8 @@ static void ray_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
             "\n"
-            "Raylib realtime frontend. Loads weights to a resident runtime, warms up,\n"
-            "then renders decoded frames to a raylib texture without writing images.\n",
+            "Raylib realtime frontend. Loads weights, optionally prewarms a temporary runtime,\n"
+            "then renders decoded frames from a fresh resident runtime without writing images.\n",
             argv0);
 }
 
@@ -322,6 +336,16 @@ static void merge_frame_control(LiveShared *s, const float *frame_control, float
         clamp_scroll_sign(s->control[2 + s->n_buttons] + frame_control[2 + s->n_buttons]);
 }
 
+static int control_has_activity(const float *control, int ctrl_dim, int n_buttons) {
+    if (!control || ctrl_dim < n_buttons + 3) return 1;
+    if (fabsf(control[0]) > 1.5e-1f || fabsf(control[1]) > 1.5e-1f) return 1;
+    for (int i = 0; i < n_buttons; ++i) {
+        if (fabsf(control[2 + i]) > 0.5f) return 1;
+    }
+    if (fabsf(control[2 + n_buttons]) > 0.5f) return 1;
+    return 0;
+}
+
 static WORLD_THREAD_RETURN generation_worker(void *arg) {
     LiveShared *s = (LiveShared *)arg;
     float *control = (float *)malloc((size_t)s->ctrl_dim * sizeof(float));
@@ -349,6 +373,10 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         }
         world_mutex_unlock(&s->mutex);
         if (stop) break;
+        if (!control_has_activity(control, s->ctrl_dim, s->n_buttons)) {
+            world_sleep_ms(5);
+            continue;
+        }
 
         const unsigned char *pixels = NULL;
         int width = 0;
@@ -581,6 +609,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "fast realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
                     cfg.local_window, cfg.global_window);
         } else {
+            int min_global_window = cfg.global_pinned_dilation * 2;
+            if (cfg.global_window < min_global_window) {
+                fprintf(stderr,
+                        "global cache override raised from %d to %d to keep at least two pinned global buckets (global_pinned_dilation=%d)\n",
+                        cfg.global_window, min_global_window, cfg.global_pinned_dilation);
+                cfg.global_window = min_global_window;
+            }
             if (cfg.global_window % cfg.global_pinned_dilation != 0) {
                 int adjusted = ((cfg.global_window + cfg.global_pinned_dilation - 1) / cfg.global_pinned_dilation) *
                     cfg.global_pinned_dilation;
@@ -629,13 +664,6 @@ int main(int argc, char **argv) {
     memset(&st, 0, sizeof(st));
     if (load_vae_decoder_weights(vae_weights, &vae)) goto cleanup_before_window;
 
-    fprintf(stderr, "creating resident %s runtime\n", WORLD_BACKEND_NAME);
-    if (world_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
-        goto cleanup_before_window;
-    }
-    free_loaded_model(&model);
-    free_vae_decoder_weights(&vae);
-
     int ctrl_dim = cfg.n_buttons + 3;
     float *seed_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
     float *warm_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
@@ -661,6 +689,53 @@ int main(int argc, char **argv) {
     int rgb_h = 0;
     int rgb_frames = 0;
     float warm_seconds = 0.0f;
+    if (warmup_chunks > 0) {
+        WorldRuntime *prewarm_rt = NULL;
+        const unsigned char *prewarm_pixels = NULL;
+        int prewarm_w = 0;
+        int prewarm_h = 0;
+        int prewarm_frames = 0;
+        float prewarm_seconds = 0.0f;
+        fprintf(stderr,
+                "prewarming %s runtime for %d chunk(s) on a temporary state; displayed runtime will be reset\n",
+                WORLD_BACKEND_NAME, warmup_chunks);
+        if (world_runtime_create(&prewarm_rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+            free(seed_control);
+            free(warm_control);
+            goto cleanup_before_window;
+        }
+        if (seed_latent) {
+            fprintf(stderr, "prewarm seed latent cache pass\n");
+            if (world_runtime_seed_latent_pixels(prewarm_rt, seed_latent, seed_control,
+                        &prewarm_pixels, &prewarm_w, &prewarm_h, &prewarm_frames, &prewarm_seconds)) {
+                world_runtime_destroy(prewarm_rt);
+                free(seed_control);
+                free(warm_control);
+                goto cleanup_before_window;
+            }
+        }
+        for (int i = 0; i < warmup_chunks; ++i) {
+            fprintf(stderr, "prewarm chunk %d/%d\n", i + 1, warmup_chunks);
+            if (world_runtime_step_pixels(prewarm_rt, warm_control,
+                        &prewarm_pixels, &prewarm_w, &prewarm_h, &prewarm_frames, &prewarm_seconds)) {
+                world_runtime_destroy(prewarm_rt);
+                free(seed_control);
+                free(warm_control);
+                goto cleanup_before_window;
+            }
+        }
+        world_runtime_destroy(prewarm_rt);
+    }
+
+    fprintf(stderr, "creating resident %s runtime\n", WORLD_BACKEND_NAME);
+    if (world_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+        free(seed_control);
+        free(warm_control);
+        goto cleanup_before_window;
+    }
+    free_loaded_model(&model);
+    free_vae_decoder_weights(&vae);
+
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
         if (world_runtime_seed_latent_pixels(rt, seed_latent, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
@@ -668,9 +743,8 @@ int main(int argc, char **argv) {
             free(warm_control);
             goto cleanup_before_window;
         }
-    }
-    for (int i = 0; i < warmup_chunks; ++i) {
-        fprintf(stderr, "warmup chunk %d/%d\n", i + 1, warmup_chunks);
+    } else {
+        fprintf(stderr, "generating initial chunk before window\n");
         if (world_runtime_step_pixels(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(seed_control);
             free(warm_control);
