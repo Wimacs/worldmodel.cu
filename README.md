@@ -255,7 +255,8 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - CUDA 目标只链接 `CUDA::cudart`，不链接 cuBLAS/cuDNN。
 - FP32 fallback 仍走 CUTLASS SIMT baseline，保证真实权重可 load 和完整 4-step 可运行。
 - resident FP16-weight path 目前默认仍是 CUTLASS SIMT half x half -> float accumulator；`WORLD_FP16_GEMM=0` 可强制回退 FP32 SIMT。
-- 已新增独立 CUTLASS tensor-op probe，并对 resident 主要 GEMM shape 做 PyTorch 对拍；但直接接入 runtime 的最小 headless smoke 仍触发 CUTLASS `ldsm RowMajor` unsupported path，所以这一版不启用为默认路径。
+- 已新增 PyTorch extension tensor-op probe，并对 resident 主要 GEMM shape 做对拍；但直接接入 runtime 的最小 headless smoke 仍触发 CUTLASS `ldsm RowMajor` unsupported path，所以这一版不启用为默认路径。
+- 已新增 CMake/NVCC 独立探针 `worldmodel_cuda_gemm_probe`：默认 SIMT 路径应通过，`--tensorop` 当前预期会复现同一个 `ldsm RowMajor` 失败，用于下一版定位编译/布局配置差异。
 - 后续高性能路线按版本推进：先 profile 确认最大瓶颈，再做少量真实 shape CUTLASS probe，最后才接入 runtime；不在主线里无休止搜索 tile。
 - D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
 - VAE decode 当前走内置 F32/NCHW direct conv；后续应迁到 CUTLASS conv/implicit-GEMM 或 im2row + CUTLASS GEMM。
@@ -274,6 +275,15 @@ CUDA extension 对拍：
 ```sh
 python test_worldmodel_kernels.py
 ```
+
+CMake/NVCC CUTLASS GEMM 探针：
+
+```sh
+./build/worldmodel_cuda_gemm_probe --small
+./build/worldmodel_cuda_gemm_probe --small --tensorop
+```
+
+当前第二条是预期失败测试，用来固定下一版要修的 tensor-op layout/config 问题。
 
 真实 F32 权重 4-step smoke：
 

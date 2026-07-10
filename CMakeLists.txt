@@ -99,6 +99,16 @@ if(WORLD_ENABLE_CUDA)
     ${WORLD_PLATFORM_LIBS}
   )
   world_enable_cuda_options(worldmodel_cuda)
+
+  add_executable(worldmodel_cuda_gemm_probe
+    src/world_cuda_gemm_probe.cu
+  )
+  world_enable_cutlass(worldmodel_cuda_gemm_probe)
+  target_link_libraries(worldmodel_cuda_gemm_probe PRIVATE
+    CUDA::cudart
+    ${WORLD_PLATFORM_LIBS}
+  )
+  world_enable_cuda_options(worldmodel_cuda_gemm_probe)
 endif()
 
 if(WORLD_ENABLE_VULKAN)

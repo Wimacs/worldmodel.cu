@@ -23,8 +23,19 @@ FP16-weight fast path：
 - resident runtime 当前仍使用 CUTLASS SIMT GEMM 做 `half x half -> float accumulator -> float output`，这是稳定默认路径。
 - 本迭代新增了 `row_major_linear_fp16_tensorop` PyTorch extension probe，使用 CUTLASS Sm80 tests 覆盖过的 `128x128x32` threadblock，`64x64x32` warp，`16x8x16` instruction，4 stages。
 - probe 已覆盖 resident 主要真实 shape：`(1,2048,8192)`、`(512,2048,2048)`、`(512,2048,4096)`、`(512,2048,8192)`、`(512,8192,2048)`。
-- 但是把同一 typedef 直接接进 resident runtime 后，最小 headless smoke 仍会触发 CUTLASS `ldsm RowMajor` unsupported path。因此这一版不启用 runtime tensor-op；下一版应该先解决 runtime 内存/layout 差异，或做权重/activation 预打包，再接默认路径。
+- 本迭代还新增了 CMake/NVCC 独立探针 `worldmodel_cuda_gemm_probe`。默认 SIMT 路径通过，`--tensorop` 在最小 shape 上也会稳定复现 CUTLASS `ldsm RowMajor` unsupported path。
+- 这说明问题不是 resident runtime 的权重数据或调用链独有问题，而是当前 CMake/NVCC 编译环境下这组 RowMajor x ColumnMajor tensor-op kernel 配置不可直接用。
+- 因此这一版不启用 runtime tensor-op；下一版应该先对齐 PyTorch extension 与 CMake target 的 arch/编译宏/kernel config，或在 load 阶段预打包权重到 tensor-op friendly layout，再接默认路径。
 - `WORLD_FP16_GEMM=0` 可以强制回退到 FP32 SIMT GEMM，用于定位问题。
+
+独立探针命令：
+
+```sh
+./build/worldmodel_cuda_gemm_probe --small
+./build/worldmodel_cuda_gemm_probe --small --tensorop
+```
+
+当前预期是第一条通过，第二条失败并打印 `ldsm RowMajor`。这条失败测试不是回归，而是为了固定下一版要解决的边界条件。
 
 FP32 path：
 
