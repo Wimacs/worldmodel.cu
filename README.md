@@ -281,6 +281,7 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - CMake configure 会打印 `CUDA architectures`；tensor-op 需要 `80+`，项目默认是 `89`。
 - 后续高性能路线按版本推进：先 profile 确认最大瓶颈，再做少量真实 shape CUTLASS probe，最后才接入 runtime；不在主线里无休止搜索 tile。
 - `WORLD_TRANSFORMER_PROFILE=1` 会打印 transformer 分段 CUDA event timing。360p 24 layer/4 step 当前最大块是 MLP fc2；小 M、大 K 形状默认启用 `WORLD_MLP_FC2_SPLITK=4` 的 CUTLASS serial split-K，`WORLD_MLP_FC2_SPLITK=1` 可关闭，`2/8/...` 可手动覆盖。
+- `WORLD_MLP_FC2_SPLITK_PARALLEL=1` 可把 MLP fc2 切到 CUTLASS parallel split-K probe；当前 360p runtime profile 慢于默认 serial split-K，因此只作为诊断开关保留。
 - 360p token GEMM 默认对小 M 形状启用 CUTLASS `64x64x32` tensor-op tile；`WORLD_FP16_GEMM_TILE=base` 可回退旧 `128x128x32` tile，`./build/worldmodel_cuda_gemm_probe --bench` 可复测候选 tile。
 - MLP `fc1 -> SiLU -> fc2` 默认使用 CUTLASS fc1 SiLU-to-half epilogue，fc2 split-K 直接消费 half activation；`WORLD_MLP_FC1_SILU_EPILOGUE=0` 可回退到独立 `SiLU + cast` kernel。
 - D=64 cache attention 默认走 CUTLASS materialized QK/AV，并强制 FP16 KV cache；它把 indexed K/V gather 成 compact buffer，再用 CUTLASS batched GEMM 做 `QK` 和 `PV`。`WORLD_ATTN_D64_CUTLASS=0` 可回退项目内 indexed warp fallback，`WORLD_ATTN_D64_CUTLASS_MAX_SCRATCH_MIB` 可覆盖默认 2048 MiB scratch 限制。

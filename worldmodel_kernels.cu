@@ -11,6 +11,7 @@
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_batched.h>
+#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/layout/tensor.h>
 #include <cutlass/numeric_types.h>
@@ -2037,6 +2038,64 @@ torch::Tensor row_major_linear_fp16_input_tensorop_splitk_cuda(torch::Tensor x, 
     return y;
 }
 
+torch::Tensor row_major_linear_fp16_input_tensorop_splitk_parallel_cuda(torch::Tensor x, torch::Tensor w, int64_t split_k_slices_arg) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F16(x);
+    WM_CHECK_F16(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+    TORCH_CHECK(split_k_slices_arg > 1 && split_k_slices_arg <= 32, "split_k_slices must be in [2,32]");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    int split_k_slices = (int)split_k_slices_arg;
+    auto y = torch::empty({m, n}, x.options().dtype(torch::kFloat32));
+
+    using Epilogue = cutlass::epilogue::thread::LinearCombination<
+        float,
+        128 / cutlass::sizeof_bits<float>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::GemmSplitKParallel<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y.data_ptr<float>(), n},
+        {y.data_ptr<float>(), n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    size_t workspace_size = Gemm::get_workspace_size(args);
+    auto workspace = torch::empty({(int64_t)workspace_size}, x.options().dtype(torch::kUInt8));
+    void *workspace_ptr = workspace_size ? workspace.data_ptr<uint8_t>() : nullptr;
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_input_tensorop_splitk_parallel.can_implement");
+    check_cutlass_status(gemm(args, workspace_ptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_input_tensorop_splitk_parallel");
+    check_last_cuda_error("row_major_linear_fp16_input_tensorop_splitk_parallel");
+    return y;
+}
+
 torch::Tensor rms_norm_cuda(torch::Tensor x, double eps) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CONTIGUOUS(x);
@@ -3823,6 +3882,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("row_major_linear_fp16_tensorop_m64n64_silu_half", &row_major_linear_fp16_tensorop_m64n64_silu_half_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile, SiLU epilogue, and FP16 output");
     m.def("row_major_linear_fp16_tensorop_splitk", &row_major_linear_fp16_tensorop_splitk_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("row_major_linear_fp16_input_tensorop_splitk", &row_major_linear_fp16_input_tensorop_splitk_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
+    m.def("row_major_linear_fp16_input_tensorop_splitk_parallel", &row_major_linear_fp16_input_tensorop_splitk_parallel_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op parallel split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
     m.def("ada_rms_norm", &ada_rms_norm_cuda, "WorldModel AdaRMSNorm (CUDA, f32)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");

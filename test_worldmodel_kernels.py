@@ -232,6 +232,23 @@ def test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference(wm_c
     torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
 
 
+def test_row_major_linear_fp16_input_tensorop_splitk_parallel_matches_half_reference(wm_cuda):
+    torch.manual_seed(117)
+    m, k, n = 128, 8192, 2048
+    x = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.125).half()
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.125).half()
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        y = wm_cuda.row_major_linear_fp16_input_tensorop_splitk_parallel(x.contiguous(), w.contiguous(), 4)
+        ref = x.float().matmul(w.float().t())
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+    torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
+
+
 def test_mlp_fused_silu_half_then_splitk_matches_reference(wm_cuda):
     torch.manual_seed(116)
     m, d, hidden = 128, 2048, 8192
@@ -817,6 +834,7 @@ if __name__ == "__main__":
         test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes,
         test_row_major_linear_fp16_tensorop_m64n64_silu_half_matches_reference,
         test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference,
+        test_row_major_linear_fp16_input_tensorop_splitk_parallel_matches_half_reference,
         test_mlp_fused_silu_half_then_splitk_matches_reference,
         test_rms_norm_matches_torch,
         test_ada_rms_norm_matches_world_formula,

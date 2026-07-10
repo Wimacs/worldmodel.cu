@@ -10,6 +10,7 @@
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_batched.h>
+#include <cutlass/gemm/device/gemm_splitk_parallel.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/layout/tensor.h>
 #include <cutlass/numeric_types.h>
@@ -2243,6 +2244,97 @@ static int row_major_linear_fp16_input_weight_tensorop_splitk(
     return 0;
 }
 
+static size_t row_major_linear_fp16_input_weight_tensorop_splitk_parallel_workspace_size(
+        int m,
+        int k,
+        int n,
+        int split_k_slices) {
+    using Epilogue = cutlass::epilogue::thread::LinearCombination<
+        float,
+        128 / cutlass::sizeof_bits<float>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::GemmSplitKParallel<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue>;
+
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {static_cast<const cutlass::half_t *>(nullptr), k},
+        {static_cast<const cutlass::half_t *>(nullptr), k},
+        {static_cast<const float *>(nullptr), n},
+        {static_cast<float *>(nullptr), n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    return Gemm::get_workspace_size(args);
+}
+
+static int row_major_linear_fp16_input_weight_tensorop_splitk_parallel(
+        const __half *x_rm_h,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n,
+        int split_k_slices,
+        void *workspace,
+        size_t workspace_bytes) {
+    using Epilogue = cutlass::epilogue::thread::LinearCombination<
+        float,
+        128 / cutlass::sizeof_bits<float>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::GemmSplitKParallel<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_rm_h);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f},
+        split_k_slices);
+    size_t needed_workspace = Gemm::get_workspace_size(args);
+    if (needed_workspace > workspace_bytes || (needed_workspace > 0 && !workspace)) {
+        fprintf(stderr,
+                "parallel split-K workspace too small: need %zu bytes have %zu bytes\n",
+                needed_workspace,
+                workspace_bytes);
+        return 1;
+    }
+    Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
+    CUTLASS_OK(gemm(args, workspace));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int indexed_attention_cache_d64_cutlass_f16_kv(
         const float *q,
         const __half *cache_k,
@@ -4236,6 +4328,7 @@ struct WorldCudaRuntime {
     int forced_pass_table_idx;
     int frame_stride;
     int mlp_fc2_splitk_slices;
+    int mlp_fc2_splitk_parallel_enabled;
     int fp16_gemm_m64n64_enabled;
     int mlp_fc1_silu_epilogue_enabled;
     size_t latent_elems;
@@ -4627,6 +4720,7 @@ extern "C" int world_cuda_runtime_create(
     }
     {
         const char *splitk_env = getenv("WORLD_MLP_FC2_SPLITK");
+        const char *splitk_parallel_env = getenv("WORLD_MLP_FC2_SPLITK_PARALLEL");
         if (splitk_env && splitk_env[0]) {
             rt->mlp_fc2_splitk_slices = atoi(splitk_env);
         } else if (rt->T <= 256 && rt->mlp_hidden >= 8192 && rt->D >= 2048) {
@@ -4636,8 +4730,16 @@ extern "C" int world_cuda_runtime_create(
         }
         if (rt->mlp_fc2_splitk_slices < 1) rt->mlp_fc2_splitk_slices = 1;
         if (rt->mlp_fc2_splitk_slices > 32) rt->mlp_fc2_splitk_slices = 32;
+        rt->mlp_fc2_splitk_parallel_enabled = splitk_parallel_env ? splitk_parallel_env[0] != '0' : 0;
+        if (rt->mlp_fc2_splitk_parallel_enabled && rt->mlp_fc2_splitk_slices <= 1) {
+            fprintf(stderr, "WORLD_MLP_FC2_SPLITK_PARALLEL ignored because split-K is disabled\n");
+            rt->mlp_fc2_splitk_parallel_enabled = 0;
+        }
         if (rt->mlp_fc2_splitk_slices > 1) {
-            fprintf(stderr, "MLP fc2 CUTLASS split-K enabled: slices=%d\n", rt->mlp_fc2_splitk_slices);
+            fprintf(stderr,
+                    "MLP fc2 CUTLASS %ssplit-K enabled: slices=%d\n",
+                    rt->mlp_fc2_splitk_parallel_enabled ? "parallel " : "",
+                    rt->mlp_fc2_splitk_slices);
         }
     }
     {
@@ -4733,8 +4835,13 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_linear_half, rt->linear_half_elems * sizeof(__half)));
     RT_CUDA(cudaMalloc((void **)&rt->d_mlp_hidden_half, (size_t)rt->T * rt->mlp_hidden * sizeof(__half)));
     if (rt->mlp_fc2_splitk_slices > 1) {
-        rt->splitk_workspace_bytes = row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
-            rt->T, rt->mlp_hidden, rt->D, rt->mlp_fc2_splitk_slices);
+        if (rt->mlp_fc2_splitk_parallel_enabled) {
+            rt->splitk_workspace_bytes = row_major_linear_fp16_input_weight_tensorop_splitk_parallel_workspace_size(
+                rt->T, rt->mlp_hidden, rt->D, rt->mlp_fc2_splitk_slices);
+        } else {
+            rt->splitk_workspace_bytes = row_major_linear_fp16_weight_tensorop_splitk_workspace_size(
+                rt->T, rt->mlp_hidden, rt->D, rt->mlp_fc2_splitk_slices);
+        }
         if (rt->splitk_workspace_bytes > 0) {
             RT_CUDA(cudaMalloc(&rt->d_splitk_workspace, rt->splitk_workspace_bytes));
         }
@@ -5258,16 +5365,29 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_PROFILE_BEGIN();
             if (mlp_hidden_half_ready) {
                 if (!d_mlp_hidden_half_cur) return 1;
-                if (row_major_linear_fp16_input_weight_tensorop_splitk(
-                            d_mlp_hidden_half_cur,
-                            lw->dit_mlp_fc2_weight_h,
-                            rt->d_mlp_out,
-                            rt->T,
-                            rt->mlp_hidden,
-                            rt->D,
-                            rt->mlp_fc2_splitk_slices,
-                            rt->d_splitk_workspace,
-                            rt->splitk_workspace_bytes)) return 1;
+                if (rt->mlp_fc2_splitk_parallel_enabled) {
+                    if (row_major_linear_fp16_input_weight_tensorop_splitk_parallel(
+                                d_mlp_hidden_half_cur,
+                                lw->dit_mlp_fc2_weight_h,
+                                rt->d_mlp_out,
+                                rt->T,
+                                rt->mlp_hidden,
+                                rt->D,
+                                rt->mlp_fc2_splitk_slices,
+                                rt->d_splitk_workspace,
+                                rt->splitk_workspace_bytes)) return 1;
+                } else {
+                    if (row_major_linear_fp16_input_weight_tensorop_splitk(
+                                d_mlp_hidden_half_cur,
+                                lw->dit_mlp_fc2_weight_h,
+                                rt->d_mlp_out,
+                                rt->T,
+                                rt->mlp_hidden,
+                                rt->D,
+                                rt->mlp_fc2_splitk_slices,
+                                rt->d_splitk_workspace,
+                                rt->splitk_workspace_bytes)) return 1;
+                }
             } else if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h &&
                     should_use_m64n64_tensorop(rt->fp16_gemm_m64n64_enabled, rt->T, rt->mlp_hidden, rt->D)) {
                 if (row_major_linear_fp16_weight_tensorop_m64n64(
