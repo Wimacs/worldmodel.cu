@@ -671,6 +671,53 @@ __global__ static void gather_indexed_kv_d64_hq_f16_kernel(
     v_compact[i] = cache_v[src];
 }
 
+__global__ static void gather_indexed_kv_d64_hkv_f16_kernel(
+        const __half *__restrict__ cache_k,
+        const __half *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        int Nkv,
+        __half *__restrict__ k_compact,
+        __half *__restrict__ v_compact,
+        int Hkv,
+        int Tk) {
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Hkv * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hk = (int)(q / Nkv);
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = ((int64_t)hk * Tk + tk) * 64 + d;
+    k_compact[i] = cache_k[src];
+    v_compact[i] = cache_v[src];
+}
+
+__global__ static void scatter_grouped_attn_d64_tokens_f32_kernel(
+        const float *__restrict__ group_out,
+        float *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Hq * Tq * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int t = (int)(q % Tq);
+    int hq = (int)(q / Tq);
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int g = hq - hk * group;
+    int64_t src = ((int64_t)hk * (group * Tq) + g * Tq + t) * 64 + d;
+    int64_t dst = ((int64_t)t * Hq + hq) * 64 + d;
+    out_tokens[dst] = group_out[src];
+}
+
 __global__ static void softmax_rows_inplace_f32_kernel(float *x, int rows, int cols) {
     __shared__ float red[256];
     int row = blockIdx.x;
@@ -2290,6 +2337,146 @@ static int indexed_attention_cache_d64_cutlass_f16_kv(
     return 0;
 }
 
+static int indexed_attention_cache_d64_cutlass_grouped_f16_kv(
+        const float *q,
+        const __half *cache_k,
+        const __half *cache_v,
+        const int64_t *indices,
+        int Nkv,
+        float *out_tokens,
+        __half *q_h,
+        __half *k_compact,
+        __half *v_compact,
+        float *scores,
+        __half *probs_h,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+    if (Nkv <= 0) {
+        CUDA_OK(cudaMemset(out_tokens, 0, (size_t)Tq * Hq * 64 * sizeof(float)));
+        return 0;
+    }
+    if (Hkv <= 0 || (Hq % Hkv) != 0 || (Hq / Hkv) <= 1 || Nkv < 64) {
+        return indexed_attention_cache_d64_cutlass_f16_kv(
+            q, cache_k, cache_v, indices, Nkv, out_tokens,
+            q_h, k_compact, v_compact, scores, probs_h,
+            Hq, Hkv, Tq, Tk, scale);
+    }
+
+    int group = Hq / Hkv;
+    int grouped_rows = group * Tq;
+
+    int64_t q_elems = (int64_t)Hq * Tq * 64;
+    f32_to_f16_kernel<<<div_up_i64(q_elems, 256), 256>>>(q, q_h, q_elems);
+    CUDA_OK(cudaGetLastError());
+
+    int64_t kv_compact_elems = (int64_t)Hkv * Nkv * 64;
+    gather_indexed_kv_d64_hkv_f16_kernel<<<div_up_i64(kv_compact_elems, 256), 256>>>(
+        cache_k, cache_v, indices, Nkv, k_compact, v_compact, Hkv, Tk);
+    CUDA_OK(cudaGetLastError());
+
+    using GemmQK = cutlass::gemm::device::GemmBatched<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 128, 32>,
+        cutlass::gemm::GemmShape<32, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        4,
+        8,
+        8>;
+
+    const cutlass::half_t *q_ptr = reinterpret_cast<const cutlass::half_t *>(q_h);
+    const cutlass::half_t *k_ptr = reinterpret_cast<const cutlass::half_t *>(k_compact);
+    typename GemmQK::Arguments qk_args(
+        {grouped_rows, Nkv, 64},
+        {q_ptr, 64},
+        (int64_t)grouped_rows * 64,
+        {k_ptr, 64},
+        (int64_t)Nkv * 64,
+        {scores, Nkv},
+        (int64_t)grouped_rows * Nkv,
+        {scores, Nkv},
+        (int64_t)grouped_rows * Nkv,
+        {scale, 0.0f},
+        Hkv);
+    GemmQK qk_gemm;
+    CUTLASS_OK(qk_gemm.can_implement(qk_args));
+    CUTLASS_OK(qk_gemm(qk_args));
+    CUDA_OK(cudaGetLastError());
+
+    softmax_rows_inplace_f32_kernel<<<Hq * Tq, 256>>>(scores, Hq * Tq, Nkv);
+    CUDA_OK(cudaGetLastError());
+
+    int64_t prob_elems = (int64_t)Hq * Tq * Nkv;
+    f32_to_f16_kernel<<<div_up_i64(prob_elems, 256), 256>>>(scores, probs_h, prob_elems);
+    CUDA_OK(cudaGetLastError());
+
+    using GemmAV = cutlass::gemm::device::GemmBatched<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        4,
+        8,
+        8>;
+
+    const cutlass::half_t *probs_ptr = reinterpret_cast<const cutlass::half_t *>(probs_h);
+    const cutlass::half_t *v_ptr = reinterpret_cast<const cutlass::half_t *>(v_compact);
+    float *group_out = scores;
+    typename GemmAV::Arguments av_args(
+        {grouped_rows, 64, Nkv},
+        {probs_ptr, Nkv},
+        (int64_t)grouped_rows * Nkv,
+        {v_ptr, 64},
+        (int64_t)Nkv * 64,
+        {group_out, 64},
+        (int64_t)grouped_rows * 64,
+        {group_out, 64},
+        (int64_t)grouped_rows * 64,
+        {1.0f, 0.0f},
+        Hkv);
+    GemmAV av_gemm;
+    CUTLASS_OK(av_gemm.can_implement(av_args));
+    CUTLASS_OK(av_gemm(av_args));
+    CUDA_OK(cudaGetLastError());
+
+    scatter_grouped_attn_d64_tokens_f32_kernel<<<div_up_i64(q_elems, 256), 256>>>(
+        group_out, out_tokens, Hq, Hkv, Tq);
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int copy_f32_to_device(float **dst, const float *src, size_t n) {
     *dst = NULL;
     CUDA_OK(cudaMalloc((void **)dst, n * sizeof(float)));
@@ -3791,6 +3978,7 @@ struct WorldCudaRuntime {
     __half *d_mlp_hidden_half;
     void *d_splitk_workspace;
     int attn_cutlass_enabled;
+    int attn_cutlass_grouped_enabled;
     int attn_max_capacity;
     __half *d_attn_q_half;
     __half *d_attn_k_compact;
@@ -4247,10 +4435,15 @@ extern "C" int world_cuda_runtime_create(
         const char *half_env = getenv("WORLD_ATTN_D64_HALF_CACHE");
         const char *half_flash_env = getenv("WORLD_ATTN_D64_HALF_FLASH");
         const char *cutlass_attn_env = getenv("WORLD_ATTN_D64_CUTLASS");
+        const char *cutlass_grouped_env = getenv("WORLD_ATTN_D64_CUTLASS_GROUPED");
         half_cache_requested = half_env ? half_env[0] != '0' : 0;
         rt->attn_half_cache_enabled = half_cache_requested;
         rt->attn_half_flash_enabled = half_flash_env ? half_flash_env[0] != '0' : 0;
         rt->attn_cutlass_enabled = cutlass_attn_env ? cutlass_attn_env[0] != '0' : 0;
+        rt->attn_cutlass_grouped_enabled = cutlass_grouped_env ? cutlass_grouped_env[0] != '0' : 0;
+        if (rt->attn_cutlass_grouped_enabled) {
+            rt->attn_cutlass_enabled = 1;
+        }
         if (rt->attn_cutlass_enabled) {
             rt->attn_half_cache_enabled = 1;
             rt->attn_half_flash_enabled = 0;
@@ -4260,12 +4453,14 @@ extern "C" int world_cuda_runtime_create(
             rt->attn_half_cache_enabled = 0;
             rt->attn_half_flash_enabled = 0;
             rt->attn_cutlass_enabled = 0;
+            rt->attn_cutlass_grouped_enabled = 0;
         }
         if (rt->attn_cutlass_enabled && cfg->n_heads % cfg->n_kv_heads != 0) {
             fprintf(stderr,
                     "WORLD_ATTN_D64_CUTLASS ignored because n_heads=%d is not divisible by n_kv_heads=%d\n",
                     cfg->n_heads, cfg->n_kv_heads);
             rt->attn_cutlass_enabled = 0;
+            rt->attn_cutlass_grouped_enabled = 0;
             if (!half_cache_requested) rt->attn_half_cache_enabled = 0;
         }
         if (rt->attn_half_cache_enabled) {
@@ -4307,6 +4502,7 @@ extern "C" int world_cuda_runtime_create(
                     (double)scratch_bytes / (1024.0 * 1024.0),
                     attn_scratch_limit_mib);
             rt->attn_cutlass_enabled = 0;
+            rt->attn_cutlass_grouped_enabled = 0;
             if (!half_cache_requested) rt->attn_half_cache_enabled = 0;
         } else {
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_q_half, q_half_elems * sizeof(__half)));
@@ -4315,7 +4511,8 @@ extern "C" int world_cuda_runtime_create(
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_scores, score_elems * sizeof(float)));
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_probs_half, score_elems * sizeof(__half)));
             fprintf(stderr,
-                    "D=64 attention CUTLASS materialized QK/AV probe enabled by WORLD_ATTN_D64_CUTLASS=1 (capacity=%d tokens scratch=%.2f MiB)\n",
+                    "D=64 attention CUTLASS materialized QK/AV probe enabled%s (capacity=%d tokens scratch=%.2f MiB)\n",
+                    rt->attn_cutlass_grouped_enabled ? " with grouped-M GQA path" : "",
                     rt->attn_max_capacity,
                     (double)scratch_bytes / (1024.0 * 1024.0));
         }
@@ -4526,7 +4723,8 @@ extern "C" int world_cuda_runtime_step_rgb(
                 if (rt->attn_half_cache_enabled) {
                     int group = cfg->n_heads % cfg->n_kv_heads == 0 ? cfg->n_heads / cfg->n_kv_heads : 0;
                     if (rt->attn_cutlass_enabled && group > 0) {
-                        if (indexed_attention_cache_d64_cutlass_f16_kv(
+                        int cutlass_rc = rt->attn_cutlass_grouped_enabled ?
+                            indexed_attention_cache_d64_cutlass_grouped_f16_kv(
                                     rt->d_q,
                                     cache->k_h,
                                     cache->v_h,
@@ -4542,7 +4740,25 @@ extern "C" int world_cuda_runtime_step_rgb(
                                     cfg->n_kv_heads,
                                     rt->T,
                                     cache->capacity,
-                                    1.0f / 8.0f)) return 1;
+                                    1.0f / 8.0f) :
+                            indexed_attention_cache_d64_cutlass_f16_kv(
+                                    rt->d_q,
+                                    cache->k_h,
+                                    cache->v_h,
+                                    cache->indices,
+                                    host_index_count,
+                                    rt->d_attn,
+                                    rt->d_attn_q_half,
+                                    rt->d_attn_k_compact,
+                                    rt->d_attn_v_compact,
+                                    rt->d_attn_scores,
+                                    rt->d_attn_probs_half,
+                                    cfg->n_heads,
+                                    cfg->n_kv_heads,
+                                    rt->T,
+                                    cache->capacity,
+                                    1.0f / 8.0f);
+                        if (cutlass_rc) return 1;
                     } else if (rt->attn_half_flash_enabled && group > 0 && group <= WORLD_ATTN_D64_FLASH_WARPS) {
                         int q_per_h = WORLD_ATTN_D64_FLASH_WARPS / group;
                         if (q_per_h < 1) q_per_h = 1;

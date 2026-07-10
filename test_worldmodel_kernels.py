@@ -437,6 +437,28 @@ def test_indexed_attention_half_kv_cutlass_matches_materialized_half_reference(w
     torch.testing.assert_close(y, ref, rtol=2e-3, atol=2e-3)
 
 
+def test_indexed_attention_half_kv_cutlass_grouped_matches_materialized_half_reference(wm_cuda):
+    torch.manual_seed(26)
+    b, hq, hkv, tq, tk, d = 2, 8, 2, 16, 48, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    indices = torch.tensor([0, 1, 3, 5, 8, 13, 21, 30, 36, 39, 40, 41, 42, 43, 46, 47], device="cuda", dtype=torch.long)
+    scale = d ** -0.5
+
+    y = wm_cuda.indexed_attention_half_kv_cutlass_grouped(q, k, v, indices, scale)
+
+    group = hq // hkv
+    q_h = q.half().float()
+    k_gqa = k.float().repeat_interleave(group, dim=1)
+    v_gqa = v.float().repeat_interleave(group, dim=1)
+    scores = torch.einsum("bhtd,bhkd->bhtk", q_h, k_gqa[:, :, indices, :]) * scale
+    probs_h = torch.softmax(scores, dim=-1).half()
+    ref = torch.einsum("bhtn,bhnd->bhtd", probs_h.float(), v_gqa[:, :, indices, :])
+
+    torch.testing.assert_close(y, ref, rtol=2e-3, atol=2e-3)
+
+
 def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
     torch.manual_seed(125)
     b, hq, hkv, tq, tk, d = 1, 32, 16, 128, 1024, 64
@@ -463,6 +485,7 @@ def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
         "half_warp": time_ms(lambda: wm_cuda.indexed_attention_half_kv(q, k, v, indices, scale)),
         "half_group_flash": time_ms(lambda: wm_cuda.indexed_attention_half_kv_flash(q, k, v, indices, scale)),
         "half_cutlass_materialized": time_ms(lambda: wm_cuda.indexed_attention_half_kv_cutlass(q, k, v, indices, scale)),
+        "half_cutlass_grouped": time_ms(lambda: wm_cuda.indexed_attention_half_kv_cutlass_grouped(q, k, v, indices, scale)),
     }
     for name, ms in timings.items():
         print(f"{name}: {ms:.4f} ms")
@@ -780,6 +803,7 @@ if __name__ == "__main__":
         test_indexed_attention_half_kv_matches_half_reference,
         test_indexed_attention_half_kv_flash_matches_half_reference,
         test_indexed_attention_half_kv_cutlass_matches_materialized_half_reference,
+        test_indexed_attention_half_kv_cutlass_grouped_matches_materialized_half_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_kv_cache_upsert_half_matches_half_reference,
