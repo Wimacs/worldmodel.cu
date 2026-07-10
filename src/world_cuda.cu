@@ -963,6 +963,40 @@ __global__ static void taehv_add_bias_nchw_kernel(
     out[i] += bias[c];
 }
 
+__global__ static void taehv_im2col3x3_nchw_tile_kernel(
+        const float *in,
+        float *cols,
+        int C,
+        int H,
+        int W,
+        int frame,
+        int tile_start,
+        int tile_cols) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int k_elems = C * 9;
+    int64_t total = (int64_t)k_elems * tile_cols;
+    if (i >= total) return;
+
+    int col = (int)(i % tile_cols);
+    int k = (int)(i / tile_cols);
+    int spatial = H * W;
+    int pos = tile_start + col;
+    int x = pos % W;
+    int y = pos / W;
+    int q = k;
+    int kx = q % 3;
+    q /= 3;
+    int ky = q % 3;
+    int c = q / 3;
+    int iy = y + ky - 1;
+    int ix = x + kx - 1;
+    float v = 0.0f;
+    if (iy >= 0 && iy < H && ix >= 0 && ix < W) {
+        v = in[((int64_t)frame * C * spatial + c * spatial + iy * W + ix)];
+    }
+    cols[i] = v;
+}
+
 __global__ static void taehv_concat_past_nchw_kernel(
         const float *x,
         float *out,
@@ -1763,6 +1797,7 @@ typedef struct {
     float *buf0;
     float *buf1;
     float *buf2;
+    float *conv3x3_cols;
     __half *hbuf0;
     __half *hbuf1;
     __half *hbuf2;
@@ -1776,6 +1811,9 @@ typedef struct {
     int W_pre_shuffle;
     int fp16_nhwc_enabled;
     int cutlass_1x1_enabled;
+    int cutlass_3x3_enabled;
+    int conv3x3_tile_cols;
+    size_t conv3x3_cols_elems;
 } DeviceVaeDecoder;
 
 static void taehv_pick_scratch(float *cur, float *buf0, float *buf1, float *buf2, float **tmp, float **aux) {
@@ -1839,6 +1877,7 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     cudaFree(dec->buf0);
     cudaFree(dec->buf1);
     cudaFree(dec->buf2);
+    cudaFree(dec->conv3x3_cols);
     cudaFree(dec->hbuf0);
     cudaFree(dec->hbuf1);
     cudaFree(dec->hbuf2);
@@ -1861,7 +1900,10 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->max_elems = (size_t)16 * 64 * dec->H_pre_shuffle * dec->W_pre_shuffle;
     dec->rgb_elems = (size_t)4 * dec->out_h * dec->out_w * 3;
     const char *vae_1x1_env = getenv("WORLD_VAE_1X1_GEMM");
+    const char *vae_3x3_env = getenv("WORLD_VAE_3X3_GEMM");
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
+    dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
+    dec->conv3x3_tile_cols = 4096;
 
 #define VAE_INIT_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -1877,12 +1919,33 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
+    if (dec->cutlass_3x3_enabled) {
+        int max_k_elems = 0;
+        for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+            const WorldVaeConvWeight *conv = &host->convs[i];
+            if (conv->kernel == 3) {
+                int k_elems = conv->in_c * 9;
+                if (k_elems > max_k_elems) max_k_elems = k_elems;
+            }
+        }
+        dec->conv3x3_cols_elems = (size_t)max_k_elems * dec->conv3x3_tile_cols;
+        cudaError_t cols_err = cudaMalloc((void **)&dec->conv3x3_cols, dec->conv3x3_cols_elems * sizeof(float));
+        if (cols_err != cudaSuccess) {
+            fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace %.2f MiB: %s; falling back to direct 3x3 conv\n",
+                    (double)(dec->conv3x3_cols_elems * sizeof(float)) / (1024.0 * 1024.0),
+                    cudaGetErrorString(cols_err));
+            dec->cutlass_3x3_enabled = 0;
+            dec->conv3x3_cols = NULL;
+            dec->conv3x3_cols_elems = 0;
+        }
+    }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, pinned RGB host buffer\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s, pinned RGB host buffer\n",
             dec->out_w,
             dec->out_h,
             (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
-            dec->cutlass_1x1_enabled ? "on" : "off");
+            dec->cutlass_1x1_enabled ? "on" : "off",
+            dec->cutlass_3x3_enabled ? "on" : "off");
 #undef VAE_INIT_CUDA
     return 0;
 
@@ -1942,9 +2005,74 @@ static int taehv_run_conv1x1_cutlass_nchw(
     return 0;
 }
 
+static int taehv_run_conv3x3_cutlass_nchw(
+        DeviceVaeDecoder *dec,
+        const float *in,
+        float *out,
+        const DeviceVaeConvWeight *conv,
+        int N,
+        int H,
+        int W) {
+    if (!dec || !dec->conv3x3_cols || dec->conv3x3_tile_cols <= 0) return 1;
+    int spatial = H * W;
+    int k_elems = conv->in_c * 9;
+    if ((size_t)k_elems * dec->conv3x3_tile_cols > dec->conv3x3_cols_elems) return 1;
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassSimt,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 128, 8>,
+        cutlass::gemm::GemmShape<32, 64, 8>,
+        cutlass::gemm::GemmShape<1, 1, 1>,
+        cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        2,
+        1,
+        1>;
+
+    Gemm gemm;
+    for (int n = 0; n < N; ++n) {
+        float *out_frame = out + (int64_t)n * conv->out_c * spatial;
+        for (int tile_start = 0; tile_start < spatial; tile_start += dec->conv3x3_tile_cols) {
+            int tile_cols = spatial - tile_start;
+            if (tile_cols > dec->conv3x3_tile_cols) tile_cols = dec->conv3x3_tile_cols;
+            taehv_im2col3x3_nchw_tile_kernel<<<div_up_i64((int64_t)k_elems * tile_cols, 256), 256>>>(
+                in, dec->conv3x3_cols, conv->in_c, H, W, n, tile_start, tile_cols);
+            CUDA_OK(cudaGetLastError());
+
+            typename Gemm::Arguments args(
+                {conv->out_c, tile_cols, k_elems},
+                {conv->weight, k_elems},
+                {dec->conv3x3_cols, tile_cols},
+                {out_frame + tile_start, spatial},
+                {out_frame + tile_start, spatial},
+                {1.0f, 0.0f});
+            CUTLASS_OK(gemm(args));
+            CUDA_OK(cudaGetLastError());
+        }
+    }
+
+    if (conv->has_bias) {
+        int64_t total = (int64_t)N * conv->out_c * H * W;
+        taehv_add_bias_nchw_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias, N, conv->out_c, H, W);
+        CUDA_OK(cudaGetLastError());
+    }
+    return 0;
+}
+
 static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
     if (dec && dec->cutlass_1x1_enabled && conv->kernel == 1) {
         return taehv_run_conv1x1_cutlass_nchw(in, out, conv, N, H, W);
+    }
+    if (dec && dec->cutlass_3x3_enabled && conv->kernel == 3) {
+        return taehv_run_conv3x3_cutlass_nchw(dec, in, out, conv, N, H, W);
     }
     int64_t total = (int64_t)N * conv->out_c * H * W;
     taehv_conv2d_nchw_kernel<<<div_up_i64(total, 256), 256>>>(

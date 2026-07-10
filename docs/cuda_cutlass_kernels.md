@@ -48,8 +48,10 @@ VAE：
 - cuDNN 路径已经移除。
 - 当前 VAE decode 仍是 F32/NCHW 主路径。
 - 1x1 conv 已接入 CUTLASS GEMM baseline：每个 frame 把 NCHW 平面视作 `B = [Cin, H*W]` row-major，权重视作 `A = [Cout, Cin]` row-major，输出直接落到该 frame 的 `[Cout, H*W]` NCHW 平面。
+- 3x3 conv 已接入 tiled im2col + CUTLASS GEMM baseline：每次 materialize `K = Cin*3*3` 和最多 4096 个 spatial column，做 `weight[Cout,K] x cols[K,tile] -> out[Cout,tile]`。这样避免完整 im2col 在后段高分辨率层爆显存。
 - `WORLD_VAE_1X1_GEMM=0` 可以回退旧 direct 1x1 conv，用于性能和数值定位。
-- 3x3 conv 仍走内置 direct conv，是下一版 VAE 优化的大头；优先做显式 im2row + CUTLASS GEMM baseline，再根据带宽开销决定是否换 CUTLASS implicit-GEMM conv。
+- `WORLD_VAE_3X3_GEMM=0` 可以回退旧 direct 3x3 conv，用于性能和数值定位。
+- 当前 1-layer/4-step headless smoke 对照：1x1+3x3 CUTLASS `vae=101.938ms`；只开 1x1 CUTLASS `vae=265.237ms`；全 direct conv `vae=294.243ms`。
 
 Attention：
 
@@ -135,7 +137,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 ## VAE conv 优化计划
 
-内置 direct conv 正确但慢。下一步有两个可选路线：
+内置 direct conv 正确但慢。当前已完成 1x1 per-frame GEMM 和 3x3 tiled im2col GEMM baseline。下一步有两个可选路线：
 
 - CUTLASS implicit-GEMM conv2d：适合 3x3/1x1、channel 比较规整的层。
 - 显式 im2row + CUTLASS GEMM：实现简单，容易对拍和 profile，但会多写一个 im2row buffer。
@@ -143,8 +145,8 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 建议顺序：
 
 1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
-2. 下一步做 3x3 conv 的 im2row + CUTLASS GEMM baseline。
-3. 如果 im2row 带宽太重，再换 CUTLASS implicit-GEMM conv。
+2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
+3. 下一版如果继续攻 VAE，应先看 profile：若 im2col kernel 或 tile GEMM launch count 是大头，再换 CUTLASS implicit-GEMM conv 或更少 launch 的 grouped/batched GEMM。
 4. 最后考虑 NHWC/FP16 全路径和 bias/ReLU fusion。
 
 ## 对拍规则
