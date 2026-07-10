@@ -36,6 +36,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#define WORLD_ATTN_D64_Q_BLOCK 4
 #define WORLD_ATTN_D64_K_BLOCK 64
 #define WORLD_ATTN_D64_FLASH_WARPS 16
 
@@ -757,6 +758,96 @@ __global__ static void indexed_attention_cache_d64_flash_f32_kernel(
     bool valid_q = local_h < group && tq < Tq;
     int hq = hk * group + local_h;
 
+    int Nkv = *index_count;
+    if (Nkv < 0) Nkv = 0;
+    if (Nkv > Tk) Nkv = Tk;
+
+    const float *kbase = cache_k + (int64_t)hk * Tk * 64;
+    const float *vbase = cache_v + (int64_t)hk * Tk * 64;
+    const float *qrow = valid_q ? q + ((int64_t)hq * Tq + tq) * 64 : q;
+    float *orow = valid_q ? out_tokens + (int64_t)tq * (Hq * 64) + hq * 64 : out_tokens;
+
+    float q0 = valid_q ? qrow[lane] : 0.0f;
+    float q1 = valid_q ? qrow[lane + 32] : 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (int n0 = 0; n0 < Nkv; n0 += WORLD_ATTN_D64_K_BLOCK) {
+        int active = Nkv - n0;
+        if (active > WORLD_ATTN_D64_K_BLOCK) active = WORLD_ATTN_D64_K_BLOCK;
+        int tile_elems = active * 64;
+        for (int i = tid; i < tile_elems; i += blockDim.x) {
+            int n = i >> 6;
+            int d = i & 63;
+            int tk = (int)indices[n0 + n];
+            sh_k[i] = kbase[(int64_t)tk * 64 + d];
+            sh_v[i] = vbase[(int64_t)tk * 64 + d];
+        }
+        __syncthreads();
+
+        if (valid_q) {
+            for (int n = 0; n < active; ++n) {
+                const float *krow = sh_k + n * 64;
+                float dot = wm_warp_sum(q0 * krow[lane] + q1 * krow[lane + 32]);
+                dot = __shfl_sync(0xffffffffu, dot, 0);
+                float score = dot * scale;
+                float new_m = fmaxf(m, score);
+                float alpha = expf(m - new_m);
+                float beta = expf(score - new_m);
+                const float *vrow = sh_v + n * 64;
+                acc0 = acc0 * alpha + beta * vrow[lane];
+                acc1 = acc1 * alpha + beta * vrow[lane + 32];
+                l = l * alpha + beta;
+                m = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_q) {
+        if (Nkv > 0) {
+            float inv_l = 1.0f / l;
+            orow[lane] = acc0 * inv_l;
+            orow[lane + 32] = acc1 * inv_l;
+        } else {
+            orow[lane] = 0.0f;
+            orow[lane + 32] = 0.0f;
+        }
+    }
+}
+
+__global__ static void indexed_attention_cache_d64_q4_shared_f32_kernel(
+        const float *__restrict__ q,
+        const float *__restrict__ cache_k,
+        const float *__restrict__ cache_v,
+        const int64_t *__restrict__ indices,
+        const int *__restrict__ index_count,
+        float *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+    extern __shared__ float smem[];
+    float *sh_k = smem;
+    float *sh_v = sh_k + WORLD_ATTN_D64_K_BLOCK * 64;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int tid = threadIdx.x;
+    int q_blocks = (Tq + WORLD_ATTN_D64_Q_BLOCK - 1) / WORLD_ATTN_D64_Q_BLOCK;
+    int q_block = blockIdx.x % q_blocks;
+    int hq = blockIdx.x / q_blocks;
+    if (hq >= Hq) return;
+
+    int tq0 = q_block * WORLD_ATTN_D64_Q_BLOCK;
+    int tq = tq0 + warp;
+    bool valid_q = tq < Tq;
+
+    int group = Hq / Hkv;
+    int hk = hq / group;
     int Nkv = *index_count;
     if (Nkv < 0) Nkv = 0;
     if (Nkv > Tk) Nkv = Tk;
@@ -3254,6 +3345,7 @@ struct WorldCudaRuntime {
     __half *d_linear_half;
     void *d_splitk_workspace;
     int attn_flash_enabled;
+    int attn_q4_shared_enabled;
     DeviceWorldLayerWeights *d_layers;
     DeviceWorldLayerCache *d_caches;
     cudaEvent_t ev_step_start;
@@ -3688,6 +3780,13 @@ extern "C" int world_cuda_runtime_create(
     if (rt->attn_flash_enabled) {
         fprintf(stderr, "tiled flash-like attention enabled by WORLD_FLASH_ATTN=1 for D=64 cache layers\n");
     }
+    {
+        const char *q4_env = getenv("WORLD_ATTN_D64_Q4_SHARED");
+        rt->attn_q4_shared_enabled = q4_env ? q4_env[0] != '0' : 0;
+        if (rt->attn_q4_shared_enabled && !rt->attn_flash_enabled) {
+            fprintf(stderr, "D=64 attention q4 shared-KV kernel enabled\n");
+        }
+    }
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
     if (precompute_runtime_layer_mods(rt)) goto fail;
@@ -3889,10 +3988,19 @@ extern "C" int world_cuda_runtime_step_rgb(
                     attn_done = 1;
                 }
                 if (!attn_done) {
-                    indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
-                        rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
-                        cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
-                        1.0f / 8.0f);
+                    if (rt->attn_q4_shared_enabled) {
+                        int q_blocks = div_up_i64(rt->T, WORLD_ATTN_D64_Q_BLOCK);
+                        size_t smem = (size_t)2 * WORLD_ATTN_D64_K_BLOCK * 64 * sizeof(float);
+                        indexed_attention_cache_d64_q4_shared_f32_kernel<<<cfg->n_heads * q_blocks, 128, smem>>>(
+                            rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                            cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                            1.0f / 8.0f);
+                    } else {
+                        indexed_attention_cache_d64_warp_f32_kernel<<<div_up_i64((int64_t)cfg->n_heads * rt->T, 4), 128>>>(
+                            rt->d_q, cache->k, cache->v, cache->indices, cache->index_count, rt->d_attn,
+                            cfg->n_heads, cfg->n_kv_heads, rt->T, cache->capacity,
+                            1.0f / 8.0f);
+                    }
                 }
             } else {
                 indexed_attention_cache_f32_kernel<<<cfg->n_heads * rt->T, 256>>>(

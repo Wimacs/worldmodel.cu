@@ -76,6 +76,9 @@ Attention：
 - cuBLAS attention prototype 已经移除。
 - 当前默认是项目内置 indexed warp fallback。
 - `WORLD_FLASH_ATTN=1` 可以打开已有 online-softmax tiled prototype。
+- `WORLD_ATTN_D64_Q4_SHARED=1` 可以打开 D=64 4-row shared-KV probe。这个 kernel 复用 PyTorch extension 中已对拍的 `indexed_attention_d64_q4_shared_f32_kernel` 思路，每个 128-thread block 处理 4 个 query row，并把 K/V tile 放入 shared memory，试图减少默认 warp fallback 中的重复 K/V 全局读取。
+- 实测后 q4 shared-KV 不默认启用：360p、24 layer、4 step、`WORLD_VAE_FP16_NHWC=1`、`cache-window=8`，单 chunk cache 1 frame 时默认 `attn=6.057ms/120`，q4 shared `10.417ms/120`，flash prototype `7.184ms/120`。连续 `--warmup 8` 填满 8-frame cache 后默认第 8 chunk `attn=38.654ms/120`、`total=79.334ms`；q4 shared 为 `71.264ms/120`、`112.881ms`；flash prototype 为 `41.541ms/120`、`82.812ms`。结论：shared-memory 复用被同步/占用开销吃掉，现阶段默认仍保留 warp fallback。
+- 正常非 profile、`--warmup 8`、默认 attention 的最后一 chunk 为 `total=71.973ms`、`chunk_fps=13.894`、`rgb_fps=55.576`，`cache_tokens_l0=1024`。下一版 attention 应该转向真正的 fused QK/softmax/AV 设计，或用 CuTe/CUTLASS 组织更高粒度的 QK/AV，而不是继续微调当前 q4/flash prototype。
 - 后续要么继续优化自写 fused attention，要么用 CUTLASS/CuTe 写专门的 QK/softmax/AV fused kernel；不要回退到 cuBLAS。
 
 ## 从 Triton 优化方案学什么
