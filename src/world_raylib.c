@@ -21,9 +21,6 @@
 
 #include <math.h>
 #include <errno.h>
-#ifndef _WIN32
-#include <time.h>
-#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -103,17 +100,6 @@ static void world_thread_join(WorldThread thread) {
 }
 #endif
 
-static void world_sleep_ms(int ms) {
-#ifdef _WIN32
-    Sleep((DWORD)ms);
-#else
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
-#endif
-}
-
 typedef struct {
     WorldModelProbeWeights probe;
     WorldLayerWeights *layers;
@@ -142,8 +128,6 @@ typedef struct {
     int stop;
     int failed;
     int produced_chunks;
-    int input_epoch;
-    int consumed_epoch;
     float generation_seconds;
     float control_seconds;
     float target_control_seconds;
@@ -326,36 +310,16 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
 
 static void merge_frame_control(LiveShared *s, const float *frame_control, float frame_seconds) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    int new_input = 0;
     s->control[0] = clamp_mouse_accum(s->control[0] + frame_control[0]);
     s->control[1] = clamp_mouse_accum(s->control[1] + frame_control[1]);
     if (frame_seconds > 0.0f && frame_seconds < 0.25f) {
         s->control_seconds += frame_seconds;
     }
     for (int i = 0; i < s->n_buttons; ++i) {
-        if (frame_control[2 + i] > 0.5f && s->control[2 + i] <= 0.5f) {
-            new_input = 1;
-        }
         s->control[2 + i] = frame_control[2 + i];
-    }
-    if (fabsf(frame_control[2 + s->n_buttons]) > 0.5f) {
-        new_input = 1;
     }
     s->control[2 + s->n_buttons] =
         clamp_scroll_sign(s->control[2 + s->n_buttons] + frame_control[2 + s->n_buttons]);
-    if (new_input) {
-        s->input_epoch += 1;
-    }
-}
-
-static int control_has_activity(const float *control, int ctrl_dim, int n_buttons) {
-    if (!control || ctrl_dim < n_buttons + 3) return 1;
-    if (fabsf(control[0]) > 1.5e-1f || fabsf(control[1]) > 1.5e-1f) return 1;
-    for (int i = 0; i < n_buttons; ++i) {
-        if (fabsf(control[2 + i]) > 0.5f) return 1;
-    }
-    if (fabsf(control[2 + n_buttons]) > 0.5f) return 1;
-    return 0;
 }
 
 static WORLD_THREAD_RETURN generation_worker(void *arg) {
@@ -371,7 +335,6 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
     for (;;) {
         world_mutex_lock(&s->mutex);
         int stop = s->stop;
-        int input_ready = s->input_epoch != s->consumed_epoch;
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
             if (s->target_control_seconds > 0.0f && s->control_seconds > s->target_control_seconds) {
@@ -384,15 +347,8 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
             s->control[2 + s->n_buttons] = 0.0f;
             s->control_seconds = 0.0f;
         }
-        if (input_ready) {
-            s->consumed_epoch = s->input_epoch;
-        }
         world_mutex_unlock(&s->mutex);
         if (stop) break;
-        if (!input_ready || !control_has_activity(control, s->ctrl_dim, s->n_buttons)) {
-            world_sleep_ms(5);
-            continue;
-        }
 
         const unsigned char *pixels = NULL;
         int width = 0;
@@ -762,6 +718,12 @@ int main(int argc, char **argv) {
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
         if (world_runtime_seed_latent_pixels(rt, seed_latent, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            free(seed_control);
+            free(warm_control);
+            goto cleanup_before_window;
+        }
+        fprintf(stderr, "generating initial chunk after seed cache pass\n");
+        if (world_runtime_step_pixels(rt, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
