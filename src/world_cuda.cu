@@ -1382,30 +1382,12 @@ __global__ static void unpatchify_orig_f32_kernel(
     }
 }
 
-__global__ static void taehv_repeat_latent4_kernel(
-        const float *latent,
-        float *out,
-        int C,
-        int H,
-        int W) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t frame_elems = (int64_t)C * H * W;
-    int64_t total = 4 * frame_elems;
-    if (i >= total) return;
-    out[i] = latent[i % frame_elems];
-}
-
 __global__ static void taehv_copy_latent_clamp_kernel(
         const float *latent,
         float *out,
         int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = tanhf(latent[i] / 3.0f) * 3.0f;
-}
-
-__global__ static void taehv_clamp_kernel(float *x, int64_t n) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = tanhf(x[i] / 3.0f) * 3.0f;
 }
 
 __global__ static void taehv_relu_kernel(float *x, int64_t n) {
@@ -1589,33 +1571,6 @@ __global__ static void taehv_concat_memory_nchw_kernel(
     }
 }
 
-__global__ static void taehv_concat_past_nchw_kernel(
-        const float *x,
-        float *out,
-        int N,
-        int C,
-        int H,
-        int W) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)N * 2 * C * H * W;
-    if (i >= total) return;
-
-    int w = (int)(i % W);
-    int64_t q = i / W;
-    int h = (int)(q % H);
-    q /= H;
-    int c2 = (int)(q % (2 * C));
-    int n = (int)(q / (2 * C));
-    if (c2 < C) {
-        out[i] = x[((int64_t)n * C * H + c2 * H + h) * W + w];
-    } else if (n == 0) {
-        out[i] = 0.0f;
-    } else {
-        int c = c2 - C;
-        out[i] = x[(((int64_t)n - 1) * C * H + c * H + h) * W + w];
-    }
-}
-
 __global__ static void taehv_add_relu_kernel(
         const float *a,
         const float *b,
@@ -1673,36 +1628,6 @@ __global__ static void taehv_tgrow_reshape_kernel(
     out[i] = in[((int64_t)n * (C * stride) * H + in_c * H + y) * W + x];
 }
 
-__global__ static void taehv_pixel_shuffle_last4_u8_kernel(
-        const float *in,
-        unsigned char *rgb,
-        int N,
-        int H,
-        int W) {
-    int frames = 4;
-    int H2 = H * 2;
-    int W2 = W * 2;
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)frames * H2 * W2 * 3;
-    if (i >= total) return;
-
-    int c = (int)(i % 3);
-    int64_t q = i / 3;
-    int ox = (int)(q % W2);
-    q /= W2;
-    int oy = (int)(q % H2);
-    int f = (int)(q / H2);
-    int n = N - frames + f;
-    int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
-    float v = in[((int64_t)n * 12 * H + ic * H + oy / 2) * W + ox / 2];
-    if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
-    int u = (int)floorf(v * 255.0f + 0.5f);
-    if (u < 0) u = 0;
-    if (u > 255) u = 255;
-    rgb[i] = (unsigned char)u;
-}
-
 __global__ static void taehv_pixel_shuffle_one_u8_kernel(
         const float *in,
         unsigned char *rgb,
@@ -1727,24 +1652,6 @@ __global__ static void taehv_pixel_shuffle_one_u8_kernel(
     if (u < 0) u = 0;
     if (u > 255) u = 255;
     rgb[i] = (unsigned char)u;
-}
-
-__global__ static void taehv_repeat_latent4_clamp_nhwc_h_kernel(
-        const float *latent,
-        __half *out,
-        int C,
-        int H,
-        int W) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)4 * H * W * C;
-    if (i >= total) return;
-    int c = (int)(i % C);
-    int64_t q = i / C;
-    int x = (int)(q % W);
-    q /= W;
-    int y = (int)(q % H);
-    float v = latent[((int64_t)c * H + y) * W + x];
-    out[i] = __float2half_rn(tanhf(v / 3.0f) * 3.0f);
 }
 
 __global__ static void taehv_copy_latent_clamp_nhwc_h_kernel(
@@ -1781,32 +1688,6 @@ __global__ static void taehv_add_bias_nhwc_h_kernel(
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     out[i] = __float2half_rn(__half2float(out[i]) + __half2float(bias[i % C]));
-}
-
-__global__ static void taehv_concat_past_nhwc_h_kernel(
-        const __half *x,
-        __half *out,
-        int N,
-        int C,
-        int H,
-        int W) {
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)N * H * W * (2 * C);
-    if (i >= total) return;
-    int c2 = (int)(i % (2 * C));
-    int64_t q = i / (2 * C);
-    int w = (int)(q % W);
-    q /= W;
-    int h = (int)(q % H);
-    int n = (int)(q / H);
-    if (c2 < C) {
-        out[i] = x[(((int64_t)n * H + h) * W + w) * C + c2];
-    } else if (n == 0) {
-        out[i] = __float2half_rn(0.0f);
-    } else {
-        int c = c2 - C;
-        out[i] = x[((((int64_t)n - 1) * H + h) * W + w) * C + c];
-    }
 }
 
 __global__ static void taehv_concat_memory_nhwc_h_kernel(
@@ -1885,36 +1766,6 @@ __global__ static void taehv_tgrow_reshape_nhwc_h_kernel(
     int n = (int)(q / stride);
     int in_c = s * C + c;
     out[i] = in[(((int64_t)n * H + y) * W + x) * (C * stride) + in_c];
-}
-
-__global__ static void taehv_pixel_shuffle_last4_u8_nhwc_h_kernel(
-        const __half *in,
-        unsigned char *rgb,
-        int N,
-        int H,
-        int W) {
-    int frames = 4;
-    int H2 = H * 2;
-    int W2 = W * 2;
-    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t total = (int64_t)frames * H2 * W2 * 3;
-    if (i >= total) return;
-
-    int c = (int)(i % 3);
-    int64_t q = i / 3;
-    int ox = (int)(q % W2);
-    q /= W2;
-    int oy = (int)(q % H2);
-    int f = (int)(q / H2);
-    int n = N - frames + f;
-    int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
-    float v = __half2float(in[(((int64_t)n * H + oy / 2) * W + ox / 2) * 12 + ic]);
-    if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
-    int u = (int)floorf(v * 255.0f + 0.5f);
-    if (u < 0) u = 0;
-    if (u > 255) u = 255;
-    rgb[i] = (unsigned char)u;
 }
 
 __global__ static void taehv_pixel_shuffle_one_u8_nhwc_h_kernel(
@@ -3231,7 +3082,7 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
     dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
     dec->conv3x3_batch_cols_enabled = vae_3x3_batch_env ? vae_3x3_batch_env[0] != '0' : 0;
-    dec->fp16_nhwc_enabled = vae_fp16_nhwc_env ? vae_fp16_nhwc_env[0] != '0' : 0;
+    dec->fp16_nhwc_enabled = vae_fp16_nhwc_env ? vae_fp16_nhwc_env[0] != '0' : 1;
     dec->profile_enabled = vae_profile_env ? vae_profile_env[0] != '0' : 0;
     dec->conv3x3_tile_cols = 16384;
     if (vae_3x3_tile_env && vae_3x3_tile_env[0]) {
@@ -3695,70 +3546,6 @@ static int taehv_run_relu(float *x, int64_t n) {
 static int taehv_run_relu_h(__half *x, int64_t n) {
     taehv_relu_nhwc_h_kernel<<<div_up_i64(n, 256), 256>>>(x, n);
     CUDA_OK(cudaGetLastError());
-    return 0;
-}
-
-static int taehv_run_memblock(
-        DeviceVaeDecoder *dec,
-        float **cur_io,
-        float *buf0,
-        float *buf1,
-        float *buf2,
-        const DeviceVaeConvWeight *conv0,
-        const DeviceVaeConvWeight *conv2,
-        const DeviceVaeConvWeight *conv4,
-        int N,
-        int C,
-        int H,
-        int W) {
-    float *cur = *cur_io;
-    float *tmp = NULL;
-    float *aux = NULL;
-    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux);
-
-    int64_t elems = (int64_t)N * C * H * W;
-    taehv_concat_past_nchw_kernel<<<div_up_i64(elems * 2, 256), 256>>>(cur, aux, N, C, H, W);
-    CUDA_OK(cudaGetLastError());
-    if (taehv_run_conv(dec, aux, tmp, conv0, N, H, W)) return 1;
-    if (taehv_run_relu(tmp, elems)) return 1;
-    if (taehv_run_conv(dec, tmp, aux, conv2, N, H, W)) return 1;
-    if (taehv_run_relu(aux, elems)) return 1;
-    if (taehv_run_conv(dec, aux, tmp, conv4, N, H, W)) return 1;
-    taehv_add_relu_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
-    CUDA_OK(cudaGetLastError());
-    *cur_io = aux;
-    return 0;
-}
-
-static int taehv_run_memblock_h_nhwc(
-        DeviceVaeDecoder *dec,
-        __half **cur_io,
-        __half *buf0,
-        __half *buf1,
-        __half *buf2,
-        const DeviceVaeConvWeight *conv0,
-        const DeviceVaeConvWeight *conv2,
-        const DeviceVaeConvWeight *conv4,
-        int N,
-        int C,
-        int H,
-        int W) {
-    __half *cur = *cur_io;
-    __half *tmp = NULL;
-    __half *aux = NULL;
-    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux);
-
-    int64_t elems = (int64_t)N * H * W * C;
-    taehv_concat_past_nhwc_h_kernel<<<div_up_i64(elems * 2, 256), 256>>>(cur, aux, N, C, H, W);
-    CUDA_OK(cudaGetLastError());
-    if (taehv_run_conv_h_nhwc(dec, aux, tmp, conv0, N, H, W)) return 1;
-    if (taehv_run_relu_h(tmp, elems)) return 1;
-    if (taehv_run_conv_h_nhwc(dec, tmp, aux, conv2, N, H, W)) return 1;
-    if (taehv_run_relu_h(aux, elems)) return 1;
-    if (taehv_run_conv_h_nhwc(dec, aux, tmp, conv4, N, H, W)) return 1;
-    taehv_add_relu_nhwc_h_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
-    CUDA_OK(cudaGetLastError());
-    *cur_io = aux;
     return 0;
 }
 
@@ -4815,7 +4602,7 @@ extern "C" int world_cuda_runtime_create(
         half_cache_requested = half_env ? half_env[0] != '0' : 0;
         rt->attn_half_cache_enabled = half_cache_requested;
         rt->attn_half_flash_enabled = half_flash_env ? half_flash_env[0] != '0' : 0;
-        rt->attn_cutlass_enabled = cutlass_attn_env ? cutlass_attn_env[0] != '0' : 0;
+        rt->attn_cutlass_enabled = cutlass_attn_env ? cutlass_attn_env[0] != '0' : 1;
         rt->attn_cutlass_grouped_enabled = cutlass_grouped_env ? cutlass_grouped_env[0] != '0' : 0;
         if (rt->attn_cutlass_grouped_enabled) {
             rt->attn_cutlass_enabled = 1;
@@ -4887,7 +4674,7 @@ extern "C" int world_cuda_runtime_create(
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_scores, score_elems * sizeof(float)));
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_probs_half, score_elems * sizeof(__half)));
             fprintf(stderr,
-                    "D=64 attention CUTLASS materialized QK/AV probe enabled%s (capacity=%d tokens scratch=%.2f MiB)\n",
+                    "D=64 attention CUTLASS materialized QK/AV enabled%s (capacity=%d tokens scratch=%.2f MiB)\n",
                     rt->attn_cutlass_grouped_enabled ? " with grouped-M GQA path" : "",
                     rt->attn_max_capacity,
                     (double)scratch_bytes / (1024.0 * 1024.0));

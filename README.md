@@ -283,12 +283,12 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - `WORLD_TRANSFORMER_PROFILE=1` 会打印 transformer 分段 CUDA event timing。360p 24 layer/4 step 当前最大块是 MLP fc2；小 M、大 K 形状默认启用 `WORLD_MLP_FC2_SPLITK=4` 的 CUTLASS serial split-K，`WORLD_MLP_FC2_SPLITK=1` 可关闭，`2/8/...` 可手动覆盖。
 - 360p token GEMM 默认对小 M 形状启用 CUTLASS `64x64x32` tensor-op tile；`WORLD_FP16_GEMM_TILE=base` 可回退旧 `128x128x32` tile，`./build/worldmodel_cuda_gemm_probe --bench` 可复测候选 tile。
 - MLP `fc1 -> SiLU -> fc2` 默认使用 CUTLASS fc1 SiLU-to-half epilogue，fc2 split-K 直接消费 half activation；`WORLD_MLP_FC1_SILU_EPILOGUE=0` 可回退到独立 `SiLU + cast` kernel。
-- D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype，`WORLD_ATTN_D64_Q4_SHARED=1` 可启用 4-row shared-KV probe。两者当前真实 profile 都慢于默认 fallback，保留为诊断开关。
+- D=64 cache attention 默认走 CUTLASS materialized QK/AV，并强制 FP16 KV cache；它把 indexed K/V gather 成 compact buffer，再用 CUTLASS batched GEMM 做 `QK` 和 `PV`。`WORLD_ATTN_D64_CUTLASS=0` 可回退项目内 indexed warp fallback，`WORLD_ATTN_D64_CUTLASS_MAX_SCRATCH_MIB` 可覆盖默认 2048 MiB scratch 限制。
+- `WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype，`WORLD_ATTN_D64_Q4_SHARED=1` 可启用 4-row shared-KV probe；两者当前真实 profile 都慢于 CUTLASS 默认路径，保留为诊断开关。
 - `WORLD_ATTN_D64_HALF_CACHE=1` 会把 K/V cache 存为 FP16，并走 half2 warp attention；`WORLD_ATTN_D64_HALF_FLASH=1` 可进一步启用 half-cache group-flash probe。group-flash 已有 PyTorch 对拍，但当前 360p 满 cache profile 慢于 half2 warp path，因此只作为下一轮 attention 设计的对照，不默认启用。
-- `WORLD_ATTN_D64_CUTLASS=1` 会启用 opt-in CUTLASS materialized QK/AV attention probe，并强制 FP16 KV cache；它显著加速 360p 满 cache attention，但会额外 materialize scores/probs，scratch 默认限制为 2048 MiB，可用 `WORLD_ATTN_D64_CUTLASS_MAX_SCRATCH_MIB` 覆盖。
 - `WORLD_ATTN_D64_CUTLASS_GROUPED=1` 会启用 grouped-M GQA materialized CUTLASS 变体，减少 K/V compact 和 GQA B 矩阵重复读取；当前端到端收益很小，作为 opt-in 对照保留。
-- VAE decode 默认仍是 F32/NCHW 主路径；1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
-- `WORLD_VAE_FP16_NHWC=1` 可启用实验性的 VAE FP16/NHWC 全路径：VAE 权重在 load 阶段额外预打包成 KRSC half，runtime 用 CUTLASS tensor-op implicit conv，bias 仍是单独 half kernel。当前保持默认关闭，方便和 F32/NCHW 对照及定位画面问题。
+- VAE decode 默认走 FP16/NHWC 全路径：VAE 权重在 load 阶段额外预打包成 KRSC half，runtime 用 CUTLASS tensor-op implicit conv，bias 仍是单独 half kernel。`WORLD_VAE_FP16_NHWC=0` 可回退 F32/NCHW 主路径。
+- F32/NCHW 回退路径里，1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
 - `WORLD_VAE_3X3_BATCH_COLS=1` 可试验 frame-batched 3x3 tiles；当前 profile 显示它慢于默认 per-frame path，所以默认关闭。
 - PyTorch extension 里已有 CUTLASS implicit-GEMM 3x3 NHWC/KRSC 单层、half 单层和 pair probe；half 单层测试按 runtime 的 half-output-then-bias 舍入路径对齐。
 - `WORLD_VAE_PROFILE=1` 会同步 CUDA event 并打印 VAE conv 分段时间，只用于 profile，不用于正常 FPS。
