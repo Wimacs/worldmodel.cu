@@ -21,6 +21,13 @@ if(UNIX)
 endif()
 
 function(world_enable_large_objects target_name)
+  if(WIN32)
+    target_compile_definitions(${target_name} PRIVATE
+      WIN32_LEAN_AND_MEAN
+      NOMINMAX
+      _CRT_SECURE_NO_WARNINGS
+    )
+  endif()
   if(MSVC)
     target_compile_options(${target_name} PRIVATE
       $<$<COMPILE_LANGUAGE:C>:/bigobj>
@@ -73,7 +80,10 @@ if(WORLD_ENABLE_CUDA)
       GIT_TAG v3.5.1
       GIT_SHALLOW TRUE
     )
-    FetchContent_MakeAvailable(cutlass)
+    FetchContent_GetProperties(cutlass)
+    if(NOT cutlass_POPULATED)
+      FetchContent_Populate(cutlass)
+    endif()
     set(WORLD_CUTLASS_INCLUDE_DIR "${cutlass_SOURCE_DIR}/include")
   endif()
   message(STATUS "CUTLASS include: ${WORLD_CUTLASS_INCLUDE_DIR}")
@@ -263,8 +273,12 @@ if(WORLD_ENABLE_VULKAN)
 endif()
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
+  set(USE_AUDIO OFF CACHE BOOL "" FORCE)
   set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
+  set(SUPPORT_MODULE_RMODELS OFF CACHE BOOL "" FORCE)
   add_subdirectory(3rd/raylib EXCLUDE_FROM_ALL)
 
   if(WORLD_ENABLE_CUDA)

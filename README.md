@@ -74,7 +74,7 @@ worldmodel.cu/
 
 ### Windows CUDA
 
-在 "x64 Native Tools Command Prompt for VS 2022" 里运行：
+在 "x64 Native Tools Command Prompt for VS 2022" 里运行。CUDA-only 构建不需要 Vulkan SDK：
 
 ```bat
 cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 ^
@@ -94,6 +94,39 @@ build-win/Release/worldmodel_raylib.exe
 build-win/Release/worldmodel_cuda.exe
 ```
 
+### Windows Vulkan
+
+Vulkan 构建需要安装 Vulkan SDK，并保证 `glslc.exe` 在 `PATH` 中，或 `VULKAN_SDK` 指向 SDK 根目录：
+
+```bat
+cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 ^
+  -DWORLD_ENABLE_CUDA=OFF ^
+  -DWORLD_ENABLE_VULKAN=ON
+
+cmake --build build-win-vulkan --config Release --parallel
+```
+
+生成文件：
+
+```text
+build-win-vulkan/Release/worldmodel_raylib_vulkan.exe
+build-win-vulkan/Release/worldmodel_vulkan_probe.exe
+build-win-vulkan/Release/worldmodel_vulkan_gemm_autotune.exe
+```
+
+### Windows CUDA + Vulkan
+
+如果同一台机器上 CUDA Toolkit 和 Vulkan SDK 都已经配置好，可以一次构建两个后端：
+
+```bat
+cmake -S . -B build-win-all -G "Visual Studio 17 2022" -A x64 ^
+  -DWORLD_ENABLE_CUDA=ON ^
+  -DWORLD_ENABLE_VULKAN=ON ^
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build-win-all --config Release --parallel
+```
+
 ### Linux CUDA
 
 ```sh
@@ -111,19 +144,7 @@ build/worldmodel_raylib
 build/worldmodel_cuda
 ```
 
-### Vulkan
-
-Windows：
-
-```bat
-cmake -S . -B build-win-vulkan -G "Visual Studio 17 2022" -A x64 ^
-  -DWORLD_ENABLE_CUDA=OFF ^
-  -DWORLD_ENABLE_VULKAN=ON
-
-cmake --build build-win-vulkan --config Release --parallel
-```
-
-Linux：
+### Linux Vulkan
 
 ```sh
 cmake -S . -B build-vulkan -DCMAKE_BUILD_TYPE=Release \
