@@ -18,7 +18,7 @@ CUDA standalone 的 `row_major_linear()` 已经改为 CUTLASS GEMM：
 
 FP16-weight fast path：
 
-- runtime 仍先把 activation 从 FP32 cast 到 FP16 scratch。
+- 通用 runtime 路径仍可把 FP32 activation cast 到 FP16 scratch；360p 的 QKV、MLP fc1 和 FMHA-out 边界已能由 producer 直接写 half，跳过独立 cast。
 - weight 预先保存为 FP16。
 - resident runtime 默认使用 CUTLASS tensor-op GEMM 做 `half x half -> float accumulator -> float output`。
 - tensor-op kernel 使用 CUTLASS Sm80 tests 覆盖过的 `128x128x32` threadblock，`64x64x32` warp，`16x8x16` instruction，4 stages。
@@ -30,6 +30,11 @@ FP16-weight fast path：
 - 上一版沿 MLP 链路做了一次小的 fusion：`fc1` 仍用 CUTLASS 输出 float，随后用 `silu_f32_to_f16_kernel` 一次完成 SiLU 和 half cast，`fc2` 的 CUTLASS serial split-K 直接读取 half activation。这样省掉旧路径中 `SiLU(float)->float hidden` 后又在 fc2 内部 `float hidden->half scratch` 的第二次全量读写。新增 PyTorch 对拍覆盖 `silu_to_half` 和 half-input split-K。360p profile 变为 `mlp_silu=0.629ms/120`、`mlp_fc2=8.159ms/120`、`total=48.872ms`；正常非 profile smoke 为 `total=41.613ms`、`chunk_fps=24.031`、`rgb_fps=96.123`。
 - MLP v1.3 把这个思路推进到 CUTLASS epilogue：新增 `LinearCombinationSilu` output op，让 fc1 GEMM 直接输出 `half(SiLU(acc))` 到 fc2 的 half activation buffer。runtime 默认启用，`WORLD_MLP_FC1_SILU_EPILOGUE=0` 可回退上一版的独立 kernel。PyTorch 对拍新增 `row_major_linear_fp16_tensorop_m64n64_silu_half`，覆盖真实 fc1 shape `M=128,K=2048,N=8192`。360p profile 为 `mlp_fc1=6.824ms/120`、`mlp_silu=0.000ms/0`、`mlp_fc2=8.200ms/120`、`total=48.185ms`；正常非 profile smoke 为 `total=40.793ms`、`chunk_fps=24.514`、`rgb_fps=98.056`。回退 `WORLD_MLP_FC1_SILU_EPILOGUE=0` 的非 profile smoke 为 `total=41.303ms`、`rgb_fps=96.845`。这版到此停止，下一步应该转向 attention，而不是继续压 MLP 这几个小数点。
 - MLP v1.4 做了一个有边界的 split-K 验证：新增 `row_major_linear_fp16_input_tensorop_splitk_parallel` PyTorch probe 和 runtime 开关 `WORLD_MLP_FC2_SPLITK_PARALLEL=1`，使用 CUTLASS `GemmSplitKParallel`，tile 保持 `128x128x32`，只改变 reduction 组织方式。probe 对拍真实 fc2 shape `M=128,K=8192,N=2048`，reference 为 half input/weight 转 float matmul。microbench 显示 parallel split-K 4 slices 为 `0.0604ms`，serial split-K 4 slices 为 `0.0647ms`，但 runtime 满 cache profile 反而更慢：默认 serial `mlp_fc2=8.306ms/120`、最后 chunk `total=45.981ms`；parallel `mlp_fc2=8.550ms/120`、最后 chunk `total=46.611ms`，且需要 `4.00 MiB` partial workspace 和一个 reduction kernel。因此 parallel split-K 不默认启用，保留为诊断开关。
+- activation-boundary v1.8 没继续调 fc2 tile，而是处理 `torch.compile`/Triton 通常会跨算子消掉、手写 runtime 里却仍显式存在的 dtype bridge。旧 QKV 和 MLP 链路是 `AdaRMSNorm(float output) -> f32_to_f16 -> CUTLASS GEMM`；旧 FMHA 链路是 `FMHA half output -> scatter float -> f32_to_f16 -> out_proj`。这些中间 float tensor 只为下一个 GEMM 再量化一次，没有增加有效精度。
+- v1.8 新增 `ada_rms_norm_single_f16_kernel`：平方和、`rsqrt`、scale/bias 调制保持 FP32，只把最终 store 改为 round-to-nearest half。新增 half-input CUTLASS `64x64x32` GEMM 和 SiLU-half epilogue，让 QKV、MLP fc1、attention out projection 直接消费 producer 的 half buffer；FMHA GQA scatter 也增加 token-major half 输出。残差、gate、scheduler 和归一化归约仍是 FP32，因此这不是把整个 transformer 粗暴降成 FP16。
+- PyTorch extension 为每个新边界暴露并对拍 `ada_rms_norm_half`、`row_major_linear_fp16_input_tensorop_m64n64`、`row_major_linear_fp16_input_tensorop_m64n64_silu_half`、`indexed_attention_half_kv_fmha_gqa_half_output`。reference 明确在相同位置 `.half()`，完整 `test_worldmodel_kernels.py` 43 项通过。runtime 同输入 A/B 连续导出的 14 个 latent 以及最终 PPM 都逐字节一致，说明新路径只是消掉冗余表示，没有移动量化边界。
+- 360p、24 layer、4 step、`cache-window=8`、FMHA GQA 满 cache 同代码 profile：`WORLD_HALF_GEMM_BOUNDARY=0` 时 `qkv_gemm=3.899ms/120`、`attn_out_gemm=2.417ms/120`、`mlp_fc1=6.861ms/120`、profile total `43.973ms`；默认新路径为 `3.666ms`、`2.158ms`、`6.478ms`、`43.011ms`。非 profile 最后一 chunk 从 `36.830ms` 降到 `35.959ms`，约 `2.4%`；`WORLD_HALF_GEMM_BOUNDARY=0` 保留为 A/B 回退。
+- 这一版到此停止：controller 分支还有类似边界，但它总计约 `1.9ms/40 calls`，继续扩散只会得到更小收益。下一版转向 FMHA 直接读取 sparse ring cache，目标是消掉每层每 pass 的 indexed K/V gather，而不是继续微调本版 half kernel。
 - CMake/NVCC 独立探针 `worldmodel_cuda_gemm_probe --tensorop` 现在通过；此前 `ldsm RowMajor` 失败的原因是 CMake 实际编译成了 `sm_52`，导致 CUTLASS SM80 `ldsm` 实现没有启用。
 - CMake 默认 `CMAKE_CUDA_ARCHITECTURES=89` 已移到 `enable_language(CUDA)` 之前设置，并在 configure 时打印实际架构。
 - `WORLD_FP16_GEMM=simt` 可以强制回退旧的 FP16 SIMT GEMM；`WORLD_FP16_GEMM=0` 可以强制回退到 FP32 SIMT GEMM，用于定位问题。
@@ -153,7 +158,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 第三阶段：fusion
 
 - QKV projection: 已经把 Q/K/V weight 拼成一个 `N = D + 2*kv_dim` 的 GEMM，这是正确方向。
-- MLP fc1 + SiLU: 下一步用 CUTLASS epilogue 输出 FP16 或直接 SiLU，减少一个 global read/write。
+- MLP fc1 + SiLU: 已用 CUTLASS epilogue 直接输出 `half(SiLU(acc))`，并让 half-output AdaRMSNorm 直接供给 fc1。
 - gated residual: 对 attn out_proj 和 mlp fc2 可以把 gate/residual 放进 epilogue，目标是少一个 kernel launch 和一次读写。
 - control branch: `fc1_x + fc1_c + SiLU` 可融合到 epilogue 或紧随 GEMM 的 lightweight kernel。
 

@@ -234,6 +234,30 @@ __global__ void scatter_gqa_bmhd_f16_to_bhtd_f32_kernel(
     out[i] = __half2float(group_out[src]);
 }
 
+__global__ void scatter_gqa_bmhd_f16_to_bhtd_f16_kernel(
+        const __half *__restrict__ group_out,
+        __half *__restrict__ out,
+        int B,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int group = Hq / Hkv;
+    int M = group * Tq;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Hq * Tq * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int t = (int)(x % Tq);
+    int hq = (int)((x / Tq) % Hq);
+    int b = (int)(x / ((int64_t)Tq * Hq));
+    int hk = hq / group;
+    int g = hq - hk * group;
+    int m = g * Tq + t;
+    int64_t src = (((int64_t)b * M + m) * Hkv + hk) * 64 + d;
+    out[i] = group_out[src];
+}
+
 __global__ void scatter_grouped_attn_d64_f32_kernel(
         const float *__restrict__ group_out,
         float *__restrict__ out,
@@ -409,6 +433,51 @@ __global__ void ada_rms_norm_f32_kernel(
     float *row_y = y + (int64_t)row * D;
     for (int d = tid; d < D; d += blockDim.x) {
         row_y[d] = row_x[d] * inv * (1.0f + row_s[d]) + row_b[d];
+    }
+}
+
+__global__ void ada_rms_norm_f16_kernel(
+        const float *x,
+        const float *scale,
+        const float *bias,
+        __half *y,
+        int B,
+        int T,
+        int N,
+        int D,
+        float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int b = row / T;
+    int t = row - b * T;
+    int m = T / N;
+    int n = t / m;
+
+    const float *row_x = x + (int64_t)row * D;
+    const float *row_s = scale + ((int64_t)b * N + n) * D;
+    const float *row_b = bias + ((int64_t)b * N + n) * D;
+
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = row_x[d];
+        sum += v * v;
+    }
+
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) {
+            red[tid] += red[tid + step];
+        }
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)D + eps);
+    __half *row_y = y + (int64_t)row * D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        row_y[d] = __float2half_rn(row_x[d] * inv * (1.0f + row_s[d]) + row_b[d]);
     }
 }
 
@@ -1928,6 +1997,59 @@ torch::Tensor row_major_linear_fp16_tensorop_m64n64_cuda(torch::Tensor x, torch:
     return y;
 }
 
+torch::Tensor row_major_linear_fp16_input_tensorop_m64n64_cuda(torch::Tensor x, torch::Tensor w) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F16(x);
+    WM_CHECK_F16(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    auto y = torch::empty({m, n}, x.options().dtype(torch::kFloat32));
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y.data_ptr<float>(), n},
+        {y.data_ptr<float>(), n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_input_tensorop_m64n64.can_implement");
+    check_cutlass_status(gemm(args, nullptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_input_tensorop_m64n64");
+    check_last_cuda_error("row_major_linear_fp16_input_tensorop_m64n64");
+    return y;
+}
+
 torch::Tensor row_major_linear_fp16_tensorop_m64n64_silu_half_cuda(torch::Tensor x, torch::Tensor w) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(w);
@@ -1982,6 +2104,61 @@ torch::Tensor row_major_linear_fp16_tensorop_m64n64_silu_half_cuda(torch::Tensor
     check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_tensorop_m64n64_silu_half.can_implement");
     check_cutlass_status(gemm(args, nullptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_tensorop_m64n64_silu_half");
     check_last_cuda_error("row_major_linear_fp16_tensorop_m64n64_silu_half");
+    return y;
+}
+
+torch::Tensor row_major_linear_fp16_input_tensorop_m64n64_silu_half_cuda(torch::Tensor x, torch::Tensor w) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F16(x);
+    WM_CHECK_F16(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    auto y = torch::empty({m, n}, x.options());
+
+    using Epilogue = LinearCombinationSilu<
+        cutlass::half_t,
+        128 / cutlass::sizeof_bits<cutlass::half_t>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w.data_ptr<at::Half>());
+    cutlass::half_t *y_ptr = reinterpret_cast<cutlass::half_t *>(y.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y_ptr, n},
+        {y_ptr, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_input_tensorop_m64n64_silu_half.can_implement");
+    check_cutlass_status(gemm(args, nullptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_input_tensorop_m64n64_silu_half");
+    check_last_cuda_error("row_major_linear_fp16_input_tensorop_m64n64_silu_half");
     return y;
 }
 
@@ -2221,6 +2398,43 @@ torch::Tensor ada_rms_norm_cuda(torch::Tensor x, torch::Tensor scale, torch::Ten
         D,
         (float)eps);
     check_last_cuda_error("ada_rms_norm_f32");
+    return y;
+}
+
+torch::Tensor ada_rms_norm_half_cuda(torch::Tensor x, torch::Tensor scale, torch::Tensor bias, double eps) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(scale);
+    WM_CHECK_CUDA(bias);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(scale);
+    WM_CHECK_CONTIGUOUS(bias);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(scale);
+    WM_CHECK_F32(bias);
+    TORCH_CHECK(x.dim() == 3, "x must be [B,T,D]");
+    TORCH_CHECK(scale.dim() == 3 && bias.dim() == 3, "scale and bias must be [B,N,D]");
+    TORCH_CHECK(scale.sizes() == bias.sizes(), "scale and bias shapes must match");
+    TORCH_CHECK(x.size(0) == scale.size(0), "B mismatch");
+    TORCH_CHECK(x.size(2) == scale.size(2), "D mismatch");
+    TORCH_CHECK(x.size(1) % scale.size(1) == 0, "T must be divisible by N");
+
+    int B = (int)x.size(0);
+    int T = (int)x.size(1);
+    int D = (int)x.size(2);
+    int N = (int)scale.size(1);
+    auto y = torch::empty_like(x, x.options().dtype(torch::kFloat16));
+
+    ada_rms_norm_f16_kernel<<<B * T, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        reinterpret_cast<__half *>(y.data_ptr<at::Half>()),
+        B,
+        T,
+        N,
+        D,
+        (float)eps);
+    check_last_cuda_error("ada_rms_norm_f16");
     return y;
 }
 
@@ -3060,12 +3274,13 @@ torch::Tensor cutlass_fmha_bmhk_fp16_cuda(
 #endif
 }
 
-torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
+static torch::Tensor indexed_attention_half_kv_fmha_gqa_impl(
         torch::Tensor q,
         torch::Tensor k,
         torch::Tensor v,
         torch::Tensor indices,
-        double scale) {
+        double scale,
+        bool output_half) {
 #if WM_HAS_CUTLASS_FMHA
     WM_CHECK_CUDA(q);
     WM_CHECK_CUDA(k);
@@ -3100,7 +3315,7 @@ torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
     auto k_bmhd = torch::empty({B, Nkv, Hkv, 64}, half_opts);
     auto v_bmhd = torch::empty({B, Nkv, Hkv, 64}, half_opts);
     auto out_bmhd = torch::empty({B, M, Hkv, 64}, half_opts);
-    auto out = torch::empty_like(q);
+    auto out = torch::empty(q.sizes(), q.options().dtype(output_half ? torch::kFloat16 : torch::kFloat32));
 
     int64_t q_elems = (int64_t)B * Hq * Tq * 64;
     q_d64_bhtd_f32_to_gqa_bmhd_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -3171,13 +3386,23 @@ torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
     kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, at::cuda::getCurrentCUDAStream()>>>(p);
     check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_fmha");
 
-    scatter_gqa_bmhd_f16_to_bhtd_f32_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
-        out.data_ptr<float>(),
-        B,
-        Hq,
-        Hkv,
-        Tq);
+    if (output_half) {
+        scatter_gqa_bmhd_f16_to_bhtd_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+            B,
+            Hq,
+            Hkv,
+            Tq);
+    } else {
+        scatter_gqa_bmhd_f16_to_bhtd_f32_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
+            out.data_ptr<float>(),
+            B,
+            Hq,
+            Hkv,
+            Tq);
+    }
     check_last_cuda_error("indexed_attention_half_kv_fmha_gqa_scatter");
     return out;
 #else
@@ -3186,8 +3411,27 @@ torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
     (void)v;
     (void)indices;
     (void)scale;
+    (void)output_half;
     TORCH_CHECK(false, "CUTLASS FMHA example headers were not available when building this extension");
 #endif
+}
+
+torch::Tensor indexed_attention_half_kv_fmha_gqa_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    return indexed_attention_half_kv_fmha_gqa_impl(q, k, v, indices, scale, false);
+}
+
+torch::Tensor indexed_attention_half_kv_fmha_gqa_half_output_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    return indexed_attention_half_kv_fmha_gqa_impl(q, k, v, indices, scale, true);
 }
 
 torch::Tensor kv_cache_upsert_cuda(
@@ -4082,12 +4326,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("row_major_linear_fp16", &row_major_linear_fp16_cuda, "WorldModel row-major Linear using FP16 inputs/weights and FP32 output");
     m.def("row_major_linear_fp16_tensorop", &row_major_linear_fp16_tensorop_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op and FP32 output");
     m.def("row_major_linear_fp16_tensorop_m64n64", &row_major_linear_fp16_tensorop_m64n64_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile and FP32 output");
+    m.def("row_major_linear_fp16_input_tensorop_m64n64", &row_major_linear_fp16_input_tensorop_m64n64_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op 64x64 tile and FP32 output");
     m.def("row_major_linear_fp16_tensorop_m64n64_silu_half", &row_major_linear_fp16_tensorop_m64n64_silu_half_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile, SiLU epilogue, and FP16 output");
+    m.def("row_major_linear_fp16_input_tensorop_m64n64_silu_half", &row_major_linear_fp16_input_tensorop_m64n64_silu_half_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op 64x64 tile, SiLU epilogue, and FP16 output");
     m.def("row_major_linear_fp16_tensorop_splitk", &row_major_linear_fp16_tensorop_splitk_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("row_major_linear_fp16_input_tensorop_splitk", &row_major_linear_fp16_input_tensorop_splitk_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("row_major_linear_fp16_input_tensorop_splitk_parallel", &row_major_linear_fp16_input_tensorop_splitk_parallel_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op parallel split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
     m.def("ada_rms_norm", &ada_rms_norm_cuda, "WorldModel AdaRMSNorm (CUDA, f32)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
+    m.def("ada_rms_norm_half", &ada_rms_norm_half_cuda, "WorldModel AdaRMSNorm with FP16 output (CUDA)", py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
     m.def("ortho_rope", &ortho_rope_cuda, "WorldModel OrthoRoPE (CUDA, f32)");
     m.def("qkv_rms_rope", &qkv_rms_rope_cuda, "WorldModel fused QKV split + RMSNorm + OrthoRoPE (CUDA, f32)", py::arg("qkv"), py::arg("x_pos"), py::arg("y_pos"), py::arg("t_pos"), py::arg("xy"), py::arg("inv_t"), py::arg("n_heads"), py::arg("n_kv_heads"), py::arg("width"), py::arg("height"), py::arg("eps") = 1.0e-6);
     m.def("masked_attention", &masked_attention_cuda, "WorldModel written-mask GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("written"), py::arg("scale"));
@@ -4099,6 +4346,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("indexed_attention_half_kv_cutlass_grouped", &indexed_attention_half_kv_cutlass_grouped_cuda, "WorldModel materialized indexed GQA attention using grouped-M CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("cutlass_fmha_bmhk_fp16", &cutlass_fmha_bmhk_fp16_cuda, "CUTLASS fused MHA probe for contiguous BMHK FP16 tensors (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("scale"));
     m.def("indexed_attention_half_kv_fmha_gqa", &indexed_attention_half_kv_fmha_gqa_cuda, "WorldModel indexed GQA attention using CUTLASS FMHA with non-repeated K/V bridge (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("indexed_attention_half_kv_fmha_gqa_half_output", &indexed_attention_half_kv_fmha_gqa_half_output_cuda, "WorldModel indexed GQA attention using CUTLASS FMHA with FP16 output (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));

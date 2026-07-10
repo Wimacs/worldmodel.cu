@@ -284,6 +284,7 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - `WORLD_MLP_FC2_SPLITK_PARALLEL=1` 可把 MLP fc2 切到 CUTLASS parallel split-K probe；当前 360p runtime profile 慢于默认 serial split-K，因此只作为诊断开关保留。
 - 360p token GEMM 默认对小 M 形状启用 CUTLASS `64x64x32` tensor-op tile；`WORLD_FP16_GEMM_TILE=base` 可回退旧 `128x128x32` tile，`./build/worldmodel_cuda_gemm_probe --bench` 可复测候选 tile。
 - MLP `fc1 -> SiLU -> fc2` 默认使用 CUTLASS fc1 SiLU-to-half epilogue，fc2 split-K 直接消费 half activation；`WORLD_MLP_FC1_SILU_EPILOGUE=0` 可回退到独立 `SiLU + cast` kernel。
+- 360p 小 M 路径默认启用 half GEMM boundary：AdaRMSNorm 以 FP32 归约后直接写 half 给 QKV/MLP fc1，FMHA 直接 scatter half 给 attention out projection，CUTLASS GEMM 不再重复执行 `f32 -> f16`。`WORLD_HALF_GEMM_BOUNDARY=0` 可回退旧边界；同输入连续生成的 14 个 latent 和最终 PPM 与回退路径逐字节一致。FMHA 满 cache 非 profile 最后一 chunk 从 `36.830ms` 降到 `35.959ms`。
 - D=64 cache attention 默认走 CUTLASS materialized QK/AV，并强制 FP16 KV cache；它把 indexed K/V gather 成 compact buffer，再用 CUTLASS batched GEMM 做 `QK` 和 `PV`。`WORLD_ATTN_D64_CUTLASS=0` 可回退项目内 indexed warp fallback，`WORLD_ATTN_D64_CUTLASS_MAX_SCRATCH_MIB` 可覆盖默认 2048 MiB scratch 限制。
 - `WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype，`WORLD_ATTN_D64_Q4_SHARED=1` 可启用 4-row shared-KV probe；两者当前真实 profile 都慢于 CUTLASS 默认路径，保留为诊断开关。
 - `WORLD_ATTN_D64_HALF_CACHE=1` 会把 K/V cache 存为 FP16，并走 half2 warp attention；`WORLD_ATTN_D64_HALF_FLASH=1` 可进一步启用 half-cache group-flash probe。group-flash 已有 PyTorch 对拍，但当前 360p 满 cache profile 慢于 half2 warp path，因此只作为下一轮 attention 设计的对照，不默认启用。

@@ -215,6 +215,30 @@ def test_row_major_linear_fp16_tensorop_m64n64_silu_half_matches_reference(wm_cu
     torch.testing.assert_close(y, ref, rtol=3e-3, atol=4e-3)
 
 
+def test_row_major_linear_fp16_input_tensorop_m64n64_variants_match_reference(wm_cuda):
+    torch.manual_seed(128)
+    m, k = 128, 2048
+    x = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.125).half()
+
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for n in (2048, 4096):
+            w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.125).half()
+            y = wm_cuda.row_major_linear_fp16_input_tensorop_m64n64(x.contiguous(), w.contiguous())
+            ref = x.float().matmul(w.float().t())
+            torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
+
+        w_silu = (torch.randn(8192, k, device="cuda", dtype=torch.float32) * 0.125).half()
+        y_silu = wm_cuda.row_major_linear_fp16_input_tensorop_m64n64_silu_half(
+            x.contiguous(), w_silu.contiguous()
+        )
+        ref_silu = F.silu(x.float().matmul(w_silu.float().t())).half()
+        torch.testing.assert_close(y_silu, ref_silu, rtol=3e-3, atol=4e-3)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
 def test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference(wm_cuda):
     torch.manual_seed(114)
     m, k, n = 128, 8192, 2048
@@ -290,6 +314,22 @@ def test_ada_rms_norm_matches_world_formula(wm_cuda):
     ref = F.rms_norm(x4, (d,), eps=1.0e-6) * (1.0 + scale[:, :, None, :]) + bias[:, :, None, :]
     ref = ref.reshape_as(x)
     torch.testing.assert_close(y, ref, rtol=3e-6, atol=3e-6)
+
+
+def test_ada_rms_norm_half_matches_half_rounded_world_formula(wm_cuda):
+    torch.manual_seed(129)
+    b, n, m, d = 2, 3, 5, 96
+    x = torch.randn(b, n * m, d, device="cuda", dtype=torch.float32)
+    scale = torch.randn(b, n, d, device="cuda", dtype=torch.float32) * 0.1
+    bias = torch.randn(b, n, d, device="cuda", dtype=torch.float32) * 0.1
+
+    y = wm_cuda.ada_rms_norm_half(x, scale, bias, 1.0e-6)
+    x4 = x.view(b, n, m, d)
+    ref = F.rms_norm(x4, (d,), eps=1.0e-6) * (1.0 + scale[:, :, None, :]) + bias[:, :, None, :]
+    ref = ref.reshape_as(x).half()
+
+    assert y.dtype == torch.float16
+    torch.testing.assert_close(y, ref, rtol=3e-3, atol=3e-3)
 
 
 def test_ortho_rope_matches_world_formula(wm_cuda):
@@ -523,6 +563,29 @@ def test_indexed_attention_half_kv_fmha_gqa_matches_half_reference(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=4e-3, atol=4e-3)
 
 
+def test_indexed_attention_half_kv_fmha_gqa_half_output_matches_reference(wm_cuda):
+    torch.manual_seed(130)
+    b, hq, hkv, tq, tk, d = 2, 8, 2, 16, 48, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    indices = torch.tensor([0, 1, 3, 5, 8, 13, 21, 30, 36, 39, 40, 41, 42, 43, 46, 47], device="cuda", dtype=torch.long)
+    scale = d ** -0.5
+
+    y = wm_cuda.indexed_attention_half_kv_fmha_gqa_half_output(q, k, v, indices, scale)
+
+    group = hq // hkv
+    q_h = q.half().float()
+    k_gqa = k.float().repeat_interleave(group, dim=1)
+    v_gqa = v.float().repeat_interleave(group, dim=1)
+    scores = torch.einsum("bhtd,bhkd->bhtk", q_h, k_gqa[:, :, indices, :]) * scale
+    probs = torch.softmax(scores, dim=-1)
+    ref = torch.einsum("bhtn,bhnd->bhtd", probs, v_gqa[:, :, indices, :]).half()
+
+    assert y.dtype == torch.float16
+    torch.testing.assert_close(y, ref, rtol=4e-3, atol=4e-3)
+
+
 def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
     torch.manual_seed(125)
     b, hq, hkv, tq, tk, d = 1, 32, 16, 128, 1024, 64
@@ -551,6 +614,9 @@ def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
         "half_cutlass_materialized": time_ms(lambda: wm_cuda.indexed_attention_half_kv_cutlass(q, k, v, indices, scale)),
         "half_cutlass_grouped": time_ms(lambda: wm_cuda.indexed_attention_half_kv_cutlass_grouped(q, k, v, indices, scale)),
         "half_fmha_gqa_bridge": time_ms(lambda: wm_cuda.indexed_attention_half_kv_fmha_gqa(q, k, v, indices, scale)),
+        "half_fmha_gqa_half_output": time_ms(
+            lambda: wm_cuda.indexed_attention_half_kv_fmha_gqa_half_output(q, k, v, indices, scale)
+        ),
     }
     for name, ms in timings.items():
         print(f"{name}: {ms:.4f} ms")
@@ -856,11 +922,13 @@ if __name__ == "__main__":
         test_row_major_linear_fp16_tensorop_splitk_matches_mlp_fc2_shape,
         test_row_major_linear_fp16_tensorop_m64n64_matches_small_m_shapes,
         test_row_major_linear_fp16_tensorop_m64n64_silu_half_matches_reference,
+        test_row_major_linear_fp16_input_tensorop_m64n64_variants_match_reference,
         test_row_major_linear_fp16_input_tensorop_splitk_matches_half_reference,
         test_row_major_linear_fp16_input_tensorop_splitk_parallel_matches_half_reference,
         test_mlp_fused_silu_half_then_splitk_matches_reference,
         test_rms_norm_matches_torch,
         test_ada_rms_norm_matches_world_formula,
+        test_ada_rms_norm_half_matches_half_rounded_world_formula,
         test_ortho_rope_matches_world_formula,
         test_qkv_rms_rope_matches_split_reference,
         test_masked_attention_matches_torch_gqa_written_mask,
@@ -872,6 +940,7 @@ if __name__ == "__main__":
         test_indexed_attention_half_kv_cutlass_grouped_matches_materialized_half_reference,
         test_cutlass_fmha_bmhk_fp16_matches_torch_half_reference,
         test_indexed_attention_half_kv_fmha_gqa_matches_half_reference,
+        test_indexed_attention_half_kv_fmha_gqa_half_output_matches_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_kv_cache_upsert_half_matches_half_reference,

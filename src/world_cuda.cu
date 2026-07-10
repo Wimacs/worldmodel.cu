@@ -238,6 +238,40 @@ __global__ static void ada_rms_norm_single_f32_kernel(
     }
 }
 
+__global__ static void ada_rms_norm_single_f16_kernel(
+        const float *x,
+        const float *scale,
+        const float *bias,
+        __half *y,
+        int rows,
+        int D,
+        float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (int64_t)row * D;
+    float sum = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+        float v = row_x[d];
+        sum += v * v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)D + eps);
+    __half *row_y = y + (int64_t)row * D;
+    for (int d = tid; d < D; d += blockDim.x) {
+        row_y[d] = __float2half_rn(row_x[d] * inv * (1.0f + scale[d]) + bias[d]);
+    }
+}
+
 __global__ static void rms_norm_rows_f32_kernel(
         const float *x,
         float *y,
@@ -745,6 +779,27 @@ __global__ static void scatter_gqa_bmhd_f16_to_tokens_f32_kernel(
     int m = g * Tq + t;
     int64_t src = ((int64_t)m * Hkv + hk) * 64 + d;
     out_tokens[i] = __half2float(group_out[src]);
+}
+
+__global__ static void scatter_gqa_bmhd_f16_to_tokens_f16_kernel(
+        const __half *__restrict__ group_out,
+        __half *__restrict__ out_tokens,
+        int Hq,
+        int Hkv,
+        int Tq) {
+    int group = Hq / Hkv;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)Tq * Hq * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t x = i >> 6;
+    int hq = (int)(x % Hq);
+    int t = (int)(x / Hq);
+    int hk = hq / group;
+    int g = hq - hk * group;
+    int m = g * Tq + t;
+    int64_t src = ((int64_t)m * Hkv + hk) * 64 + d;
+    out_tokens[i] = group_out[src];
 }
 
 __global__ static void gather_indexed_kv_d64_hkv_f16_kernel(
@@ -2108,6 +2163,50 @@ static int row_major_linear_fp16_weight_tensorop_m64n64(
     return 0;
 }
 
+static int row_major_linear_fp16_input_weight_tensorop_m64n64(
+        const __half *x_rm_h,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n) {
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_rm_h);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
         const float *x_rm,
         __half *x_half_tmp,
@@ -2143,6 +2242,52 @@ static int row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
         4>;
 
     const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    cutlass::half_t *y_h = reinterpret_cast<cutlass::half_t *>(y_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_h, n},
+        {y_h, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
+static int row_major_linear_fp16_input_weight_tensorop_m64n64_silu_half(
+        const __half *x_rm_h,
+        const __half *w_rm_h,
+        __half *y_rm_h,
+        int m,
+        int k,
+        int n) {
+    using Epilogue = LinearCombinationSilu<
+        cutlass::half_t,
+        128 / cutlass::sizeof_bits<cutlass::half_t>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_rm_h);
     const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
     cutlass::half_t *y_h = reinterpret_cast<cutlass::half_t *>(y_rm_h);
     typename Gemm::Arguments args(
@@ -2487,6 +2632,8 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
         const int64_t *indices,
         int Nkv,
         float *out_tokens,
+        __half *out_tokens_h,
+        int output_half,
         __half *q_bmhd,
         __half *k_bnhd,
         __half *v_bnhd,
@@ -2501,7 +2648,11 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
     if (Nkv > Tk) Nkv = Tk;
     int64_t out_elems = (int64_t)Tq * Hq * 64;
     if (Nkv <= 0) {
-        CUDA_OK(cudaMemset(out_tokens, 0, (size_t)out_elems * sizeof(float)));
+        if (output_half) {
+            CUDA_OK(cudaMemset(out_tokens_h, 0, (size_t)out_elems * sizeof(__half)));
+        } else {
+            CUDA_OK(cudaMemset(out_tokens, 0, (size_t)out_elems * sizeof(float)));
+        }
         return 0;
     }
     if (Hkv <= 0 || Hq <= 0 || (Hq % Hkv) != 0) {
@@ -2567,8 +2718,13 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
     kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes>>>(p);
     CUDA_OK(cudaGetLastError());
 
-    scatter_gqa_bmhd_f16_to_tokens_f32_kernel<<<div_up_i64(out_elems, 256), 256>>>(
-        out_bmhd, out_tokens, Hq, Hkv, Tq);
+    if (output_half) {
+        scatter_gqa_bmhd_f16_to_tokens_f16_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+            out_bmhd, out_tokens_h, Hq, Hkv, Tq);
+    } else {
+        scatter_gqa_bmhd_f16_to_tokens_f32_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+            out_bmhd, out_tokens, Hq, Hkv, Tq);
+    }
     CUDA_OK(cudaGetLastError());
     return 0;
 #else
@@ -2578,6 +2734,8 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
     (void)indices;
     (void)Nkv;
     (void)out_tokens;
+    (void)out_tokens_h;
+    (void)output_half;
     (void)q_bmhd;
     (void)k_bnhd;
     (void)v_bnhd;
@@ -4356,6 +4514,7 @@ struct WorldCudaRuntime {
     int mlp_fc2_splitk_slices;
     int mlp_fc2_splitk_parallel_enabled;
     int fp16_gemm_m64n64_enabled;
+    int half_gemm_boundary_enabled;
     int mlp_fc1_silu_epilogue_enabled;
     size_t latent_elems;
     size_t token_elems;
@@ -4742,6 +4901,13 @@ extern "C" int world_cuda_runtime_create(
             fprintf(stderr, "FP16 tensor-op GEMM small-M tile: m64n64\n");
         } else {
             fprintf(stderr, "FP16 tensor-op GEMM small-M tile disabled by WORLD_FP16_GEMM_TILE=base\n");
+        }
+    }
+    {
+        const char *boundary_env = getenv("WORLD_HALF_GEMM_BOUNDARY");
+        rt->half_gemm_boundary_enabled = boundary_env ? boundary_env[0] != '0' : 1;
+        if (rt->half_gemm_boundary_enabled) {
+            fprintf(stderr, "FP16 activation boundaries enabled for supported CUTLASS GEMMs\n");
         }
     }
     {
@@ -5157,13 +5323,34 @@ extern "C" int world_cuda_runtime_step_rgb(
             float *d_b1 = d_layer_mod + 4 * rt->D;
             float *d_g1 = d_layer_mod + 5 * rt->D;
 
+            int qkv_half_boundary =
+                use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
+                lw->qkv_proj_weight_h &&
+                should_use_m64n64_tensorop(
+                    rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
             STEP_PROFILE_BEGIN();
-            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, rt->rms_eps);
+            if (qkv_half_boundary) {
+                ada_rms_norm_single_f16_kernel<<<rt->T, 256>>>(
+                    d_tokens_cur, d_s0, d_b0, rt->d_linear_half, rt->T, rt->D, rt->rms_eps);
+            } else {
+                ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(
+                    d_tokens_cur, d_s0, d_b0, rt->d_norm, rt->T, rt->D, rt->rms_eps);
+            }
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
             STEP_PROFILE_BEGIN();
-            STEP_LINEAR_FAST(rt->d_norm, lw->qkv_proj_weight, lw->qkv_proj_weight_h,
-                             rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
+            if (qkv_half_boundary) {
+                if (row_major_linear_fp16_input_weight_tensorop_m64n64(
+                            rt->d_linear_half,
+                            lw->qkv_proj_weight_h,
+                            rt->d_qkv_raw,
+                            rt->T,
+                            rt->D,
+                            rt->D + 2 * rt->kv_dim)) return 1;
+            } else {
+                STEP_LINEAR_FAST(rt->d_norm, lw->qkv_proj_weight, lw->qkv_proj_weight_h,
+                                 rt->d_qkv_raw, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
+            }
             STEP_PROFILE_ACCUM(prof_qkv_gemm_ms, prof_qkv_gemm_calls);
             float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? rt->d_v_first : rt->d_v;
             STEP_PROFILE_BEGIN();
@@ -5206,6 +5393,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             cache_host_note_upsert(cache, rt->T, base, write_step, (bool)frozen_pass);
             STEP_PROFILE_ACCUM(prof_cache_ms, prof_cache_calls);
             STEP_PROFILE_BEGIN();
+            int attn_output_half_ready = 0;
             if (rt->d_head == 64) {
                 int attn_done = 0;
                 if (rt->attn_half_cache_enabled) {
@@ -5213,6 +5401,11 @@ extern "C" int world_cuda_runtime_step_rgb(
                     if (rt->attn_cutlass_enabled && group > 0) {
                         int cutlass_rc = 0;
                         if (rt->attn_cutlass_fmha_enabled) {
+                            int fmha_half_output =
+                                use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
+                                lw->out_proj_weight_h &&
+                                should_use_m64n64_tensorop(
+                                    rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->D);
                             cutlass_rc = indexed_attention_cache_d64_fmha_f16_kv(
                                     rt->d_q,
                                     cache->k_h,
@@ -5220,6 +5413,8 @@ extern "C" int world_cuda_runtime_step_rgb(
                                     cache->indices,
                                     host_index_count,
                                     rt->d_attn,
+                                    rt->d_linear_half,
+                                    fmha_half_output,
                                     rt->d_attn_q_half,
                                     rt->d_attn_k_compact,
                                     rt->d_attn_v_compact,
@@ -5229,6 +5424,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                                     rt->T,
                                     cache->capacity,
                                     1.0f / 8.0f);
+                            attn_output_half_ready = fmha_half_output;
                         } else if (rt->attn_cutlass_grouped_enabled) {
                             cutlass_rc = indexed_attention_cache_d64_cutlass_grouped_f16_kv(
                                     rt->d_q,
@@ -5320,8 +5516,18 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_attn_ms, prof_attn_calls);
             STEP_PROFILE_BEGIN();
-            STEP_LINEAR_FAST(rt->d_attn, lw->out_proj_weight, lw->out_proj_weight_h,
-                             rt->d_attn_out, rt->T, rt->D, rt->D);
+            if (attn_output_half_ready) {
+                if (row_major_linear_fp16_input_weight_tensorop_m64n64(
+                            rt->d_linear_half,
+                            lw->out_proj_weight_h,
+                            rt->d_attn_out,
+                            rt->T,
+                            rt->D,
+                            rt->D)) return 1;
+            } else {
+                STEP_LINEAR_FAST(rt->d_attn, lw->out_proj_weight, lw->out_proj_weight_h,
+                                 rt->d_attn_out, rt->T, rt->D, rt->D);
+            }
             STEP_PROFILE_ACCUM(prof_attn_out_gemm_ms, prof_attn_out_gemm_calls);
             STEP_PROFILE_BEGIN();
             gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
@@ -5348,8 +5554,21 @@ extern "C" int world_cuda_runtime_step_rgb(
                 STEP_PROFILE_ACCUM(prof_ctrl_ms, prof_ctrl_calls);
             }
 
+            int mlp_fc1_half_boundary =
+                use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
+                rt->mlp_fc1_silu_epilogue_enabled &&
+                lw->dit_mlp_fc1_weight_h && lw->dit_mlp_fc2_weight_h &&
+                rt->mlp_fc2_splitk_slices > 1 &&
+                should_use_m64n64_tensorop(
+                    rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->mlp_hidden);
             STEP_PROFILE_BEGIN();
-            ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, rt->rms_eps);
+            if (mlp_fc1_half_boundary) {
+                ada_rms_norm_single_f16_kernel<<<rt->T, 256>>>(
+                    d_tokens_ctrl, d_s1, d_b1, rt->d_linear_half, rt->T, rt->D, rt->rms_eps);
+            } else {
+                ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(
+                    d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, rt->rms_eps);
+            }
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
             int mlp_hidden_half_ready = 0;
@@ -5360,14 +5579,24 @@ extern "C" int world_cuda_runtime_step_rgb(
                     lw->dit_mlp_fc1_weight_h && lw->dit_mlp_fc2_weight_h &&
                     rt->mlp_fc2_splitk_slices > 1 &&
                     should_use_m64n64_tensorop(rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->mlp_hidden)) {
-                if (row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
-                            rt->d_mlp_in,
-                            rt->d_linear_half,
-                            lw->dit_mlp_fc1_weight_h,
-                            rt->d_mlp_hidden_half,
-                            rt->T,
-                            rt->D,
-                            rt->mlp_hidden)) return 1;
+                if (mlp_fc1_half_boundary) {
+                    if (row_major_linear_fp16_input_weight_tensorop_m64n64_silu_half(
+                                rt->d_linear_half,
+                                lw->dit_mlp_fc1_weight_h,
+                                rt->d_mlp_hidden_half,
+                                rt->T,
+                                rt->D,
+                                rt->mlp_hidden)) return 1;
+                } else {
+                    if (row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
+                                rt->d_mlp_in,
+                                rt->d_linear_half,
+                                lw->dit_mlp_fc1_weight_h,
+                                rt->d_mlp_hidden_half,
+                                rt->T,
+                                rt->D,
+                                rt->mlp_hidden)) return 1;
+                }
                 mlp_hidden_half_ready = 1;
                 d_mlp_hidden_half_cur = rt->d_mlp_hidden_half;
             } else {
