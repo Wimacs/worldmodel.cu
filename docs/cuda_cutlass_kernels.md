@@ -48,12 +48,13 @@ VAE：
 - cuDNN 路径已经移除。
 - 当前 VAE decode 仍是 F32/NCHW 主路径。
 - 1x1 conv 已接入 CUTLASS GEMM baseline：每个 frame 把 NCHW 平面视作 `B = [Cin, H*W]` row-major，权重视作 `A = [Cout, Cin]` row-major，输出直接落到该 frame 的 `[Cout, H*W]` NCHW 平面。
-- 3x3 conv 已接入 tiled im2col + CUTLASS GEMM baseline：每次 materialize `K = Cin*3*3` 和最多 4096 个 spatial column，做 `weight[Cout,K] x cols[K,tile] -> out[Cout,tile]`。这样避免完整 im2col 在后段高分辨率层爆显存。
+- 3x3 conv 已接入 tiled im2col + CUTLASS GEMM baseline：每次 materialize `K = Cin*3*3` 和最多 16384 个 spatial column，做 `weight[Cout,K] x cols[K,tile] -> out[Cout,tile]`。这样避免完整 im2col 在后段高分辨率层爆显存，同时把 tile/GEMM launch 数降下来。
 - `WORLD_VAE_1X1_GEMM=0` 可以回退旧 direct 1x1 conv，用于性能和数值定位。
 - `WORLD_VAE_3X3_GEMM=0` 可以回退旧 direct 3x3 conv，用于性能和数值定位。
+- `WORLD_VAE_3X3_TILE_COLS=N` 可以覆盖 3x3 tiled GEMM 的 spatial tile，默认 `16384`；workspace 分配失败时会自动对半降低，最低到 `1024`。
 - `WORLD_VAE_PROFILE=1` 会在 VAE conv 内部打开 CUDA event 分段计时，输出 direct、1x1 GEMM、3x3 im2col/GEMM/bias 时间。这个模式会同步每段 kernel，只用于诊断，不用于正常 FPS。
-- 当前 1-layer/4-step headless smoke 对照：1x1+3x3 CUTLASS `vae=101.938ms`；只开 1x1 CUTLASS `vae=265.237ms`；全 direct conv `vae=294.243ms`。
-- 当前 profiling 结果：`1x1_gemm=1.311ms/16 launches`，`3x3_im2col=27.154ms/1784 tiles`，`3x3_gemm=65.232ms/1784 tiles`，`3x3_bias=1.518ms`。下一步的大头是 3x3 GEMM 和 1784 次 tile/launch，而不是 bias。
+- 当前 1-layer/4-step headless smoke 对照：默认 tile 16384 `vae=68.927ms`；旧 tile 4096 profile-mode `vae=116.244ms`；全 direct conv `vae=294.243ms`。
+- 当前 profiling 结果：默认 tile 16384 是 `1x1_gemm=1.370ms/16 launches`，`3x3_im2col=24.218ms/496 tiles`，`3x3_gemm=34.194ms/496 tiles`，`3x3_bias=1.490ms`；旧 tile 4096 是 `1784 tiles`、`3x3_gemm=65.235ms`。下一步大头仍是 3x3 GEMM，但主要 launch 数已经降了一轮。
 
 Attention：
 
@@ -148,7 +149,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
 2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
-3. profiling 显示 3x3 GEMM 与 tile launch count 是大头；下一版优先减少 3x3 tile launch，路线是 CUTLASS implicit-GEMM conv 或 grouped/batched GEMM，而不是继续只调当前 tile。
+3. profiling 显示增大 tile 后 launch 数已经从 1784 降到 496；下一版如果继续攻 VAE，应比较 CUTLASS implicit-GEMM conv 或 grouped/batched GEMM，而不是围绕当前 tile 做无休止参数搜索。
 4. 最后考虑 NHWC/FP16 全路径和 bias/ReLU fusion。
 
 ## 对拍规则

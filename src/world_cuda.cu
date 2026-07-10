@@ -1917,11 +1917,17 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->rgb_elems = (size_t)4 * dec->out_h * dec->out_w * 3;
     const char *vae_1x1_env = getenv("WORLD_VAE_1X1_GEMM");
     const char *vae_3x3_env = getenv("WORLD_VAE_3X3_GEMM");
+    const char *vae_3x3_tile_env = getenv("WORLD_VAE_3X3_TILE_COLS");
     const char *vae_profile_env = getenv("WORLD_VAE_PROFILE");
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
     dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
     dec->profile_enabled = vae_profile_env ? vae_profile_env[0] != '0' : 0;
-    dec->conv3x3_tile_cols = 4096;
+    dec->conv3x3_tile_cols = 16384;
+    if (vae_3x3_tile_env && vae_3x3_tile_env[0]) {
+        int requested_tile_cols = atoi(vae_3x3_tile_env);
+        if (requested_tile_cols > 0) dec->conv3x3_tile_cols = requested_tile_cols;
+    }
+    if (dec->conv3x3_tile_cols < 1024) dec->conv3x3_tile_cols = 1024;
 
 #define VAE_INIT_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -1950,8 +1956,20 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
                 if (k_elems > max_k_elems) max_k_elems = k_elems;
             }
         }
-        dec->conv3x3_cols_elems = (size_t)max_k_elems * dec->conv3x3_tile_cols;
-        cudaError_t cols_err = cudaMalloc((void **)&dec->conv3x3_cols, dec->conv3x3_cols_elems * sizeof(float));
+        cudaError_t cols_err = cudaErrorMemoryAllocation;
+        while (dec->conv3x3_tile_cols >= 1024 && cols_err != cudaSuccess) {
+            dec->conv3x3_cols_elems = (size_t)max_k_elems * dec->conv3x3_tile_cols;
+            cols_err = cudaMalloc((void **)&dec->conv3x3_cols, dec->conv3x3_cols_elems * sizeof(float));
+            if (cols_err != cudaSuccess) {
+                fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace tile_cols=%d %.2f MiB: %s\n",
+                        dec->conv3x3_tile_cols,
+                        (double)(dec->conv3x3_cols_elems * sizeof(float)) / (1024.0 * 1024.0),
+                        cudaGetErrorString(cols_err));
+                dec->conv3x3_tile_cols /= 2;
+                dec->conv3x3_cols = NULL;
+                dec->conv3x3_cols_elems = 0;
+            }
+        }
         if (cols_err != cudaSuccess) {
             fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace %.2f MiB: %s; falling back to direct 3x3 conv\n",
                     (double)(dec->conv3x3_cols_elems * sizeof(float)) / (1024.0 * 1024.0),
@@ -1962,12 +1980,13 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
         }
     }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s, profiling %s, pinned RGB host buffer\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s tile_cols=%d, profiling %s, pinned RGB host buffer\n",
             dec->out_w,
             dec->out_h,
             (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
             dec->cutlass_1x1_enabled ? "on" : "off",
             dec->cutlass_3x3_enabled ? "on" : "off",
+            dec->conv3x3_tile_cols,
             dec->profile_enabled ? "on" : "off");
 #undef VAE_INIT_CUDA
     return 0;
