@@ -4,3 +4,14 @@ build-win*/
 __pycache__/
 *.pyc
 smoke_latent*.pt
+
+# Local model weights and generated tensors
+/Waypoint-1.5-1B/
+/Waypoint-1.5-1B-360P/
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.gguf
+*.f32
