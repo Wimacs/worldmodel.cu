@@ -20,6 +20,7 @@
 #if __has_include("kernel_forward.h")
 #define WM_HAS_CUTLASS_FMHA 1
 #include "kernel_forward.h"
+#include "src/world_sparse_fmha.cuh"
 #else
 #define WM_HAS_CUTLASS_FMHA 0
 #endif
@@ -3434,6 +3435,168 @@ torch::Tensor indexed_attention_half_kv_fmha_gqa_half_output_cuda(
     return indexed_attention_half_kv_fmha_gqa_impl(q, k, v, indices, scale, true);
 }
 
+static torch::Tensor sparse_attention_half_kv_fmha_gqa_impl(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor block_ids,
+        double scale,
+        bool output_half) {
+#if WM_HAS_CUTLASS_FMHA
+    constexpr int kHeadDim = 64;
+    constexpr int kSparseBlockSize = 128;
+
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(block_ids);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(block_ids);
+    WM_CHECK_F32(q);
+    WM_CHECK_F16(k);
+    WM_CHECK_F16(v);
+    TORCH_CHECK(block_ids.scalar_type() == at::ScalarType::Int, "block_ids must be int32");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(block_ids.dim() == 1 || block_ids.dim() == 2, "block_ids must be [N] or [B,N]");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == kHeadDim && k.size(3) == kHeadDim,
+                "sparse_attention_half_kv_fmha_gqa currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(Tk % kSparseBlockSize == 0, "KV cache length must be divisible by 128");
+    if (block_ids.dim() == 2) {
+        TORCH_CHECK(block_ids.size(0) == B, "block_ids batch dimension must match q");
+    }
+    int sparse_block_count = block_ids.dim() == 1
+        ? (int)block_ids.size(0)
+        : (int)block_ids.size(1);
+    TORCH_CHECK(sparse_block_count > 0, "block_ids must be non-empty");
+
+    int group = Hq / Hkv;
+    int M = group * Tq;
+    int Nkv = sparse_block_count * kSparseBlockSize;
+    auto half_opts = q.options().dtype(torch::kFloat16);
+    auto q_bmhd = torch::empty({B, M, Hkv, kHeadDim}, half_opts);
+    auto out_bmhd = torch::empty({B, M, Hkv, kHeadDim}, half_opts);
+    auto out = torch::empty(q.sizes(), q.options().dtype(output_half ? torch::kFloat16 : torch::kFloat32));
+
+    int64_t q_elems = (int64_t)B * Hq * Tq * kHeadDim;
+    q_d64_bhtd_f32_to_gqa_bmhd_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        reinterpret_cast<__half *>(q_bmhd.data_ptr<at::Half>()),
+        B,
+        Hq,
+        Hkv,
+        Tq);
+    check_last_cuda_error("sparse_attention_half_kv_fmha_gqa_q_bridge");
+
+    using Attention = world_sparse_fmha::SparseAttentionKernel<
+        cutlass::half_t,
+        cutlass::arch::Sm80,
+        true,
+        64,
+        64,
+        64,
+        false,
+        false>;
+
+    typename Attention::Params p;
+    p.query_ptr = reinterpret_cast<cutlass::half_t *>(q_bmhd.data_ptr<at::Half>());
+    p.key_ptr = reinterpret_cast<cutlass::half_t *>(k.data_ptr<at::Half>());
+    p.value_ptr = reinterpret_cast<cutlass::half_t *>(v.data_ptr<at::Half>());
+    p.sparse_block_ids = block_ids.data_ptr<int32_t>();
+    p.sparse_block_count = sparse_block_count;
+    p.sparse_block_size = kSparseBlockSize;
+    p.sparse_block_strideB = block_ids.dim() == 2 ? sparse_block_count : 0;
+    p.output_ptr = reinterpret_cast<cutlass::half_t *>(out_bmhd.data_ptr<at::Half>());
+    p.output_accum_ptr = nullptr;
+    p.logsumexp_ptr = nullptr;
+    p.scale = (float)scale;
+    p.num_heads = Hkv;
+    p.num_batches = B;
+    p.head_dim = kHeadDim;
+    p.head_dim_value = kHeadDim;
+    p.num_queries = M;
+    p.num_keys = Nkv;
+    p.custom_mask_type = Attention::NoCustomMask;
+    p.q_strideH = kHeadDim;
+    p.k_strideH = Tk * kHeadDim;
+    p.v_strideH = Tk * kHeadDim;
+    p.q_strideM = Hkv * kHeadDim;
+    p.k_strideM = kHeadDim;
+    p.v_strideM = kHeadDim;
+    p.q_strideB = (int64_t)M * Hkv * kHeadDim;
+    p.k_strideB = (int64_t)Hkv * Tk * kHeadDim;
+    p.v_strideB = (int64_t)Hkv * Tk * kHeadDim;
+    p.o_strideM = Hkv * kHeadDim;
+
+    TORCH_CHECK(Attention::check_supported(p), "sparse CUTLASS FMHA does not support this GQA shape");
+    constexpr auto kernel_fn = world_sparse_fmha::sparse_attention_kernel_batched_impl<Attention>;
+    int smem_bytes = sizeof(typename Attention::SharedStorage);
+    if (smem_bytes > 0xc000) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
+    }
+    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, at::cuda::getCurrentCUDAStream()>>>(p);
+    check_last_cuda_error("sparse_attention_half_kv_fmha_gqa_fmha");
+
+    if (output_half) {
+        scatter_gqa_bmhd_f16_to_bhtd_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
+            reinterpret_cast<__half *>(out.data_ptr<at::Half>()),
+            B,
+            Hq,
+            Hkv,
+            Tq);
+    } else {
+        scatter_gqa_bmhd_f16_to_bhtd_f32_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half *>(out_bmhd.data_ptr<at::Half>()),
+            out.data_ptr<float>(),
+            B,
+            Hq,
+            Hkv,
+            Tq);
+    }
+    check_last_cuda_error("sparse_attention_half_kv_fmha_gqa_scatter");
+    return out;
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)block_ids;
+    (void)scale;
+    (void)output_half;
+    TORCH_CHECK(false, "CUTLASS FMHA example headers were not available when building this extension");
+#endif
+}
+
+torch::Tensor sparse_attention_half_kv_fmha_gqa_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor block_ids,
+        double scale) {
+    return sparse_attention_half_kv_fmha_gqa_impl(q, k, v, block_ids, scale, false);
+}
+
+torch::Tensor sparse_attention_half_kv_fmha_gqa_half_output_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor block_ids,
+        double scale) {
+    return sparse_attention_half_kv_fmha_gqa_impl(q, k, v, block_ids, scale, true);
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -4347,6 +4510,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cutlass_fmha_bmhk_fp16", &cutlass_fmha_bmhk_fp16_cuda, "CUTLASS fused MHA probe for contiguous BMHK FP16 tensors (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("scale"));
     m.def("indexed_attention_half_kv_fmha_gqa", &indexed_attention_half_kv_fmha_gqa_cuda, "WorldModel indexed GQA attention using CUTLASS FMHA with non-repeated K/V bridge (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv_fmha_gqa_half_output", &indexed_attention_half_kv_fmha_gqa_half_output_cuda, "WorldModel indexed GQA attention using CUTLASS FMHA with FP16 output (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("sparse_attention_half_kv_fmha_gqa", &sparse_attention_half_kv_fmha_gqa_cuda, "WorldModel native block-sparse GQA FMHA reading FP16 ring-cache blocks directly (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("block_ids"), py::arg("scale"));
+    m.def("sparse_attention_half_kv_fmha_gqa_half_output", &sparse_attention_half_kv_fmha_gqa_half_output_cuda, "WorldModel native block-sparse GQA FMHA with FP16 output (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("block_ids"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));

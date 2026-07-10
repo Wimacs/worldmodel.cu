@@ -19,6 +19,7 @@
 #if __has_include("kernel_forward.h")
 #define WORLD_HAS_CUTLASS_FMHA 1
 #include "kernel_forward.h"
+#include "world_sparse_fmha.cuh"
 #else
 #define WORLD_HAS_CUTLASS_FMHA 0
 #endif
@@ -650,6 +651,7 @@ __global__ static void kv_cache_upsert_copy_f16_kernel(
 __global__ static void collect_cache_frame_indices_kernel(
         const bool *written,
         int64_t *indices,
+        int32_t *block_ids,
         int *count,
         int capacity,
         int T,
@@ -680,6 +682,12 @@ __global__ static void collect_cache_frame_indices_kernel(
     if (slot_written) {
         for (int t = tid; t < T; t += blockDim.x) {
             indices[out_base + t] = (int64_t)(slot_base + t);
+        }
+        constexpr int sparse_block_size = 128;
+        int blocks_per_frame = T / sparse_block_size;
+        for (int block = tid; block < blocks_per_frame; block += blockDim.x) {
+            block_ids[out_base / sparse_block_size + block] =
+                slot_base / sparse_block_size + block;
         }
     }
 }
@@ -2750,6 +2758,131 @@ static int indexed_attention_cache_d64_fmha_f16_kv(
 #endif
 }
 
+static int sparse_attention_cache_d64_fmha_f16_kv(
+        const float *q,
+        const __half *cache_k,
+        const __half *cache_v,
+        const int32_t *block_ids,
+        int block_count,
+        float *out_tokens,
+        __half *out_tokens_h,
+        int output_half,
+        __half *q_bmhd,
+        __half *out_bmhd,
+        int Hq,
+        int Hkv,
+        int Tq,
+        int Tk,
+        float scale) {
+#if WORLD_HAS_CUTLASS_FMHA
+    constexpr int kSparseBlockSize = 128;
+    int64_t out_elems = (int64_t)Tq * Hq * 64;
+    if (block_count <= 0) {
+        if (output_half) {
+            CUDA_OK(cudaMemset(out_tokens_h, 0, (size_t)out_elems * sizeof(__half)));
+        } else {
+            CUDA_OK(cudaMemset(out_tokens, 0, (size_t)out_elems * sizeof(float)));
+        }
+        return 0;
+    }
+    if (Tk % kSparseBlockSize != 0 || block_count > Tk / kSparseBlockSize) {
+        fprintf(stderr, "Sparse CUTLASS FMHA requires valid 128-token KV blocks\n");
+        return 1;
+    }
+    if (Hkv <= 0 || Hq <= 0 || (Hq % Hkv) != 0) {
+        fprintf(stderr, "Sparse CUTLASS FMHA requires Hq divisible by Hkv\n");
+        return 1;
+    }
+
+    int group = Hq / Hkv;
+    int M = group * Tq;
+    int Nkv = block_count * kSparseBlockSize;
+    q_d64_htd_f32_to_gqa_bmhd_f16_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+        q, q_bmhd, Hq, Hkv, Tq);
+    CUDA_OK(cudaGetLastError());
+
+    using Attention = world_sparse_fmha::SparseAttentionKernel<
+        cutlass::half_t,
+        cutlass::arch::Sm80,
+        true,
+        64,
+        64,
+        64,
+        false,
+        false>;
+
+    typename Attention::Params p;
+    p.query_ptr = reinterpret_cast<cutlass::half_t *>(q_bmhd);
+    p.key_ptr = reinterpret_cast<cutlass::half_t *>(const_cast<__half *>(cache_k));
+    p.value_ptr = reinterpret_cast<cutlass::half_t *>(const_cast<__half *>(cache_v));
+    p.sparse_block_ids = block_ids;
+    p.sparse_block_count = block_count;
+    p.sparse_block_size = kSparseBlockSize;
+    p.sparse_block_strideB = 0;
+    p.output_ptr = reinterpret_cast<cutlass::half_t *>(out_bmhd);
+    p.output_accum_ptr = NULL;
+    p.logsumexp_ptr = NULL;
+    p.scale = scale;
+    p.num_heads = Hkv;
+    p.num_batches = 1;
+    p.head_dim = 64;
+    p.head_dim_value = 64;
+    p.num_queries = M;
+    p.num_keys = Nkv;
+    p.custom_mask_type = Attention::NoCustomMask;
+    p.q_strideH = 64;
+    p.k_strideH = Tk * 64;
+    p.v_strideH = Tk * 64;
+    p.q_strideM = Hkv * 64;
+    p.k_strideM = 64;
+    p.v_strideM = 64;
+    p.q_strideB = (int64_t)M * Hkv * 64;
+    p.k_strideB = (int64_t)Hkv * Tk * 64;
+    p.v_strideB = (int64_t)Hkv * Tk * 64;
+    p.o_strideM = Hkv * 64;
+
+    if (!Attention::check_supported(p)) {
+        fprintf(stderr, "Sparse CUTLASS FMHA does not support this runtime attention shape\n");
+        return 1;
+    }
+    constexpr auto kernel_fn = world_sparse_fmha::sparse_attention_kernel_batched_impl<Attention>;
+    int smem_bytes = sizeof(typename Attention::SharedStorage);
+    if (smem_bytes > 0xc000) {
+        CUDA_OK(cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    }
+    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes>>>(p);
+    CUDA_OK(cudaGetLastError());
+
+    if (output_half) {
+        scatter_gqa_bmhd_f16_to_tokens_f16_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+            out_bmhd, out_tokens_h, Hq, Hkv, Tq);
+    } else {
+        scatter_gqa_bmhd_f16_to_tokens_f32_kernel<<<div_up_i64(out_elems, 256), 256>>>(
+            out_bmhd, out_tokens, Hq, Hkv, Tq);
+    }
+    CUDA_OK(cudaGetLastError());
+    return 0;
+#else
+    (void)q;
+    (void)cache_k;
+    (void)cache_v;
+    (void)block_ids;
+    (void)block_count;
+    (void)out_tokens;
+    (void)out_tokens_h;
+    (void)output_half;
+    (void)q_bmhd;
+    (void)out_bmhd;
+    (void)Hq;
+    (void)Hkv;
+    (void)Tq;
+    (void)Tk;
+    (void)scale;
+    fprintf(stderr, "CUTLASS FMHA headers are not available in this build\n");
+    return 1;
+#endif
+}
+
 static int indexed_attention_cache_d64_cutlass_grouped_f16_kv(
         const float *q,
         const __half *cache_k,
@@ -2980,6 +3113,7 @@ typedef struct {
     bool *written;
     unsigned char *h_slot_written;
     int64_t *indices;
+    int32_t *block_ids;
     int *index_count;
     int ring_length;
     int capacity;
@@ -3048,6 +3182,7 @@ static void free_device_world_caches(DeviceWorldLayerCache *caches, int n_layers
         cudaFree(caches[i].v_h);
         cudaFree(caches[i].written);
         cudaFree(caches[i].indices);
+        cudaFree(caches[i].block_ids);
         cudaFree(caches[i].index_count);
         free(caches[i].h_slot_written);
     }
@@ -3089,6 +3224,8 @@ static int alloc_device_world_caches(
         }
         if (cudaMalloc((void **)&c->written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->indices, (size_t)c->capacity * sizeof(int64_t)) != cudaSuccess) goto fail;
+        if (cudaMalloc((void **)&c->block_ids,
+                       (size_t)div_up_i64(c->capacity, 128) * sizeof(int32_t)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->index_count, sizeof(int)) != cudaSuccess) goto fail;
         c->h_slot_written = (unsigned char *)calloc((size_t)c->slot_count, sizeof(unsigned char));
         if (!c->h_slot_written) goto fail;
@@ -4582,6 +4719,7 @@ struct WorldCudaRuntime {
     int attn_cutlass_enabled;
     int attn_cutlass_grouped_enabled;
     int attn_cutlass_fmha_enabled;
+    int attn_sparse_fmha_enabled;
     int attn_max_capacity;
     __half *d_attn_q_half;
     __half *d_attn_k_compact;
@@ -5063,16 +5201,19 @@ extern "C" int world_cuda_runtime_create(
         const char *cutlass_attn_env = getenv("WORLD_ATTN_D64_CUTLASS");
         const char *cutlass_grouped_env = getenv("WORLD_ATTN_D64_CUTLASS_GROUPED");
         const char *cutlass_fmha_env = getenv("WORLD_ATTN_D64_FMHA");
+        const char *sparse_fmha_env = getenv("WORLD_ATTN_D64_SPARSE_FMHA");
         half_cache_requested = half_env ? half_env[0] != '0' : 0;
         rt->attn_half_cache_enabled = half_cache_requested;
         rt->attn_half_flash_enabled = half_flash_env ? half_flash_env[0] != '0' : 0;
         rt->attn_cutlass_enabled = cutlass_attn_env ? cutlass_attn_env[0] != '0' : 1;
         rt->attn_cutlass_grouped_enabled = cutlass_grouped_env ? cutlass_grouped_env[0] != '0' : 0;
         rt->attn_cutlass_fmha_enabled = cutlass_fmha_env ? cutlass_fmha_env[0] != '0' : 0;
+        rt->attn_sparse_fmha_enabled = sparse_fmha_env ? sparse_fmha_env[0] != '0' : 0;
 #if !WORLD_HAS_CUTLASS_FMHA
-        if (rt->attn_cutlass_fmha_enabled) {
-            fprintf(stderr, "WORLD_ATTN_D64_FMHA ignored because CUTLASS FMHA example headers are unavailable\n");
+        if (rt->attn_cutlass_fmha_enabled || rt->attn_sparse_fmha_enabled) {
+            fprintf(stderr, "CUTLASS FMHA options ignored because the example headers are unavailable\n");
             rt->attn_cutlass_fmha_enabled = 0;
+            rt->attn_sparse_fmha_enabled = 0;
         }
 #endif
         if (rt->attn_cutlass_grouped_enabled) {
@@ -5083,6 +5224,14 @@ extern "C" int world_cuda_runtime_create(
                 fprintf(stderr, "WORLD_ATTN_D64_FMHA disables WORLD_ATTN_D64_CUTLASS_GROUPED for this run\n");
             }
             rt->attn_cutlass_enabled = 1;
+            rt->attn_cutlass_grouped_enabled = 0;
+        }
+        if (rt->attn_sparse_fmha_enabled) {
+            if (rt->attn_cutlass_fmha_enabled || rt->attn_cutlass_grouped_enabled) {
+                fprintf(stderr, "WORLD_ATTN_D64_SPARSE_FMHA takes precedence over the other CUTLASS attention probes\n");
+            }
+            rt->attn_cutlass_enabled = 1;
+            rt->attn_cutlass_fmha_enabled = 0;
             rt->attn_cutlass_grouped_enabled = 0;
         }
         if (rt->attn_cutlass_enabled) {
@@ -5096,6 +5245,7 @@ extern "C" int world_cuda_runtime_create(
             rt->attn_cutlass_enabled = 0;
             rt->attn_cutlass_grouped_enabled = 0;
             rt->attn_cutlass_fmha_enabled = 0;
+            rt->attn_sparse_fmha_enabled = 0;
         }
         if (rt->attn_cutlass_enabled && cfg->n_heads % cfg->n_kv_heads != 0) {
             fprintf(stderr,
@@ -5104,7 +5254,14 @@ extern "C" int world_cuda_runtime_create(
             rt->attn_cutlass_enabled = 0;
             rt->attn_cutlass_grouped_enabled = 0;
             rt->attn_cutlass_fmha_enabled = 0;
+            rt->attn_sparse_fmha_enabled = 0;
             if (!half_cache_requested) rt->attn_half_cache_enabled = 0;
+        }
+        if (rt->attn_sparse_fmha_enabled && (rt->T % 128) != 0) {
+            fprintf(stderr,
+                    "WORLD_ATTN_D64_SPARSE_FMHA ignored because tokens_per_frame=%d is not divisible by 128\n",
+                    rt->T);
+            rt->attn_sparse_fmha_enabled = 0;
         }
         if (rt->attn_half_cache_enabled) {
             if (rt->attn_flash_enabled || rt->attn_q4_shared_enabled) {
@@ -5134,11 +5291,16 @@ extern "C" int world_cuda_runtime_create(
         size_t kv_compact_heads = rt->attn_cutlass_fmha_enabled ? (size_t)cfg->n_kv_heads : (size_t)cfg->n_heads;
         size_t kv_compact_elems = kv_compact_heads * rt->attn_max_capacity * 64;
         size_t score_elems = (size_t)cfg->n_heads * rt->T * rt->attn_max_capacity;
-        size_t scratch_bytes = q_half_elems * sizeof(__half) + 2 * kv_compact_elems * sizeof(__half);
-        if (rt->attn_cutlass_fmha_enabled) {
+        size_t scratch_bytes = q_half_elems * sizeof(__half);
+        if (rt->attn_sparse_fmha_enabled) {
             scratch_bytes += q_half_elems * sizeof(__half);
         } else {
-            scratch_bytes += score_elems * sizeof(float) + score_elems * sizeof(__half);
+            scratch_bytes += 2 * kv_compact_elems * sizeof(__half);
+            if (rt->attn_cutlass_fmha_enabled) {
+                scratch_bytes += q_half_elems * sizeof(__half);
+            } else {
+                scratch_bytes += score_elems * sizeof(float) + score_elems * sizeof(__half);
+            }
         }
         size_t scratch_limit_bytes = attn_scratch_limit_mib * 1024ull * 1024ull;
         if (scratch_bytes > scratch_limit_bytes) {
@@ -5149,12 +5311,21 @@ extern "C" int world_cuda_runtime_create(
             rt->attn_cutlass_enabled = 0;
             rt->attn_cutlass_grouped_enabled = 0;
             rt->attn_cutlass_fmha_enabled = 0;
+            rt->attn_sparse_fmha_enabled = 0;
             if (!half_cache_requested) rt->attn_half_cache_enabled = 0;
         } else {
             RT_CUDA(cudaMalloc((void **)&rt->d_attn_q_half, q_half_elems * sizeof(__half)));
-            RT_CUDA(cudaMalloc((void **)&rt->d_attn_k_compact, kv_compact_elems * sizeof(__half)));
-            RT_CUDA(cudaMalloc((void **)&rt->d_attn_v_compact, kv_compact_elems * sizeof(__half)));
-            if (rt->attn_cutlass_fmha_enabled) {
+            if (!rt->attn_sparse_fmha_enabled) {
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_k_compact, kv_compact_elems * sizeof(__half)));
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_v_compact, kv_compact_elems * sizeof(__half)));
+            }
+            if (rt->attn_sparse_fmha_enabled) {
+                RT_CUDA(cudaMalloc((void **)&rt->d_attn_out_half, q_half_elems * sizeof(__half)));
+                fprintf(stderr,
+                        "D=64 native sparse GQA CUTLASS FMHA enabled (block=128 capacity=%d tokens scratch=%.2f MiB)\n",
+                        rt->attn_max_capacity,
+                        (double)scratch_bytes / (1024.0 * 1024.0));
+            } else if (rt->attn_cutlass_fmha_enabled) {
                 RT_CUDA(cudaMalloc((void **)&rt->d_attn_out_half, q_half_elems * sizeof(__half)));
                 fprintf(stderr,
                         "D=64 attention CUTLASS FMHA GQA bridge enabled (capacity=%d tokens scratch=%.2f MiB)\n",
@@ -5387,7 +5558,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             }
             STEP_CUDA(cudaGetLastError());
             collect_cache_frame_indices_kernel<<<cache->capacity / rt->T, 256>>>(
-                cache->written, cache->indices, cache->index_count,
+                cache->written, cache->indices, cache->block_ids, cache->index_count,
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
             cache_host_note_upsert(cache, rt->T, base, write_step, (bool)frozen_pass);
@@ -5400,7 +5571,30 @@ extern "C" int world_cuda_runtime_step_rgb(
                     int group = cfg->n_heads % cfg->n_kv_heads == 0 ? cfg->n_heads / cfg->n_kv_heads : 0;
                     if (rt->attn_cutlass_enabled && group > 0) {
                         int cutlass_rc = 0;
-                        if (rt->attn_cutlass_fmha_enabled) {
+                        if (rt->attn_sparse_fmha_enabled) {
+                            int fmha_half_output =
+                                use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
+                                lw->out_proj_weight_h &&
+                                should_use_m64n64_tensorop(
+                                    rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->D);
+                            cutlass_rc = sparse_attention_cache_d64_fmha_f16_kv(
+                                    rt->d_q,
+                                    cache->k_h,
+                                    cache->v_h,
+                                    cache->block_ids,
+                                    host_index_count / 128,
+                                    rt->d_attn,
+                                    rt->d_linear_half,
+                                    fmha_half_output,
+                                    rt->d_attn_q_half,
+                                    rt->d_attn_out_half,
+                                    cfg->n_heads,
+                                    cfg->n_kv_heads,
+                                    rt->T,
+                                    cache->capacity,
+                                    1.0f / 8.0f);
+                            attn_output_half_ready = fmha_half_output;
+                        } else if (rt->attn_cutlass_fmha_enabled) {
                             int fmha_half_output =
                                 use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
                                 lw->out_proj_weight_h &&
@@ -6661,7 +6855,7 @@ extern "C" int world_cuda_transformer_probe(
                     cfg->n_kv_heads, T, d_head, cache->ring_length, base, write_step, (bool)frozen_pass);
                 TRY_CUDA2(cudaGetLastError());
                 collect_cache_frame_indices_kernel<<<cache->capacity / T, 256>>>(
-                    cache->written, cache->indices, cache->index_count,
+                    cache->written, cache->indices, cache->block_ids, cache->index_count,
                     cache->capacity, T, base, write_step);
                 TRY_CUDA2(cudaGetLastError());
                 indexed_attention_cache_f32_kernel<<<cfg->n_heads * T, 256>>>(

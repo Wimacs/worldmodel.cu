@@ -586,6 +586,59 @@ def test_indexed_attention_half_kv_fmha_gqa_half_output_matches_reference(wm_cud
     torch.testing.assert_close(y, ref, rtol=4e-3, atol=4e-3)
 
 
+def _expand_sparse_block_ids(block_ids, block_size=128):
+    offsets = torch.arange(block_size, device=block_ids.device, dtype=block_ids.dtype)
+    return (block_ids[..., None] * block_size + offsets).flatten(-2)
+
+
+def test_sparse_attention_half_kv_fmha_gqa_matches_batched_block_reference(wm_cuda):
+    torch.manual_seed(131)
+    b, hq, hkv, tq, tk, d = 2, 8, 2, 16, 1024, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    block_ids = torch.tensor([[0, 3, 6], [1, 4, 7]], device="cuda", dtype=torch.int32)
+    scale = d ** -0.5
+
+    y = wm_cuda.sparse_attention_half_kv_fmha_gqa(q, k, v, block_ids, scale)
+
+    indices = _expand_sparse_block_ids(block_ids).long()
+    gather_index = indices[:, None, :, None].expand(b, hkv, indices.size(1), d)
+    k_selected = torch.gather(k.float(), 2, gather_index)
+    v_selected = torch.gather(v.float(), 2, gather_index)
+    group = hq // hkv
+    scores = torch.einsum(
+        "bhtd,bhkd->bhtk",
+        q.half().float(),
+        k_selected.repeat_interleave(group, dim=1),
+    ) * scale
+    probs = torch.softmax(scores, dim=-1)
+    ref = torch.einsum(
+        "bhtn,bhnd->bhtd",
+        probs,
+        v_selected.repeat_interleave(group, dim=1),
+    ).half().float()
+
+    torch.testing.assert_close(y, ref, rtol=4e-3, atol=4e-3)
+
+
+def test_sparse_attention_half_kv_fmha_gqa_matches_compact_bridge(wm_cuda):
+    torch.manual_seed(132)
+    b, hq, hkv, tq, tk, d = 1, 32, 16, 128, 1024, 64
+    q = torch.randn(b, hq, tq, d, device="cuda", dtype=torch.float32)
+    k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
+    block_ids = torch.tensor([0, 2, 5, 7], device="cuda", dtype=torch.int32)
+    indices = _expand_sparse_block_ids(block_ids).long().contiguous()
+    scale = d ** -0.5
+
+    y = wm_cuda.sparse_attention_half_kv_fmha_gqa_half_output(q, k, v, block_ids, scale)
+    bridge = wm_cuda.indexed_attention_half_kv_fmha_gqa_half_output(q, k, v, indices, scale)
+
+    assert y.dtype == torch.float16
+    torch.testing.assert_close(y, bridge, rtol=0, atol=0)
+
+
 def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
     torch.manual_seed(125)
     b, hq, hkv, tq, tk, d = 1, 32, 16, 128, 1024, 64
@@ -593,6 +646,7 @@ def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
     k = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
     v = torch.randn(b, hkv, tk, d, device="cuda", dtype=torch.float32).half().contiguous()
     indices = torch.arange(tk, device="cuda", dtype=torch.long)
+    block_ids = torch.arange(tk // 128, device="cuda", dtype=torch.int32)
     scale = d ** -0.5
 
     def time_ms(fn):
@@ -616,6 +670,9 @@ def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
         "half_fmha_gqa_bridge": time_ms(lambda: wm_cuda.indexed_attention_half_kv_fmha_gqa(q, k, v, indices, scale)),
         "half_fmha_gqa_half_output": time_ms(
             lambda: wm_cuda.indexed_attention_half_kv_fmha_gqa_half_output(q, k, v, indices, scale)
+        ),
+        "half_sparse_fmha_gqa": time_ms(
+            lambda: wm_cuda.sparse_attention_half_kv_fmha_gqa_half_output(q, k, v, block_ids, scale)
         ),
     }
     for name, ms in timings.items():
@@ -941,6 +998,8 @@ if __name__ == "__main__":
         test_cutlass_fmha_bmhk_fp16_matches_torch_half_reference,
         test_indexed_attention_half_kv_fmha_gqa_matches_half_reference,
         test_indexed_attention_half_kv_fmha_gqa_half_output_matches_reference,
+        test_sparse_attention_half_kv_fmha_gqa_matches_batched_block_reference,
+        test_sparse_attention_half_kv_fmha_gqa_matches_compact_bridge,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_kv_cache_upsert_half_matches_half_reference,
