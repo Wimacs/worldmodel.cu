@@ -10,6 +10,7 @@
 #include <cutlass/conv/kernel/default_conv2d_fprop.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/device/gemm_batched.h>
 #include <cutlass/layout/matrix.h>
 #include <cutlass/layout/tensor.h>
 #include <cutlass/numeric_types.h>
@@ -88,6 +89,42 @@ __global__ void silu_f32_to_f16_kernel(const float *x, cutlass::half_t *y, int64
     if (i < n) {
         y[i] = cutlass::half_t(wm_silu(x[i]));
     }
+}
+
+__global__ void cast_f32_to_f16_kernel(const float *x, cutlass::half_t *y, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        y[i] = cutlass::half_t(x[i]);
+    }
+}
+
+__global__ void gather_indexed_kv_d64_hq_f16_kernel(
+        const __half *__restrict__ k,
+        const __half *__restrict__ v,
+        const int64_t *__restrict__ indices,
+        __half *__restrict__ k_compact,
+        __half *__restrict__ v_compact,
+        int B,
+        int Hq,
+        int Hkv,
+        int Nkv,
+        int Tk) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)B * Hq * Nkv * 64;
+    if (i >= total) return;
+    int d = (int)(i & 63);
+    int64_t q = i >> 6;
+    int n = (int)(q % Nkv);
+    int hq = (int)((q / Nkv) % Hq);
+    int b = (int)(q / ((int64_t)Nkv * Hq));
+    int group = Hq / Hkv;
+    int hk = hq / group;
+    int tk = (int)indices[n];
+    if (tk < 0) tk = 0;
+    if (tk >= Tk) tk = Tk - 1;
+    int64_t src = (((int64_t)b * Hkv + hk) * Tk + tk) * 64 + d;
+    k_compact[i] = k[src];
+    v_compact[i] = v[src];
 }
 
 template <
@@ -2415,6 +2452,169 @@ torch::Tensor indexed_attention_half_kv_flash_cuda(
     return out;
 }
 
+torch::Tensor indexed_attention_half_kv_cutlass_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        torch::Tensor indices,
+        double scale) {
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CUDA(indices);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_CONTIGUOUS(indices);
+    WM_CHECK_F32(q);
+    WM_CHECK_F16(k);
+    WM_CHECK_F16(v);
+    TORCH_CHECK(indices.scalar_type() == at::ScalarType::Long, "indices must be int64");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be 4D");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "B mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "indexed_attention_half_kv_cutlass currently supports D=64");
+
+    int B = (int)q.size(0);
+    int Hq = (int)q.size(1);
+    int Tq = (int)q.size(2);
+    int Hkv = (int)k.size(1);
+    int Tk = (int)k.size(2);
+    int Nkv = (int)indices.numel();
+    TORCH_CHECK(Hq % Hkv == 0, "Hq must be divisible by Hkv for GQA");
+    TORCH_CHECK(Nkv > 0, "indices must be non-empty");
+
+    auto half_opts = q.options().dtype(torch::kFloat16);
+    auto q_h = torch::empty({B, Hq, Tq, 64}, half_opts);
+    auto k_compact = torch::empty({B, Hq, Nkv, 64}, half_opts);
+    auto v_compact = torch::empty({B, Hq, Nkv, 64}, half_opts);
+    auto scores = torch::empty({B, Hq, Tq, Nkv}, q.options());
+    auto probs_h = torch::empty({B, Hq, Tq, Nkv}, half_opts);
+    auto out = torch::empty_like(q);
+
+    int64_t q_elems = (int64_t)B * Hq * Tq * 64;
+    cast_f32_to_f16_kernel<<<div_up_i64(q_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        reinterpret_cast<cutlass::half_t *>(q_h.data_ptr<at::Half>()),
+        q_elems);
+    check_last_cuda_error("attention_cutlass_q_cast");
+
+    int64_t kv_compact_elems = (int64_t)B * Hq * Nkv * 64;
+    gather_indexed_kv_d64_hq_f16_kernel<<<div_up_i64(kv_compact_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half *>(k.data_ptr<at::Half>()),
+        reinterpret_cast<const __half *>(v.data_ptr<at::Half>()),
+        indices.data_ptr<int64_t>(),
+        reinterpret_cast<__half *>(k_compact.data_ptr<at::Half>()),
+        reinterpret_cast<__half *>(v_compact.data_ptr<at::Half>()),
+        B,
+        Hq,
+        Hkv,
+        Nkv,
+        Tk);
+    check_last_cuda_error("attention_cutlass_gather_kv");
+
+    int batch_count = B * Hq;
+    using GemmQK = cutlass::gemm::device::GemmBatched<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 128, 32>,
+        cutlass::gemm::GemmShape<32, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        4,
+        8,
+        8>;
+
+    const cutlass::half_t *q_ptr = reinterpret_cast<const cutlass::half_t *>(q_h.data_ptr<at::Half>());
+    const cutlass::half_t *k_ptr = reinterpret_cast<const cutlass::half_t *>(k_compact.data_ptr<at::Half>());
+    float *scores_ptr = scores.data_ptr<float>();
+    typename GemmQK::Arguments qk_args(
+        {Tq, Nkv, 64},
+        {q_ptr, 64},
+        (int64_t)Tq * 64,
+        {k_ptr, 64},
+        (int64_t)Nkv * 64,
+        {scores_ptr, Nkv},
+        (int64_t)Tq * Nkv,
+        {scores_ptr, Nkv},
+        (int64_t)Tq * Nkv,
+        {(float)scale, 0.0f},
+        batch_count);
+    GemmQK qk_gemm;
+    check_cutlass_status(qk_gemm.can_implement(qk_args), "indexed_attention_half_kv_cutlass.qk.can_implement");
+    check_cutlass_status(qk_gemm(qk_args, nullptr, at::cuda::getCurrentCUDAStream()), "indexed_attention_half_kv_cutlass.qk");
+    check_last_cuda_error("indexed_attention_half_kv_cutlass_qk");
+
+    softmax_rows_inplace_f32_kernel<<<B * Hq * Tq, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scores_ptr,
+        B * Hq * Tq,
+        Nkv);
+    check_last_cuda_error("indexed_attention_half_kv_cutlass_softmax");
+
+    int64_t probs_elems = (int64_t)B * Hq * Tq * Nkv;
+    cast_f32_to_f16_kernel<<<div_up_i64(probs_elems, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        scores_ptr,
+        reinterpret_cast<cutlass::half_t *>(probs_h.data_ptr<at::Half>()),
+        probs_elems);
+    check_last_cuda_error("attention_cutlass_probs_cast");
+
+    using GemmAV = cutlass::gemm::device::GemmBatched<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        4,
+        8,
+        8>;
+
+    const cutlass::half_t *probs_ptr = reinterpret_cast<const cutlass::half_t *>(probs_h.data_ptr<at::Half>());
+    const cutlass::half_t *v_ptr = reinterpret_cast<const cutlass::half_t *>(v_compact.data_ptr<at::Half>());
+    float *out_ptr = out.data_ptr<float>();
+    typename GemmAV::Arguments av_args(
+        {Tq, 64, Nkv},
+        {probs_ptr, Nkv},
+        (int64_t)Tq * Nkv,
+        {v_ptr, 64},
+        (int64_t)Nkv * 64,
+        {out_ptr, 64},
+        (int64_t)Tq * 64,
+        {out_ptr, 64},
+        (int64_t)Tq * 64,
+        {1.0f, 0.0f},
+        batch_count);
+    GemmAV av_gemm;
+    check_cutlass_status(av_gemm.can_implement(av_args), "indexed_attention_half_kv_cutlass.av.can_implement");
+    check_cutlass_status(av_gemm(av_args, nullptr, at::cuda::getCurrentCUDAStream()), "indexed_attention_half_kv_cutlass.av");
+    check_last_cuda_error("indexed_attention_half_kv_cutlass_av");
+    return out;
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -3319,6 +3519,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("indexed_attention_flash", &indexed_attention_flash_cuda, "WorldModel fused online-softmax indexed GQA attention (CUDA, f32)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv", &indexed_attention_half_kv_cuda, "WorldModel indexed GQA attention with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv_flash", &indexed_attention_half_kv_flash_cuda, "WorldModel group-flash indexed GQA attention with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("indexed_attention_half_kv_cutlass", &indexed_attention_half_kv_cutlass_cuda, "WorldModel materialized indexed GQA attention using CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
