@@ -997,6 +997,69 @@ __global__ static void taehv_im2col3x3_nchw_tile_kernel(
     cols[i] = v;
 }
 
+__global__ static void taehv_im2col3x3_nchw_batch_tile_kernel(
+        const float *in,
+        float *cols,
+        int N,
+        int C,
+        int H,
+        int W,
+        int tile_start,
+        int tile_cols) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int k_elems = C * 9;
+    int64_t total = (int64_t)k_elems * tile_cols;
+    if (i >= total) return;
+
+    int col = (int)(i % tile_cols);
+    int k = (int)(i / tile_cols);
+    int spatial = H * W;
+    int global_col = tile_start + col;
+    int frame = global_col / spatial;
+    int pos = global_col - frame * spatial;
+    if (frame >= N) {
+        cols[i] = 0.0f;
+        return;
+    }
+    int x = pos % W;
+    int y = pos / W;
+    int q = k;
+    int kx = q % 3;
+    q /= 3;
+    int ky = q % 3;
+    int c = q / 3;
+    int iy = y + ky - 1;
+    int ix = x + kx - 1;
+    float v = 0.0f;
+    if (iy >= 0 && iy < H && ix >= 0 && ix < W) {
+        v = in[((int64_t)frame * C * spatial + c * spatial + iy * W + ix)];
+    }
+    cols[i] = v;
+}
+
+__global__ static void taehv_scatter_conv_tile_to_nchw_kernel(
+        const float *tile,
+        float *out,
+        int N,
+        int C_out,
+        int H,
+        int W,
+        int tile_start,
+        int tile_cols) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)C_out * tile_cols;
+    if (i >= total) return;
+
+    int col = (int)(i % tile_cols);
+    int co = (int)(i / tile_cols);
+    int spatial = H * W;
+    int global_col = tile_start + col;
+    int frame = global_col / spatial;
+    int pos = global_col - frame * spatial;
+    if (frame >= N) return;
+    out[(int64_t)frame * C_out * spatial + (int64_t)co * spatial + pos] = tile[i];
+}
+
 __global__ static void taehv_concat_past_nchw_kernel(
         const float *x,
         float *out,
@@ -1798,6 +1861,7 @@ typedef struct {
     float *buf1;
     float *buf2;
     float *conv3x3_cols;
+    float *conv3x3_out_tile;
     __half *hbuf0;
     __half *hbuf1;
     __half *hbuf2;
@@ -1812,8 +1876,10 @@ typedef struct {
     int fp16_nhwc_enabled;
     int cutlass_1x1_enabled;
     int cutlass_3x3_enabled;
+    int conv3x3_batch_cols_enabled;
     int conv3x3_tile_cols;
     size_t conv3x3_cols_elems;
+    size_t conv3x3_out_tile_elems;
     int profile_enabled;
     cudaEvent_t prof_start;
     cudaEvent_t prof_stop;
@@ -1822,6 +1888,7 @@ typedef struct {
     float prof_1x1_bias_ms;
     float prof_3x3_im2col_ms;
     float prof_3x3_gemm_ms;
+    float prof_3x3_scatter_ms;
     float prof_3x3_bias_ms;
     int prof_direct_calls;
     int prof_1x1_calls;
@@ -1892,6 +1959,7 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     cudaFree(dec->buf1);
     cudaFree(dec->buf2);
     cudaFree(dec->conv3x3_cols);
+    cudaFree(dec->conv3x3_out_tile);
     cudaFree(dec->hbuf0);
     cudaFree(dec->hbuf1);
     cudaFree(dec->hbuf2);
@@ -1917,10 +1985,12 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->rgb_elems = (size_t)4 * dec->out_h * dec->out_w * 3;
     const char *vae_1x1_env = getenv("WORLD_VAE_1X1_GEMM");
     const char *vae_3x3_env = getenv("WORLD_VAE_3X3_GEMM");
+    const char *vae_3x3_batch_env = getenv("WORLD_VAE_3X3_BATCH_COLS");
     const char *vae_3x3_tile_env = getenv("WORLD_VAE_3X3_TILE_COLS");
     const char *vae_profile_env = getenv("WORLD_VAE_PROFILE");
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
     dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
+    dec->conv3x3_batch_cols_enabled = vae_3x3_batch_env ? vae_3x3_batch_env[0] != '0' : 0;
     dec->profile_enabled = vae_profile_env ? vae_profile_env[0] != '0' : 0;
     dec->conv3x3_tile_cols = 16384;
     if (vae_3x3_tile_env && vae_3x3_tile_env[0]) {
@@ -1949,28 +2019,41 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     }
     if (dec->cutlass_3x3_enabled) {
         int max_k_elems = 0;
+        int max_out_c = 0;
         for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
             const WorldVaeConvWeight *conv = &host->convs[i];
             if (conv->kernel == 3) {
                 int k_elems = conv->in_c * 9;
                 if (k_elems > max_k_elems) max_k_elems = k_elems;
+                if (conv->out_c > max_out_c) max_out_c = conv->out_c;
             }
         }
         cudaError_t cols_err = cudaErrorMemoryAllocation;
-        while (dec->conv3x3_tile_cols >= 1024 && cols_err != cudaSuccess) {
+        cudaError_t out_err = dec->conv3x3_batch_cols_enabled ? cudaErrorMemoryAllocation : cudaSuccess;
+        while (dec->conv3x3_tile_cols >= 1024 && (cols_err != cudaSuccess || out_err != cudaSuccess)) {
             dec->conv3x3_cols_elems = (size_t)max_k_elems * dec->conv3x3_tile_cols;
+            dec->conv3x3_out_tile_elems = (size_t)max_out_c * dec->conv3x3_tile_cols;
             cols_err = cudaMalloc((void **)&dec->conv3x3_cols, dec->conv3x3_cols_elems * sizeof(float));
-            if (cols_err != cudaSuccess) {
-                fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace tile_cols=%d %.2f MiB: %s\n",
+            out_err = dec->conv3x3_batch_cols_enabled && cols_err == cudaSuccess
+                ? cudaMalloc((void **)&dec->conv3x3_out_tile, dec->conv3x3_out_tile_elems * sizeof(float))
+                : (cols_err == cudaSuccess ? cudaSuccess : cudaErrorMemoryAllocation);
+            if (cols_err != cudaSuccess || out_err != cudaSuccess) {
+                fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace tile_cols=%d cols %.2f MiB out %.2f MiB: %s/%s\n",
                         dec->conv3x3_tile_cols,
                         (double)(dec->conv3x3_cols_elems * sizeof(float)) / (1024.0 * 1024.0),
-                        cudaGetErrorString(cols_err));
+                        (double)(dec->conv3x3_out_tile_elems * sizeof(float)) / (1024.0 * 1024.0),
+                        cudaGetErrorString(cols_err),
+                        cudaGetErrorString(out_err));
+                cudaFree(dec->conv3x3_cols);
+                cudaFree(dec->conv3x3_out_tile);
                 dec->conv3x3_tile_cols /= 2;
                 dec->conv3x3_cols = NULL;
+                dec->conv3x3_out_tile = NULL;
                 dec->conv3x3_cols_elems = 0;
+                dec->conv3x3_out_tile_elems = 0;
             }
         }
-        if (cols_err != cudaSuccess) {
+        if (cols_err != cudaSuccess || out_err != cudaSuccess) {
             fprintf(stderr, "warning: failed to allocate VAE 3x3 CUTLASS workspace %.2f MiB: %s; falling back to direct 3x3 conv\n",
                     (double)(dec->conv3x3_cols_elems * sizeof(float)) / (1024.0 * 1024.0),
                     cudaGetErrorString(cols_err));
@@ -1980,13 +2063,14 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
         }
     }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s tile_cols=%d, profiling %s, pinned RGB host buffer\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s tile_cols=%d batch_cols=%s, profiling %s, pinned RGB host buffer\n",
             dec->out_w,
             dec->out_h,
             (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
             dec->cutlass_1x1_enabled ? "on" : "off",
             dec->cutlass_3x3_enabled ? "on" : "off",
             dec->conv3x3_tile_cols,
+            dec->conv3x3_batch_cols_enabled ? "on" : "off",
             dec->profile_enabled ? "on" : "off");
 #undef VAE_INIT_CUDA
     return 0;
@@ -2004,6 +2088,7 @@ static void taehv_profile_reset(DeviceVaeDecoder *dec) {
     dec->prof_1x1_bias_ms = 0.0f;
     dec->prof_3x3_im2col_ms = 0.0f;
     dec->prof_3x3_gemm_ms = 0.0f;
+    dec->prof_3x3_scatter_ms = 0.0f;
     dec->prof_3x3_bias_ms = 0.0f;
     dec->prof_direct_calls = 0;
     dec->prof_1x1_calls = 0;
@@ -2031,7 +2116,7 @@ static int taehv_profile_accum(DeviceVaeDecoder *dec, float *accum) {
 static void taehv_profile_print(const DeviceVaeDecoder *dec) {
     if (!dec || !dec->profile_enabled) return;
     fprintf(stderr,
-            "VAE profile: direct=%.3fms/%d calls 1x1_gemm=%.3fms/%d launches 1x1_bias=%.3fms 3x3_im2col=%.3fms/%d tiles 3x3_gemm=%.3fms/%d tiles 3x3_bias=%.3fms\n",
+            "VAE profile: direct=%.3fms/%d calls 1x1_gemm=%.3fms/%d launches 1x1_bias=%.3fms 3x3_im2col=%.3fms/%d tiles 3x3_gemm=%.3fms/%d tiles 3x3_scatter=%.3fms 3x3_bias=%.3fms\n",
             dec->prof_direct_ms,
             dec->prof_direct_calls,
             dec->prof_1x1_gemm_ms,
@@ -2041,6 +2126,7 @@ static void taehv_profile_print(const DeviceVaeDecoder *dec) {
             dec->prof_3x3_tiles,
             dec->prof_3x3_gemm_ms,
             dec->prof_3x3_tiles,
+            dec->prof_3x3_scatter_ms,
             dec->prof_3x3_bias_ms);
 }
 
@@ -2113,6 +2199,9 @@ static int taehv_run_conv3x3_cutlass_nchw(
     int spatial = H * W;
     int k_elems = conv->in_c * 9;
     if ((size_t)k_elems * dec->conv3x3_tile_cols > dec->conv3x3_cols_elems) return 1;
+    if (dec->conv3x3_batch_cols_enabled &&
+            (!dec->conv3x3_out_tile ||
+             (size_t)conv->out_c * dec->conv3x3_tile_cols > dec->conv3x3_out_tile_elems)) return 1;
 
     using Gemm = cutlass::gemm::device::Gemm<
         float,
@@ -2134,6 +2223,47 @@ static int taehv_run_conv3x3_cutlass_nchw(
         1>;
 
     Gemm gemm;
+    if (dec->conv3x3_batch_cols_enabled) {
+        int total_cols = N * spatial;
+        for (int tile_start = 0; tile_start < total_cols; tile_start += dec->conv3x3_tile_cols) {
+            int tile_cols = total_cols - tile_start;
+            if (tile_cols > dec->conv3x3_tile_cols) tile_cols = dec->conv3x3_tile_cols;
+            if (taehv_profile_begin(dec)) return 1;
+            taehv_im2col3x3_nchw_batch_tile_kernel<<<div_up_i64((int64_t)k_elems * tile_cols, 256), 256>>>(
+                in, dec->conv3x3_cols, N, conv->in_c, H, W, tile_start, tile_cols);
+            CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_im2col_ms)) return 1;
+
+            typename Gemm::Arguments args(
+                {conv->out_c, tile_cols, k_elems},
+                {conv->weight, k_elems},
+                {dec->conv3x3_cols, tile_cols},
+                {dec->conv3x3_out_tile, tile_cols},
+                {dec->conv3x3_out_tile, tile_cols},
+                {1.0f, 0.0f});
+            if (taehv_profile_begin(dec)) return 1;
+            CUTLASS_OK(gemm(args));
+            CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_gemm_ms)) return 1;
+
+            if (taehv_profile_begin(dec)) return 1;
+            taehv_scatter_conv_tile_to_nchw_kernel<<<div_up_i64((int64_t)conv->out_c * tile_cols, 256), 256>>>(
+                dec->conv3x3_out_tile, out, N, conv->out_c, H, W, tile_start, tile_cols);
+            CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_scatter_ms)) return 1;
+            if (dec->profile_enabled) dec->prof_3x3_tiles++;
+        }
+        if (conv->has_bias) {
+            int64_t total = (int64_t)N * conv->out_c * H * W;
+            if (taehv_profile_begin(dec)) return 1;
+            taehv_add_bias_nchw_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias, N, conv->out_c, H, W);
+            CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_bias_ms)) return 1;
+        }
+        if (dec->profile_enabled) dec->prof_3x3_calls++;
+        return 0;
+    }
+
     for (int n = 0; n < N; ++n) {
         float *out_frame = out + (int64_t)n * conv->out_c * spatial;
         for (int tile_start = 0; tile_start < spatial; tile_start += dec->conv3x3_tile_cols) {
