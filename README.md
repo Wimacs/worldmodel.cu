@@ -280,9 +280,10 @@ raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和
 - CMake configure 会打印 `CUDA architectures`；tensor-op 需要 `80+`，项目默认是 `89`。
 - 后续高性能路线按版本推进：先 profile 确认最大瓶颈，再做少量真实 shape CUTLASS probe，最后才接入 runtime；不在主线里无休止搜索 tile。
 - D=64 cache attention 默认走项目内 indexed warp fallback；`WORLD_FLASH_ATTN=1` 可启用 online-softmax tiled prototype。
-- VAE decode 当前是 F32/NCHW 主路径；1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
+- VAE decode 默认仍是 F32/NCHW 主路径；1x1 conv 默认走 per-frame CUTLASS GEMM，3x3 conv 默认走 tiled im2col + CUTLASS GEMM，默认 `WORLD_VAE_3X3_TILE_COLS=16384`。`WORLD_VAE_1X1_GEMM=0` / `WORLD_VAE_3X3_GEMM=0` 可分别回退旧 direct conv。
+- `WORLD_VAE_FP16_NHWC=1` 可启用实验性的 VAE FP16/NHWC 全路径：VAE 权重在 load 阶段额外预打包成 KRSC half，runtime 用 CUTLASS tensor-op implicit conv，bias 仍是单独 half kernel。当前保持默认关闭，方便和 F32/NCHW 对照及定位画面问题。
 - `WORLD_VAE_3X3_BATCH_COLS=1` 可试验 frame-batched 3x3 tiles；当前 profile 显示它慢于默认 per-frame path，所以默认关闭。
-- PyTorch extension 里已有 CUTLASS implicit-GEMM 3x3 NHWC/KRSC 单层和 pair probe；连续 NHWC island 比两层 im2col path 快，下一步应接 runtime 的 FP16/NHWC conv 和 KRSC half 权重预打包。
+- PyTorch extension 里已有 CUTLASS implicit-GEMM 3x3 NHWC/KRSC 单层、half 单层和 pair probe；half 单层测试按 runtime 的 half-output-then-bias 舍入路径对齐。
 - `WORLD_VAE_PROFILE=1` 会同步 CUDA event 并打印 VAE conv 分段时间，只用于 profile，不用于正常 FPS。
 
 ## 8. 测试

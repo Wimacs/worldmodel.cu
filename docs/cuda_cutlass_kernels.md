@@ -46,7 +46,7 @@ FP32 path：
 VAE：
 
 - cuDNN 路径已经移除。
-- 当前 VAE decode 仍是 F32/NCHW 主路径。
+- 默认 VAE decode 仍是 F32/NCHW 主路径。
 - 1x1 conv 已接入 CUTLASS GEMM baseline：每个 frame 把 NCHW 平面视作 `B = [Cin, H*W]` row-major，权重视作 `A = [Cout, Cin]` row-major，输出直接落到该 frame 的 `[Cout, H*W]` NCHW 平面。
 - 3x3 conv 已接入 tiled im2col + CUTLASS GEMM baseline：每次 materialize `K = Cin*3*3` 和最多 16384 个 spatial column，做 `weight[Cout,K] x cols[K,tile] -> out[Cout,tile]`。这样避免完整 im2col 在后段高分辨率层爆显存，同时把 tile/GEMM launch 数降下来。
 - `WORLD_VAE_1X1_GEMM=0` 可以回退旧 direct 1x1 conv，用于性能和数值定位。
@@ -60,7 +60,10 @@ VAE：
 - 小型 CUDA event probe 显示 implicit NHWC core 确实能绕开 im2col 物化：`N=4,Cin=64,Cout=64,H=64,W=128` 时，现有 batched im2col path `0.220ms`，implicit NHWC core `0.115ms`，临时 `NCHW->NHWC->NCHW` 包裹后 `0.157ms`；`Cout=128` 时分别是 `0.282ms`、`0.197ms`、`0.269ms`。
 - 单层 probe 结论：不把“每层临时转 NHWC 再转回 NCHW”的实现接入默认 runtime；需要用连续 NHWC island 或完整 NHWC/FP16 路径，让 layout 转换只发生在边界。
 - 连续 NHWC island probe 已加入 PyTorch extension：`taehv_conv3x3_cutlass_implicit_nhwc_pair`，执行 `conv3x3 -> ReLU -> conv3x3`，中间不离开 NHWC。小型 probe 显示 `N=4,Cin=64,Cmid=64,H=64,W=128` 时，两层 im2col path 是 `0.456ms`，NHWC pair core 是 `0.246ms`，边界转换一次后是 `0.279ms`；`Cin=128` 时分别是 `0.674ms`、`0.341ms`、`0.421ms`；`H=128,W=256` 时分别是 `1.896ms`、`0.800ms`、`1.016ms`。
-- 因此下一版可以开始接 runtime FP16/NHWC conv：先给 VAE 权重增加 KRSC half 预打包，再实现 `taehv_run_conv_h_nhwc()` 的 CUTLASS implicit conv。仍然不要接 cuDNN，也不要先做大规模 tile 搜索。
+- runtime FP16/NHWC VAE conv 已接入实验开关 `WORLD_VAE_FP16_NHWC=1`。加载 VAE 时会保留旧 OIHW F32 权重，同时额外预打包 KRSC half 权重；`taehv_run_conv_h_nhwc()` 使用 CUTLASS tensor-op implicit conv，accumulator 为 float，输出 half，bias 暂时单独 half NHWC kernel。
+- half implicit conv 使用 A/B alignment=8。原因是 CUTLASS SM80 tensor-op implicit conv 使用 `cp.async`，alignment=1 会退成 2-byte 搬运并触发 `Size is not supported` 编译错误；当前 VAE activation/filter 的 `Cin` 都是 8 的倍数，A/B alignment=8 能覆盖真实 shape。output epilogue 仍用 element-per-access=1，以兼容最后 `Cout=12`。
+- 实测 headless smoke：1024x512、1 layer、1 step，旧 F32/NCHW VAE `68.705ms`，`WORLD_VAE_FP16_NHWC=1` 后 VAE `12.613ms`；1024x512、1 layer、4 step 为 `12.854ms`；360p、24 layer、4 step 完整闭环为 transformer `66.851ms`、VAE `3.716ms`、total `71.825ms`。
+- 这版刻意不做 bias/ReLU fusion 和 tile 搜索。下一版应先判断视觉/数值是否接受 half VAE，再考虑 fused bias/ReLU 或针对真实 VAE shape 增加少量专用 CUTLASS 变体。
 
 Attention：
 
@@ -146,7 +149,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 ## VAE conv 优化计划
 
-内置 direct conv 正确但慢。当前已完成 1x1 per-frame GEMM 和 3x3 tiled im2col GEMM baseline。下一步有两个可选路线：
+内置 direct conv 正确但慢。当前已完成 1x1 per-frame GEMM、3x3 tiled im2col GEMM baseline，以及实验性的 runtime FP16/NHWC implicit conv 全路径。后续还有两个可选路线：
 
 - CUTLASS implicit-GEMM conv2d：适合 3x3/1x1、channel 比较规整的层。
 - 显式 im2row + CUTLASS GEMM：实现简单，容易对拍和 profile，但会多写一个 im2row buffer。
@@ -157,7 +160,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
 3. frame-batched tile 实验证明“简单合并 frame 维”不值得进默认。
 4. CUTLASS implicit-GEMM NHWC 单层和 pair probe 已证明 core 有收益，且连续 NHWC island 能 amortize 边界转换。
-5. 下一版接 runtime FP16/NHWC conv：补 KRSC half 权重预打包，实现 `taehv_run_conv_h_nhwc()`，先用一个保守 CUTLASS implicit conv kernel 跑通并对拍/烟测。
+5. runtime FP16/NHWC conv 已接入实验开关：补 KRSC half 权重预打包，实现 `taehv_run_conv_h_nhwc()`，并补 half implicit conv PyTorch 对拍。
 6. 再考虑 bias/ReLU fusion，以及真实 VAE shape 的少量专用 tensor-op/TF32 变体。
 
 ## 对拍规则

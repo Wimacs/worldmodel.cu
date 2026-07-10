@@ -477,6 +477,22 @@ def test_taehv_conv3x3_cutlass_implicit_nhwc_matches_torch_same_padding(wm_cuda)
     torch.testing.assert_close(y_nchw, ref, rtol=2e-5, atol=2e-5)
 
 
+def test_taehv_conv3x3_cutlass_implicit_nhwc_fp16_matches_reference(wm_cuda):
+    torch.manual_seed(126)
+    n, cin, cout, h, w = 2, 8, 12, 9, 10
+    x = (torch.randn(n, cin, h, w, device="cuda", dtype=torch.float32) * 0.5).half()
+    weight = (torch.randn(cout, cin, 3, 3, device="cuda", dtype=torch.float32) * 0.1).half()
+    bias = (torch.randn(cout, device="cuda", dtype=torch.float32) * 0.05).half()
+
+    x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+    weight_krsc = weight.permute(0, 2, 3, 1).contiguous()
+    y = wm_cuda.taehv_conv3x3_cutlass_implicit_nhwc_fp16(x_nhwc, weight_krsc, bias)
+    y_nchw = y.permute(0, 3, 1, 2).contiguous()
+    ref_conv = F.conv2d(x.float(), weight.float(), bias=None, padding=1).half()
+    ref = (ref_conv + bias.view(1, -1, 1, 1)).half()
+    torch.testing.assert_close(y_nchw, ref, rtol=2e-2, atol=2e-2)
+
+
 def test_taehv_conv3x3_cutlass_implicit_nhwc_pair_matches_torch(wm_cuda):
     torch.manual_seed(125)
     n, cin, cmid, cout, h, w = 2, 5, 8, 7, 8, 11
@@ -545,6 +561,7 @@ if __name__ == "__main__":
         test_taehv_conv3x3_cutlass_matches_torch_same_padding,
         test_taehv_conv3x3_cutlass_batched_matches_torch_same_padding,
         test_taehv_conv3x3_cutlass_implicit_nhwc_matches_torch_same_padding,
+        test_taehv_conv3x3_cutlass_implicit_nhwc_fp16_matches_reference,
         test_taehv_conv3x3_cutlass_implicit_nhwc_pair_matches_torch,
         test_taehv_concat_past_matches_reference,
         test_taehv_upsample2_matches_nearest,

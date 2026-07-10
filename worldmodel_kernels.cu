@@ -22,6 +22,7 @@
 #define WM_CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 #define WM_CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 #define WM_CHECK_F32(x) TORCH_CHECK((x).scalar_type() == at::ScalarType::Float, #x " must be float32")
+#define WM_CHECK_F16(x) TORCH_CHECK((x).scalar_type() == at::ScalarType::Half, #x " must be float16")
 
 #define WM_ATTN_D64_Q_BLOCK 4
 #define WM_ATTN_D64_K_BLOCK 64
@@ -1113,6 +1114,16 @@ __global__ void taehv_add_bias_nhwc_f32_kernel(
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
     out[i] += bias[i % C];
+}
+
+__global__ void taehv_add_bias_nhwc_f16_kernel(
+        cutlass::half_t *out,
+        const cutlass::half_t *bias,
+        int64_t total,
+        int C) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    out[i] = cutlass::half_t(float(out[i]) + float(bias[i % C]));
 }
 
 __global__ void taehv_im2col3x3_nchw_tile_f32_kernel(
@@ -2388,6 +2399,99 @@ torch::Tensor taehv_conv3x3_cutlass_implicit_nhwc_cuda(torch::Tensor x, torch::T
     return out;
 }
 
+torch::Tensor taehv_conv3x3_cutlass_implicit_nhwc_fp16_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CUDA(bias);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_CONTIGUOUS(bias);
+    WM_CHECK_F16(x);
+    WM_CHECK_F16(weight);
+    WM_CHECK_F16(bias);
+    TORCH_CHECK(x.dim() == 4, "x must be NHWC [N,H,W,C]");
+    TORCH_CHECK(weight.dim() == 4, "weight must be KRSC [Cout,3,3,Cin]");
+    TORCH_CHECK(weight.size(1) == 3 && weight.size(2) == 3, "weight must be 3x3 KRSC");
+    TORCH_CHECK(weight.size(3) == x.size(3), "input channel mismatch");
+    TORCH_CHECK(bias.numel() == weight.size(0), "bias length must equal Cout");
+
+    int N = (int)x.size(0);
+    int H = (int)x.size(1);
+    int W = (int)x.size(2);
+    int C_in = (int)x.size(3);
+    int C_out = (int)weight.size(0);
+    auto out = torch::empty({N, H, W, C_out}, x.options());
+
+    using Layout = cutlass::layout::TensorNHWC;
+    using Element = cutlass::half_t;
+    using Conv2dFpropKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+        Element,
+        Layout,
+        Element,
+        Layout,
+        Element,
+        Layout,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 64, 32>,
+        cutlass::gemm::GemmShape<64, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<Element, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        3,
+        cutlass::arch::OpMultiplyAdd,
+        cutlass::conv::IteratorAlgorithm::kAnalytic,
+        cutlass::conv::StrideSupport::kUnity,
+        8,
+        8>::Kernel;
+    using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel>;
+
+    cutlass::Tensor4DCoord input_size(N, H, W, C_in);
+    cutlass::Tensor4DCoord filter_size(C_out, 3, 3, C_in);
+    cutlass::Tensor4DCoord padding(1, 1, 1, 1);
+    cutlass::MatrixCoord stride(1, 1);
+    cutlass::MatrixCoord dilation(1, 1);
+    cutlass::Tensor4DCoord output_size(N, H, W, C_out);
+    cutlass::conv::Conv2dProblemSize problem(
+        input_size,
+        filter_size,
+        padding,
+        stride,
+        dilation,
+        output_size,
+        cutlass::conv::Mode::kCrossCorrelation,
+        1);
+
+    Element *x_ptr = const_cast<Element *>(reinterpret_cast<const Element *>(x.data_ptr<at::Half>()));
+    Element *weight_ptr = const_cast<Element *>(reinterpret_cast<const Element *>(weight.data_ptr<at::Half>()));
+    Element *out_ptr = reinterpret_cast<Element *>(out.data_ptr<at::Half>());
+    typename ImplicitGemm::Arguments args(
+        problem,
+        cutlass::TensorRef<Element, Layout>(x_ptr, Layout::packed(input_size)),
+        cutlass::TensorRef<Element, Layout>(weight_ptr, Layout::packed(filter_size)),
+        cutlass::TensorRef<Element, Layout>(out_ptr, Layout::packed(output_size)),
+        cutlass::TensorRef<Element, Layout>(out_ptr, Layout::packed(output_size)),
+        {1.0f, 0.0f});
+
+    ImplicitGemm implicit_gemm;
+    check_cutlass_status(implicit_gemm.can_implement(args), "taehv_conv3x3_cutlass_implicit_nhwc_fp16.can_implement");
+    size_t workspace_size = implicit_gemm.get_workspace_size(args);
+    auto workspace = torch::empty({(int64_t)workspace_size}, x.options().dtype(torch::kUInt8));
+    void *workspace_ptr = workspace_size ? workspace.data_ptr<uint8_t>() : nullptr;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    check_cutlass_status(implicit_gemm(args, workspace_ptr, stream), "taehv_conv3x3_cutlass_implicit_nhwc_fp16");
+    check_last_cuda_error("taehv_conv3x3_cutlass_implicit_nhwc_fp16");
+
+    taehv_add_bias_nhwc_f16_kernel<<<div_up_i64((int64_t)N * H * W * C_out, 256), 256, 0, stream>>>(
+        out_ptr,
+        reinterpret_cast<const Element *>(bias.data_ptr<at::Half>()),
+        (int64_t)N * H * W * C_out,
+        C_out);
+    check_last_cuda_error("taehv_conv3x3_cutlass_implicit_nhwc_fp16_bias");
+    return out;
+}
+
 torch::Tensor taehv_conv3x3_cutlass_implicit_nhwc_pair_cuda(
         torch::Tensor x,
         torch::Tensor weight0,
@@ -2483,6 +2587,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("taehv_conv3x3_cutlass", &taehv_conv3x3_cutlass_cuda, "TAEHV 3x3 Conv2d using im2col tile + CUTLASS GEMM (CUDA, f32)");
     m.def("taehv_conv3x3_cutlass_batched", &taehv_conv3x3_cutlass_batched_cuda, "TAEHV 3x3 Conv2d using batch-spatial im2col tile + CUTLASS GEMM (CUDA, f32)", py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("tile_cols"));
     m.def("taehv_conv3x3_cutlass_implicit_nhwc", &taehv_conv3x3_cutlass_implicit_nhwc_cuda, "TAEHV 3x3 Conv2d using CUTLASS implicit-GEMM NHWC/KRSC probe (CUDA, f32)");
+    m.def("taehv_conv3x3_cutlass_implicit_nhwc_fp16", &taehv_conv3x3_cutlass_implicit_nhwc_fp16_cuda, "TAEHV 3x3 Conv2d using CUTLASS implicit-GEMM NHWC/KRSC probe (CUDA, fp16)");
     m.def("taehv_conv3x3_cutlass_implicit_nhwc_pair", &taehv_conv3x3_cutlass_implicit_nhwc_pair_cuda, "Two TAEHV 3x3 CUTLASS implicit-GEMM NHWC convs with intermediate ReLU (CUDA, f32)");
     m.def("taehv_concat_past", &taehv_concat_past_cuda, "TAEHV MemBlock current+past concat (CUDA, f32)");
     m.def("taehv_upsample2", &taehv_upsample2_cuda, "TAEHV nearest upsample x2 (CUDA, f32)");

@@ -4,10 +4,15 @@
 #include <cuda_runtime.h>
 
 #include <cutlass/cutlass.h>
+#include <cutlass/conv/conv2d_problem_size.h>
+#include <cutlass/conv/device/implicit_gemm_convolution.h>
+#include <cutlass/conv/kernel/default_conv2d_fprop.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/layout/matrix.h>
+#include <cutlass/layout/tensor.h>
 #include <cutlass/numeric_types.h>
+#include <cutlass/tensor_ref.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1200,6 +1205,16 @@ __global__ static void taehv_relu_nhwc_h_kernel(__half *x, int64_t n) {
     }
 }
 
+__global__ static void taehv_add_bias_nhwc_h_kernel(
+        __half *out,
+        const __half *bias,
+        int64_t total,
+        int C) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    out[i] = __float2half_rn(__half2float(out[i]) + __half2float(bias[i % C]));
+}
+
 __global__ static void taehv_concat_past_nhwc_h_kernel(
         const __half *x,
         __half *out,
@@ -1534,6 +1549,35 @@ static int copy_f32_to_half_device(__half **dst, const float *src, size_t n) {
     return 0;
 }
 
+static int copy_oihw_f32_to_krsc_half_device(
+        __half **dst,
+        const float *src,
+        int out_c,
+        int in_c,
+        int kernel) {
+    *dst = NULL;
+    size_t n = (size_t)out_c * in_c * kernel * kernel;
+    float *host = (float *)malloc(n * sizeof(float));
+    if (!host) {
+        fprintf(stderr, "failed to allocate KRSC weight packing buffer\n");
+        return 1;
+    }
+    for (int co = 0; co < out_c; ++co) {
+        for (int ky = 0; ky < kernel; ++ky) {
+            for (int kx = 0; kx < kernel; ++kx) {
+                for (int ci = 0; ci < in_c; ++ci) {
+                    size_t dst_idx = (((size_t)co * kernel + ky) * kernel + kx) * in_c + ci;
+                    size_t src_idx = (((size_t)co * in_c + ci) * kernel + ky) * kernel + kx;
+                    host[dst_idx] = src[src_idx];
+                }
+            }
+        }
+    }
+    int rc = copy_f32_to_half_device(dst, host, n);
+    free(host);
+    return rc;
+}
+
 typedef struct {
     float *cond_bias;
     float *cond_proj_weight;
@@ -1848,6 +1892,7 @@ typedef struct {
     float *weight;
     float *bias;
     __half *weight_h;
+    __half *weight_krsc_h;
     __half *bias_h;
     int out_c;
     int in_c;
@@ -1917,7 +1962,7 @@ static void taehv_pick_scratch_h(__half *cur, __half *buf0, __half *buf1, __half
     *aux = second;
 }
 
-static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT], const WorldVaeDecoderWeights *host) {
+static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT], const WorldVaeDecoderWeights *host, int pack_krsc_half) {
     memset(dev, 0, WORLD_VAE_DECODER_CONV_COUNT * sizeof(dev[0]));
     for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
         const WorldVaeConvWeight *src = &host->convs[i];
@@ -1930,6 +1975,14 @@ static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COU
         CUDA_OK(cudaMalloc((void **)&dst->weight, w_elems * sizeof(float)));
         CUDA_OK(cudaMemcpy(dst->weight, src->weight, w_elems * sizeof(float), cudaMemcpyHostToDevice));
         if (copy_f32_to_half_device(&dst->weight_h, src->weight, w_elems)) return 1;
+        if (pack_krsc_half) {
+            if (copy_oihw_f32_to_krsc_half_device(
+                        &dst->weight_krsc_h,
+                        src->weight,
+                        src->out_c,
+                        src->in_c,
+                        src->kernel)) return 1;
+        }
         if (src->has_bias) {
             CUDA_OK(cudaMalloc((void **)&dst->bias, (size_t)src->out_c * sizeof(float)));
             CUDA_OK(cudaMemcpy(dst->bias, src->bias, (size_t)src->out_c * sizeof(float), cudaMemcpyHostToDevice));
@@ -1944,10 +1997,12 @@ static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_CO
         cudaFree(dev[i].weight);
         cudaFree(dev[i].bias);
         cudaFree(dev[i].weight_h);
+        cudaFree(dev[i].weight_krsc_h);
         cudaFree(dev[i].bias_h);
         dev[i].weight = NULL;
         dev[i].bias = NULL;
         dev[i].weight_h = NULL;
+        dev[i].weight_krsc_h = NULL;
         dev[i].bias_h = NULL;
     }
 }
@@ -1987,10 +2042,12 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     const char *vae_3x3_env = getenv("WORLD_VAE_3X3_GEMM");
     const char *vae_3x3_batch_env = getenv("WORLD_VAE_3X3_BATCH_COLS");
     const char *vae_3x3_tile_env = getenv("WORLD_VAE_3X3_TILE_COLS");
+    const char *vae_fp16_nhwc_env = getenv("WORLD_VAE_FP16_NHWC");
     const char *vae_profile_env = getenv("WORLD_VAE_PROFILE");
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
     dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
     dec->conv3x3_batch_cols_enabled = vae_3x3_batch_env ? vae_3x3_batch_env[0] != '0' : 0;
+    dec->fp16_nhwc_enabled = vae_fp16_nhwc_env ? vae_fp16_nhwc_env[0] != '0' : 0;
     dec->profile_enabled = vae_profile_env ? vae_profile_env[0] != '0' : 0;
     dec->conv3x3_tile_cols = 16384;
     if (vae_3x3_tile_env && vae_3x3_tile_env[0]) {
@@ -2007,12 +2064,17 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     } \
 } while (0)
 
-    if (taehv_copy_weights(dec->convs, host)) goto fail;
+    if (taehv_copy_weights(dec->convs, host, dec->fp16_nhwc_enabled)) goto fail;
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf0, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf1, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
+    if (dec->fp16_nhwc_enabled) {
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf0, dec->max_elems * sizeof(__half)));
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf1, dec->max_elems * sizeof(__half)));
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf2, dec->max_elems * sizeof(__half)));
+    }
     if (dec->profile_enabled) {
         VAE_INIT_CUDA(cudaEventCreate(&dec->prof_start));
         VAE_INIT_CUDA(cudaEventCreate(&dec->prof_stop));
@@ -2063,10 +2125,11 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
         }
     }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s tile_cols=%d batch_cols=%s, profiling %s, pinned RGB host buffer\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, FP16/NHWC CUTLASS implicit conv %s, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s tile_cols=%d batch_cols=%s, profiling %s, pinned RGB host buffer\n",
             dec->out_w,
             dec->out_h,
             (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
+            dec->fp16_nhwc_enabled ? "on" : "off",
             dec->cutlass_1x1_enabled ? "on" : "off",
             dec->cutlass_3x3_enabled ? "on" : "off",
             dec->conv3x3_tile_cols,
@@ -2319,14 +2382,108 @@ static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, co
 }
 
 static int taehv_run_conv_h_nhwc(DeviceVaeDecoder *dec, const __half *in, __half *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
-    (void)dec;
-    (void)in;
-    (void)out;
-    (void)conv;
-    (void)N;
-    (void)H;
-    (void)W;
-    return 1;
+    if (!in || !out || !conv || !conv->weight_krsc_h) return 1;
+    if (conv->has_bias && !conv->bias_h) return 1;
+    if (conv->kernel != 1 && conv->kernel != 3) return 1;
+
+    using Layout = cutlass::layout::TensorNHWC;
+    using Element = cutlass::half_t;
+    using Conv2dFpropKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+        Element,
+        Layout,
+        Element,
+        Layout,
+        Element,
+        Layout,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 64, 32>,
+        cutlass::gemm::GemmShape<64, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<Element, 1, float, float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        3,
+        cutlass::arch::OpMultiplyAdd,
+        cutlass::conv::IteratorAlgorithm::kAnalytic,
+        cutlass::conv::StrideSupport::kUnity,
+        8,
+        8>::Kernel;
+    using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel>;
+
+    int K = conv->kernel;
+    int pad = K / 2;
+    cutlass::Tensor4DCoord input_size(N, H, W, conv->in_c);
+    cutlass::Tensor4DCoord filter_size(conv->out_c, K, K, conv->in_c);
+    cutlass::Tensor4DCoord padding(pad, pad, pad, pad);
+    cutlass::MatrixCoord stride(1, 1);
+    cutlass::MatrixCoord dilation(1, 1);
+    cutlass::Tensor4DCoord output_size(N, H, W, conv->out_c);
+    cutlass::conv::Conv2dProblemSize problem(
+        input_size,
+        filter_size,
+        padding,
+        stride,
+        dilation,
+        output_size,
+        cutlass::conv::Mode::kCrossCorrelation,
+        1);
+
+    Element *in_ptr = const_cast<Element *>(reinterpret_cast<const Element *>(in));
+    Element *weight_ptr = const_cast<Element *>(reinterpret_cast<const Element *>(conv->weight_krsc_h));
+    Element *out_ptr = reinterpret_cast<Element *>(out);
+    typename ImplicitGemm::Arguments args(
+        problem,
+        cutlass::TensorRef<Element, Layout>(in_ptr, Layout::packed(input_size)),
+        cutlass::TensorRef<Element, Layout>(weight_ptr, Layout::packed(filter_size)),
+        cutlass::TensorRef<Element, Layout>(out_ptr, Layout::packed(output_size)),
+        cutlass::TensorRef<Element, Layout>(out_ptr, Layout::packed(output_size)),
+        {1.0f, 0.0f});
+
+    ImplicitGemm implicit_gemm;
+    CUTLASS_OK(implicit_gemm.can_implement(args));
+    size_t workspace_size = implicit_gemm.get_workspace_size(args);
+    void *workspace = NULL;
+    if (workspace_size > 0) {
+        CUDA_OK(cudaMalloc(&workspace, workspace_size));
+    }
+    if (taehv_profile_begin(dec)) {
+        cudaFree(workspace);
+        return 1;
+    }
+    cutlass::Status status = implicit_gemm(args, workspace, 0);
+    cudaFree(workspace);
+    if (status != cutlass::Status::kSuccess) {
+        fprintf(stderr, "CUTLASS error %s:%d: %s\n", __FILE__, __LINE__, cutlassGetStatusString(status));
+        return 1;
+    }
+    CUDA_OK(cudaGetLastError());
+    if (conv->kernel == 1) {
+        if (taehv_profile_accum(dec, &dec->prof_1x1_gemm_ms)) return 1;
+        if (dec && dec->profile_enabled) {
+            dec->prof_1x1_calls++;
+            dec->prof_1x1_gemm_launches++;
+        }
+    } else {
+        if (taehv_profile_accum(dec, &dec->prof_3x3_gemm_ms)) return 1;
+        if (dec && dec->profile_enabled) {
+            dec->prof_3x3_calls++;
+            dec->prof_3x3_tiles++;
+        }
+    }
+
+    if (conv->has_bias) {
+        int64_t total = (int64_t)N * H * W * conv->out_c;
+        if (taehv_profile_begin(dec)) return 1;
+        taehv_add_bias_nhwc_h_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias_h, total, conv->out_c);
+        CUDA_OK(cudaGetLastError());
+        if (conv->kernel == 1) {
+            if (taehv_profile_accum(dec, &dec->prof_1x1_bias_ms)) return 1;
+        } else {
+            if (taehv_profile_accum(dec, &dec->prof_3x3_bias_ms)) return 1;
+        }
+    }
+    return 0;
 }
 
 static int taehv_run_relu(float *x, int64_t n) {
