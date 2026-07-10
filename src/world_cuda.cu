@@ -1814,6 +1814,20 @@ typedef struct {
     int cutlass_3x3_enabled;
     int conv3x3_tile_cols;
     size_t conv3x3_cols_elems;
+    int profile_enabled;
+    cudaEvent_t prof_start;
+    cudaEvent_t prof_stop;
+    float prof_direct_ms;
+    float prof_1x1_gemm_ms;
+    float prof_1x1_bias_ms;
+    float prof_3x3_im2col_ms;
+    float prof_3x3_gemm_ms;
+    float prof_3x3_bias_ms;
+    int prof_direct_calls;
+    int prof_1x1_calls;
+    int prof_1x1_gemm_launches;
+    int prof_3x3_calls;
+    int prof_3x3_tiles;
 } DeviceVaeDecoder;
 
 static void taehv_pick_scratch(float *cur, float *buf0, float *buf1, float *buf2, float **tmp, float **aux) {
@@ -1883,6 +1897,8 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     cudaFree(dec->hbuf2);
     cudaFree(dec->d_rgb);
     cudaFreeHost(dec->h_rgb);
+    if (dec->prof_start) cudaEventDestroy(dec->prof_start);
+    if (dec->prof_stop) cudaEventDestroy(dec->prof_stop);
     memset(dec, 0, sizeof(*dec));
 }
 
@@ -1901,8 +1917,10 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     dec->rgb_elems = (size_t)4 * dec->out_h * dec->out_w * 3;
     const char *vae_1x1_env = getenv("WORLD_VAE_1X1_GEMM");
     const char *vae_3x3_env = getenv("WORLD_VAE_3X3_GEMM");
+    const char *vae_profile_env = getenv("WORLD_VAE_PROFILE");
     dec->cutlass_1x1_enabled = vae_1x1_env ? vae_1x1_env[0] != '0' : 1;
     dec->cutlass_3x3_enabled = vae_3x3_env ? vae_3x3_env[0] != '0' : 1;
+    dec->profile_enabled = vae_profile_env ? vae_profile_env[0] != '0' : 0;
     dec->conv3x3_tile_cols = 4096;
 
 #define VAE_INIT_CUDA(expr) do { \
@@ -1919,6 +1937,10 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
+    if (dec->profile_enabled) {
+        VAE_INIT_CUDA(cudaEventCreate(&dec->prof_start));
+        VAE_INIT_CUDA(cudaEventCreate(&dec->prof_stop));
+    }
     if (dec->cutlass_3x3_enabled) {
         int max_k_elems = 0;
         for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
@@ -1940,12 +1962,13 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
         }
     }
 
-    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s, pinned RGB host buffer\n",
+    fprintf(stderr, "VAE decoder init: RGB %dx%d, scratch %.2f MiB x3, F32/NCHW conv, 1x1 CUTLASS GEMM %s, 3x3 CUTLASS GEMM %s, profiling %s, pinned RGB host buffer\n",
             dec->out_w,
             dec->out_h,
             (double)(dec->max_elems * sizeof(float)) / (1024.0 * 1024.0),
             dec->cutlass_1x1_enabled ? "on" : "off",
-            dec->cutlass_3x3_enabled ? "on" : "off");
+            dec->cutlass_3x3_enabled ? "on" : "off",
+            dec->profile_enabled ? "on" : "off");
 #undef VAE_INIT_CUDA
     return 0;
 
@@ -1955,7 +1978,55 @@ fail:
     return 1;
 }
 
+static void taehv_profile_reset(DeviceVaeDecoder *dec) {
+    if (!dec || !dec->profile_enabled) return;
+    dec->prof_direct_ms = 0.0f;
+    dec->prof_1x1_gemm_ms = 0.0f;
+    dec->prof_1x1_bias_ms = 0.0f;
+    dec->prof_3x3_im2col_ms = 0.0f;
+    dec->prof_3x3_gemm_ms = 0.0f;
+    dec->prof_3x3_bias_ms = 0.0f;
+    dec->prof_direct_calls = 0;
+    dec->prof_1x1_calls = 0;
+    dec->prof_1x1_gemm_launches = 0;
+    dec->prof_3x3_calls = 0;
+    dec->prof_3x3_tiles = 0;
+}
+
+static int taehv_profile_begin(DeviceVaeDecoder *dec) {
+    if (!dec || !dec->profile_enabled) return 0;
+    CUDA_OK(cudaEventRecord(dec->prof_start, 0));
+    return 0;
+}
+
+static int taehv_profile_accum(DeviceVaeDecoder *dec, float *accum) {
+    if (!dec || !dec->profile_enabled) return 0;
+    float ms = 0.0f;
+    CUDA_OK(cudaEventRecord(dec->prof_stop, 0));
+    CUDA_OK(cudaEventSynchronize(dec->prof_stop));
+    CUDA_OK(cudaEventElapsedTime(&ms, dec->prof_start, dec->prof_stop));
+    *accum += ms;
+    return 0;
+}
+
+static void taehv_profile_print(const DeviceVaeDecoder *dec) {
+    if (!dec || !dec->profile_enabled) return;
+    fprintf(stderr,
+            "VAE profile: direct=%.3fms/%d calls 1x1_gemm=%.3fms/%d launches 1x1_bias=%.3fms 3x3_im2col=%.3fms/%d tiles 3x3_gemm=%.3fms/%d tiles 3x3_bias=%.3fms\n",
+            dec->prof_direct_ms,
+            dec->prof_direct_calls,
+            dec->prof_1x1_gemm_ms,
+            dec->prof_1x1_gemm_launches,
+            dec->prof_1x1_bias_ms,
+            dec->prof_3x3_im2col_ms,
+            dec->prof_3x3_tiles,
+            dec->prof_3x3_gemm_ms,
+            dec->prof_3x3_tiles,
+            dec->prof_3x3_bias_ms);
+}
+
 static int taehv_run_conv1x1_cutlass_nchw(
+        DeviceVaeDecoder *dec,
         const float *in,
         float *out,
         const DeviceVaeConvWeight *conv,
@@ -1993,15 +2064,21 @@ static int taehv_run_conv1x1_cutlass_nchw(
             {out_frame, spatial},
             {out_frame, spatial},
             {1.0f, 0.0f});
+        if (taehv_profile_begin(dec)) return 1;
         CUTLASS_OK(gemm(args));
+        if (taehv_profile_accum(dec, &dec->prof_1x1_gemm_ms)) return 1;
+        if (dec && dec->profile_enabled) dec->prof_1x1_gemm_launches++;
     }
     CUDA_OK(cudaGetLastError());
 
     if (conv->has_bias) {
         int64_t total = (int64_t)N * conv->out_c * H * W;
+        if (taehv_profile_begin(dec)) return 1;
         taehv_add_bias_nchw_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias, N, conv->out_c, H, W);
         CUDA_OK(cudaGetLastError());
+        if (taehv_profile_accum(dec, &dec->prof_1x1_bias_ms)) return 1;
     }
+    if (dec && dec->profile_enabled) dec->prof_1x1_calls++;
     return 0;
 }
 
@@ -2043,9 +2120,11 @@ static int taehv_run_conv3x3_cutlass_nchw(
         for (int tile_start = 0; tile_start < spatial; tile_start += dec->conv3x3_tile_cols) {
             int tile_cols = spatial - tile_start;
             if (tile_cols > dec->conv3x3_tile_cols) tile_cols = dec->conv3x3_tile_cols;
+            if (taehv_profile_begin(dec)) return 1;
             taehv_im2col3x3_nchw_tile_kernel<<<div_up_i64((int64_t)k_elems * tile_cols, 256), 256>>>(
                 in, dec->conv3x3_cols, conv->in_c, H, W, n, tile_start, tile_cols);
             CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_im2col_ms)) return 1;
 
             typename Gemm::Arguments args(
                 {conv->out_c, tile_cols, k_elems},
@@ -2054,30 +2133,39 @@ static int taehv_run_conv3x3_cutlass_nchw(
                 {out_frame + tile_start, spatial},
                 {out_frame + tile_start, spatial},
                 {1.0f, 0.0f});
+            if (taehv_profile_begin(dec)) return 1;
             CUTLASS_OK(gemm(args));
             CUDA_OK(cudaGetLastError());
+            if (taehv_profile_accum(dec, &dec->prof_3x3_gemm_ms)) return 1;
+            if (dec->profile_enabled) dec->prof_3x3_tiles++;
         }
     }
 
     if (conv->has_bias) {
         int64_t total = (int64_t)N * conv->out_c * H * W;
+        if (taehv_profile_begin(dec)) return 1;
         taehv_add_bias_nchw_kernel<<<div_up_i64(total, 256), 256>>>(out, conv->bias, N, conv->out_c, H, W);
         CUDA_OK(cudaGetLastError());
+        if (taehv_profile_accum(dec, &dec->prof_3x3_bias_ms)) return 1;
     }
+    if (dec->profile_enabled) dec->prof_3x3_calls++;
     return 0;
 }
 
 static int taehv_run_conv(DeviceVaeDecoder *dec, const float *in, float *out, const DeviceVaeConvWeight *conv, int N, int H, int W) {
     if (dec && dec->cutlass_1x1_enabled && conv->kernel == 1) {
-        return taehv_run_conv1x1_cutlass_nchw(in, out, conv, N, H, W);
+        return taehv_run_conv1x1_cutlass_nchw(dec, in, out, conv, N, H, W);
     }
     if (dec && dec->cutlass_3x3_enabled && conv->kernel == 3) {
         return taehv_run_conv3x3_cutlass_nchw(dec, in, out, conv, N, H, W);
     }
     int64_t total = (int64_t)N * conv->out_c * H * W;
+    if (taehv_profile_begin(dec)) return 1;
     taehv_conv2d_nchw_kernel<<<div_up_i64(total, 256), 256>>>(
         in, conv->weight, conv->bias, out, N, conv->in_c, conv->out_c, H, W, conv->kernel, conv->has_bias);
     CUDA_OK(cudaGetLastError());
+    if (taehv_profile_accum(dec, &dec->prof_direct_ms)) return 1;
+    if (dec && dec->profile_enabled) dec->prof_direct_calls++;
     return 0;
 }
 
@@ -2357,6 +2445,7 @@ static int world_cuda_decode_vae_to_rgb(
     float *aux = NULL;
 
     fprintf(stderr, "VAE decode: latent [%d,%d,%d] -> RGB %dx%d\n", C_latent, H0, W0, dec->out_w, dec->out_h);
+    taehv_profile_reset(dec);
 
     taehv_repeat_latent4_kernel<<<div_up_i64((int64_t)4 * C * H * W, 256), 256>>>(d_latent, cur, C, H, W);
     CUDA_OK(cudaGetLastError());
@@ -2426,6 +2515,7 @@ static int world_cuda_decode_vae_to_rgb(
     CUDA_OK(cudaGetLastError());
     CUDA_OK(cudaMemcpy(dec->h_rgb, dec->d_rgb, dec->rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
+    taehv_profile_print(dec);
     if (rgb_out) *rgb_out = dec->h_rgb;
     if (frame_count_out) *frame_count_out = 4;
     if (width_out) *width_out = dec->out_w;

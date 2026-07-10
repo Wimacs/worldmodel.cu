@@ -51,7 +51,9 @@ VAE：
 - 3x3 conv 已接入 tiled im2col + CUTLASS GEMM baseline：每次 materialize `K = Cin*3*3` 和最多 4096 个 spatial column，做 `weight[Cout,K] x cols[K,tile] -> out[Cout,tile]`。这样避免完整 im2col 在后段高分辨率层爆显存。
 - `WORLD_VAE_1X1_GEMM=0` 可以回退旧 direct 1x1 conv，用于性能和数值定位。
 - `WORLD_VAE_3X3_GEMM=0` 可以回退旧 direct 3x3 conv，用于性能和数值定位。
+- `WORLD_VAE_PROFILE=1` 会在 VAE conv 内部打开 CUDA event 分段计时，输出 direct、1x1 GEMM、3x3 im2col/GEMM/bias 时间。这个模式会同步每段 kernel，只用于诊断，不用于正常 FPS。
 - 当前 1-layer/4-step headless smoke 对照：1x1+3x3 CUTLASS `vae=101.938ms`；只开 1x1 CUTLASS `vae=265.237ms`；全 direct conv `vae=294.243ms`。
+- 当前 profiling 结果：`1x1_gemm=1.311ms/16 launches`，`3x3_im2col=27.154ms/1784 tiles`，`3x3_gemm=65.232ms/1784 tiles`，`3x3_bias=1.518ms`。下一步的大头是 3x3 GEMM 和 1784 次 tile/launch，而不是 bias。
 
 Attention：
 
@@ -146,7 +148,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 
 1. 1x1 conv 已改成 per-frame CUTLASS GEMM，不需要 im2row buffer。
 2. 3x3 conv 已改成 tiled im2col + CUTLASS GEMM baseline。
-3. 下一版如果继续攻 VAE，应先看 profile：若 im2col kernel 或 tile GEMM launch count 是大头，再换 CUTLASS implicit-GEMM conv 或更少 launch 的 grouped/batched GEMM。
+3. profiling 显示 3x3 GEMM 与 tile launch count 是大头；下一版优先减少 3x3 tile launch，路线是 CUTLASS implicit-GEMM conv 或 grouped/batched GEMM，而不是继续只调当前 tile。
 4. 最后考虑 NHWC/FP16 全路径和 bias/ReLU fusion。
 
 ## 对拍规则
