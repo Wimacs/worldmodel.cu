@@ -119,6 +119,81 @@ __global__ static void add_channel_silu_inplace_f32_kernel(float *x, const float
     if (i < n) x[i] = wm_silu(x[i] + bias[i % D]);
 }
 
+template <
+    typename ElementOutput_,
+    int Count,
+    typename ElementAccumulator_ = float,
+    typename ElementCompute_ = float>
+class LinearCombinationSilu {
+public:
+    using ElementOutput = ElementOutput_;
+    using ElementSource = ElementOutput_;
+    using ElementAccumulator = ElementAccumulator_;
+    using ElementCompute = ElementCompute_;
+    using ElementScalar = ElementCompute;
+    using ElementC = ElementSource;
+    using ElementD = ElementOutput;
+
+    static int const kCount = Count;
+    using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
+    using FragmentSource = cutlass::Array<ElementSource, kCount>;
+    using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+    using FragmentCompute = cutlass::Array<ElementCompute, kCount>;
+
+    struct Params {
+        ElementCompute alpha;
+
+        CUTLASS_HOST_DEVICE
+        Params(): alpha(ElementCompute(1)) {}
+
+        CUTLASS_HOST_DEVICE
+        Params(ElementCompute alpha_, ElementCompute = ElementCompute(0)): alpha(alpha_) {}
+    };
+
+private:
+    ElementCompute alpha_;
+
+public:
+    CUTLASS_HOST_DEVICE
+    LinearCombinationSilu(Params const &params, int = 0): alpha_(params.alpha) {}
+
+    CUTLASS_HOST_DEVICE
+    bool is_source_needed() const { return false; }
+
+    CUTLASS_HOST_DEVICE
+    void set_k_partition(int, int) {}
+
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const &accumulator, FragmentSource const &) const {
+        return (*this)(accumulator);
+    }
+
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const &accumulator) const {
+        cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount> accumulator_converter;
+        cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount> output_converter;
+        FragmentCompute tmp = accumulator_converter(accumulator);
+        for (int i = 0; i < kCount; ++i) {
+            ElementCompute v = alpha_ * tmp[i];
+            tmp[i] = v / (ElementCompute(1) + expf(-v));
+        }
+        return output_converter(tmp);
+    }
+
+    CUTLASS_HOST_DEVICE
+    ElementD operator()(ElementAccumulator const accumulator, ElementC const) const {
+        return (*this)(accumulator);
+    }
+
+    CUTLASS_HOST_DEVICE
+    ElementD operator()(ElementAccumulator const accumulator) const {
+        cutlass::NumericConverter<ElementCompute, ElementAccumulator> accumulator_converter;
+        cutlass::NumericConverter<ElementD, ElementCompute> output_converter;
+        ElementCompute v = alpha_ * accumulator_converter(accumulator);
+        return output_converter(v / (ElementCompute(1) + expf(-v)));
+    }
+};
+
 __global__ static void ada_rms_norm_single_f32_kernel(
         const float *x,
         const float *scale,
@@ -1564,6 +1639,57 @@ static int row_major_linear_fp16_weight_tensorop_m64n64(
         {y_rm, n},
         {1.0f, 0.0f});
     Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
+static int row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
+        const float *x_rm,
+        __half *x_half_tmp,
+        const __half *w_rm_h,
+        __half *y_rm_h,
+        int m,
+        int k,
+        int n) {
+    int64_t x_elems = (int64_t)m * k;
+    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
+    CUDA_OK(cudaGetLastError());
+
+    using Epilogue = LinearCombinationSilu<
+        cutlass::half_t,
+        128 / cutlass::sizeof_bits<cutlass::half_t>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    cutlass::half_t *y_h = reinterpret_cast<cutlass::half_t *>(y_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_h, n},
+        {y_h, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
     CUTLASS_OK(gemm(args));
     CUDA_OK(cudaGetLastError());
     return 0;
@@ -3064,6 +3190,7 @@ struct WorldCudaRuntime {
     int frame_stride;
     int mlp_fc2_splitk_slices;
     int fp16_gemm_m64n64_enabled;
+    int mlp_fc1_silu_epilogue_enabled;
     size_t latent_elems;
     size_t token_elems;
     size_t kv_rope_elems;
@@ -3445,6 +3572,13 @@ extern "C" int world_cuda_runtime_create(
             fprintf(stderr, "MLP fc2 CUTLASS split-K enabled: slices=%d\n", rt->mlp_fc2_splitk_slices);
         }
     }
+    {
+        const char *epilogue_env = getenv("WORLD_MLP_FC1_SILU_EPILOGUE");
+        rt->mlp_fc1_silu_epilogue_enabled = epilogue_env ? epilogue_env[0] != '0' : 1;
+        if (rt->mlp_fc1_silu_epilogue_enabled) {
+            fprintf(stderr, "MLP fc1 CUTLASS SiLU-to-half epilogue enabled\n");
+        }
+    }
     rt->total_passes = steps_to_run + 1;
     rt->precomputed_total_passes = rt->total_passes;
     rt->forced_pass_table_idx = -1;
@@ -3801,22 +3935,40 @@ extern "C" int world_cuda_runtime_step_rgb(
             ada_rms_norm_single_f32_kernel<<<rt->T, 256>>>(d_tokens_ctrl, d_s1, d_b1, rt->d_mlp_in, rt->T, rt->D, rt->rms_eps);
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
-            STEP_PROFILE_BEGIN();
-            STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
-                             rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
-            STEP_PROFILE_ACCUM(prof_mlp_fc1_ms, prof_mlp_fc1_calls);
             int mlp_hidden_half_ready = 0;
             STEP_PROFILE_BEGIN();
-            if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
-                silu_f32_to_f16_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
-                    rt->d_mlp_hidden, rt->d_linear_half, (int64_t)rt->T * rt->mlp_hidden);
+            if (use_fp16_gemm && use_fp16_tensorop &&
+                    rt->mlp_fc1_silu_epilogue_enabled &&
+                    lw->dit_mlp_fc1_weight_h && lw->dit_mlp_fc2_weight_h &&
+                    rt->mlp_fc2_splitk_slices > 1 &&
+                    should_use_m64n64_tensorop(rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->mlp_hidden)) {
+                if (row_major_linear_fp16_weight_tensorop_m64n64_silu_half(
+                            rt->d_mlp_in,
+                            rt->d_linear_half,
+                            lw->dit_mlp_fc1_weight_h,
+                            rt->d_linear_half,
+                            rt->T,
+                            rt->D,
+                            rt->mlp_hidden)) return 1;
                 mlp_hidden_half_ready = 1;
             } else {
-                silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
-                    rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
+                STEP_LINEAR_FAST(rt->d_mlp_in, lw->dit_mlp_fc1_weight, lw->dit_mlp_fc1_weight_h,
+                                 rt->d_mlp_hidden, rt->T, rt->D, rt->mlp_hidden);
             }
-            STEP_CUDA(cudaGetLastError());
-            STEP_PROFILE_ACCUM(prof_mlp_silu_ms, prof_mlp_silu_calls);
+            STEP_PROFILE_ACCUM(prof_mlp_fc1_ms, prof_mlp_fc1_calls);
+            if (!mlp_hidden_half_ready) {
+                STEP_PROFILE_BEGIN();
+                if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
+                    silu_f32_to_f16_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
+                        rt->d_mlp_hidden, rt->d_linear_half, (int64_t)rt->T * rt->mlp_hidden);
+                    mlp_hidden_half_ready = 1;
+                } else {
+                    silu_f32_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
+                        rt->d_mlp_hidden, rt->d_mlp_hidden, (int64_t)rt->T * rt->mlp_hidden);
+                }
+                STEP_CUDA(cudaGetLastError());
+                STEP_PROFILE_ACCUM(prof_mlp_silu_ms, prof_mlp_silu_calls);
+            }
             STEP_PROFILE_BEGIN();
             if (mlp_hidden_half_ready) {
                 if (row_major_linear_fp16_input_weight_tensorop_splitk(

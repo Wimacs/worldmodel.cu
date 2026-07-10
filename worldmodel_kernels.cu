@@ -89,6 +89,81 @@ __global__ void silu_f32_to_f16_kernel(const float *x, cutlass::half_t *y, int64
     }
 }
 
+template <
+    typename ElementOutput_,
+    int Count,
+    typename ElementAccumulator_ = float,
+    typename ElementCompute_ = float>
+class LinearCombinationSilu {
+public:
+    using ElementOutput = ElementOutput_;
+    using ElementSource = ElementOutput_;
+    using ElementAccumulator = ElementAccumulator_;
+    using ElementCompute = ElementCompute_;
+    using ElementScalar = ElementCompute;
+    using ElementC = ElementSource;
+    using ElementD = ElementOutput;
+
+    static int const kCount = Count;
+    using FragmentOutput = cutlass::Array<ElementOutput, kCount>;
+    using FragmentSource = cutlass::Array<ElementSource, kCount>;
+    using FragmentAccumulator = cutlass::Array<ElementAccumulator, kCount>;
+    using FragmentCompute = cutlass::Array<ElementCompute, kCount>;
+
+    struct Params {
+        ElementCompute alpha;
+
+        CUTLASS_HOST_DEVICE
+        Params(): alpha(ElementCompute(1)) {}
+
+        CUTLASS_HOST_DEVICE
+        Params(ElementCompute alpha_, ElementCompute = ElementCompute(0)): alpha(alpha_) {}
+    };
+
+private:
+    ElementCompute alpha_;
+
+public:
+    CUTLASS_HOST_DEVICE
+    LinearCombinationSilu(Params const &params, int = 0): alpha_(params.alpha) {}
+
+    CUTLASS_HOST_DEVICE
+    bool is_source_needed() const { return false; }
+
+    CUTLASS_HOST_DEVICE
+    void set_k_partition(int, int) {}
+
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const &accumulator, FragmentSource const &) const {
+        return (*this)(accumulator);
+    }
+
+    CUTLASS_HOST_DEVICE
+    FragmentOutput operator()(FragmentAccumulator const &accumulator) const {
+        cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, kCount> accumulator_converter;
+        cutlass::NumericArrayConverter<ElementOutput, ElementCompute, kCount> output_converter;
+        FragmentCompute tmp = accumulator_converter(accumulator);
+        for (int i = 0; i < kCount; ++i) {
+            ElementCompute v = alpha_ * tmp[i];
+            tmp[i] = v / (ElementCompute(1) + expf(-v));
+        }
+        return output_converter(tmp);
+    }
+
+    CUTLASS_HOST_DEVICE
+    ElementD operator()(ElementAccumulator const accumulator, ElementC const) const {
+        return (*this)(accumulator);
+    }
+
+    CUTLASS_HOST_DEVICE
+    ElementD operator()(ElementAccumulator const accumulator) const {
+        cutlass::NumericConverter<ElementCompute, ElementAccumulator> accumulator_converter;
+        cutlass::NumericConverter<ElementD, ElementCompute> output_converter;
+        ElementCompute v = alpha_ * accumulator_converter(accumulator);
+        return output_converter(v / (ElementCompute(1) + expf(-v)));
+    }
+};
+
 __global__ void relu_inplace_f32_kernel(float *x, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && x[i] < 0.0f) {
@@ -1472,6 +1547,63 @@ torch::Tensor row_major_linear_fp16_tensorop_m64n64_cuda(torch::Tensor x, torch:
     return y;
 }
 
+torch::Tensor row_major_linear_fp16_tensorop_m64n64_silu_half_cuda(torch::Tensor x, torch::Tensor w) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(w);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(w);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(w);
+    TORCH_CHECK(x.dim() == 2, "x must be [M,K]");
+    TORCH_CHECK(w.dim() == 2, "w must be [N,K]");
+    TORCH_CHECK(x.size(1) == w.size(1), "K mismatch");
+
+    int m = (int)x.size(0);
+    int k = (int)x.size(1);
+    int n = (int)w.size(0);
+    auto x_h = x.to(torch::kFloat16);
+    auto w_h = w.to(torch::kFloat16);
+    auto y = torch::empty({m, n}, x.options().dtype(torch::kFloat16));
+
+    using Epilogue = LinearCombinationSilu<
+        cutlass::half_t,
+        128 / cutlass::sizeof_bits<cutlass::half_t>::value,
+        float,
+        float>;
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<32, 32, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        Epilogue,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
+
+    const cutlass::half_t *x_ptr = reinterpret_cast<const cutlass::half_t *>(x_h.data_ptr<at::Half>());
+    const cutlass::half_t *w_ptr = reinterpret_cast<const cutlass::half_t *>(w_h.data_ptr<at::Half>());
+    cutlass::half_t *y_ptr = reinterpret_cast<cutlass::half_t *>(y.data_ptr<at::Half>());
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_ptr, k},
+        {w_ptr, k},
+        {y_ptr, n},
+        {y_ptr, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    check_cutlass_status(gemm.can_implement(args), "row_major_linear_fp16_tensorop_m64n64_silu_half.can_implement");
+    check_cutlass_status(gemm(args, nullptr, at::cuda::getCurrentCUDAStream()), "row_major_linear_fp16_tensorop_m64n64_silu_half");
+    check_last_cuda_error("row_major_linear_fp16_tensorop_m64n64_silu_half");
+    return y;
+}
+
 torch::Tensor row_major_linear_fp16_tensorop_splitk_cuda(torch::Tensor x, torch::Tensor w, int64_t split_k_slices_arg) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(w);
@@ -2775,6 +2907,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("row_major_linear_fp16", &row_major_linear_fp16_cuda, "WorldModel row-major Linear using FP16 inputs/weights and FP32 output");
     m.def("row_major_linear_fp16_tensorop", &row_major_linear_fp16_tensorop_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op and FP32 output");
     m.def("row_major_linear_fp16_tensorop_m64n64", &row_major_linear_fp16_tensorop_m64n64_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile and FP32 output");
+    m.def("row_major_linear_fp16_tensorop_m64n64_silu_half", &row_major_linear_fp16_tensorop_m64n64_silu_half_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op 64x64 tile, SiLU epilogue, and FP16 output");
     m.def("row_major_linear_fp16_tensorop_splitk", &row_major_linear_fp16_tensorop_splitk_cuda, "WorldModel row-major Linear using CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("row_major_linear_fp16_input_tensorop_splitk", &row_major_linear_fp16_input_tensorop_splitk_cuda, "WorldModel row-major Linear using half input/weight CUTLASS FP16 tensor-op split-K and FP32 output", py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("rms_norm", &rms_norm_cuda, "WorldModel RMSNorm (CUDA, f32)", py::arg("x"), py::arg("eps") = 1.0e-6);
