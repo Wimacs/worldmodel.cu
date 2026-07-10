@@ -172,8 +172,8 @@ Linux：
 
 控制：
 
-- `WASD`: 移动
-- `Space`: 跳
+- `W` / `Space`: 前进，送入模型的 PyTorch button id 是 `32`
+- `A` / `D` / `S`: 左 / 右 / 后退，送入模型的 PyTorch button id 分别是 `65` / `68` / `83`
 - `Shift`: 冲刺
 - 鼠标: 转向
 - 鼠标左右键: 按钮输入
@@ -270,7 +270,7 @@ Vulkan shader probe：
 - `--latent FILE`: 载入外部 little-endian float32 latent
 - `--vae-only --latent FILE --out FILE`: 只调试 TAEHV decode
 
-raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和滚轮，映射到 PyTorch controller layout。CUDA generation 在 worker thread 里跑，主线程继续轮询输入；收到新 decoded chunk 后按顺序播放一次，然后停在最后一帧等待下一个 chunk。`WORLD_CONTROL_DEBUG=1` 会打印每个 chunk 实际送入模型的 mouse/button/wheel。
+raylib 前端会采样 WASD、Space、Shift、鼠标左右键、鼠标 delta 和滚轮，映射到 PyTorch `examples/gen_sample.py` 里使用的 controller layout。CUDA generation 在 worker thread 里跑，主线程继续轮询输入；收到新 decoded chunk 后按顺序播放一次，然后停在最后一帧等待下一个 chunk。`WORLD_CONTROL_DEBUG=1` 会打印每个 chunk 实际送入模型的 mouse/button id/wheel；按下物理 `W` 时应看到 `buttons={32}`，不是键盘扫描码 `87`。
 
 ## 7. CUDA/CUTLASS 状态
 

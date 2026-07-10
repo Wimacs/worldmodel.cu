@@ -135,15 +135,14 @@ typedef struct {
 } LiveShared;
 
 enum {
-    WORLD_VK_LMB = 0x01,
-    WORLD_VK_RMB = 0x02,
-    WORLD_VK_SHIFT = 0x10,
-    WORLD_VK_SPACE = 0x20,
-    WORLD_VK_A = 0x41,
-    WORLD_VK_D = 0x44,
-    WORLD_VK_S = 0x53,
-    WORLD_VK_W = 0x57,
-    WORLD_VK_LSHIFT = 0xA0,
+    WORLD_CTRL_LMB = 0x01,
+    WORLD_CTRL_RMB = 0x02,
+    WORLD_CTRL_SHIFT = 0x10,
+    WORLD_CTRL_FORWARD = 0x20,
+    WORLD_CTRL_LEFT = 0x41,
+    WORLD_CTRL_RIGHT = 0x44,
+    WORLD_CTRL_BACK = 0x53,
+    WORLD_CTRL_LSHIFT = 0xA0,
 };
 
 static void ray_usage(const char *argv0) {
@@ -290,15 +289,14 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
     if (ctrl_dim >= n_buttons + 3) {
         control[0] = clamp_mouse_axis(delta.x * mouse_scale * 0.01f);
         control[1] = clamp_mouse_axis(delta.y * mouse_scale * 0.01f);
-        set_button_vk(control, n_buttons, WORLD_VK_W, IsKeyDown(KEY_W));
-        set_button_vk(control, n_buttons, WORLD_VK_S, IsKeyDown(KEY_S));
-        set_button_vk(control, n_buttons, WORLD_VK_A, IsKeyDown(KEY_A));
-        set_button_vk(control, n_buttons, WORLD_VK_D, IsKeyDown(KEY_D));
-        set_button_vk(control, n_buttons, WORLD_VK_SPACE, IsKeyDown(KEY_SPACE));
-        set_button_vk(control, n_buttons, WORLD_VK_SHIFT, IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
-        set_button_vk(control, n_buttons, WORLD_VK_LSHIFT, IsKeyDown(KEY_LEFT_SHIFT));
-        set_button_vk(control, n_buttons, WORLD_VK_LMB, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-        set_button_vk(control, n_buttons, WORLD_VK_RMB, IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
+        set_button_vk(control, n_buttons, WORLD_CTRL_FORWARD, IsKeyDown(KEY_W) || IsKeyDown(KEY_SPACE));
+        set_button_vk(control, n_buttons, WORLD_CTRL_BACK, IsKeyDown(KEY_S));
+        set_button_vk(control, n_buttons, WORLD_CTRL_LEFT, IsKeyDown(KEY_A));
+        set_button_vk(control, n_buttons, WORLD_CTRL_RIGHT, IsKeyDown(KEY_D));
+        set_button_vk(control, n_buttons, WORLD_CTRL_SHIFT, IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
+        set_button_vk(control, n_buttons, WORLD_CTRL_LSHIFT, IsKeyDown(KEY_LEFT_SHIFT));
+        set_button_vk(control, n_buttons, WORLD_CTRL_LMB, IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+        set_button_vk(control, n_buttons, WORLD_CTRL_RMB, IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
         control[2 + n_buttons] = clamp_scroll_sign(GetMouseWheelMove());
     }
 }
@@ -348,12 +346,22 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         if (stop) break;
         if (s->control_debug_enabled && s->ctrl_dim >= s->n_buttons + 3) {
             int active_buttons = 0;
+            char active_ids[256];
+            size_t active_len = 0;
+            active_ids[0] = '\0';
             for (int i = 0; i < s->n_buttons; ++i) {
-                if (control[2 + i] > 0.5f) ++active_buttons;
+                if (control[2 + i] > 0.5f) {
+                    if (active_len + 8 < sizeof(active_ids)) {
+                        int n = snprintf(active_ids + active_len, sizeof(active_ids) - active_len,
+                                         "%s%d", active_buttons ? "," : "", i);
+                        if (n > 0) active_len += (size_t)n;
+                    }
+                    ++active_buttons;
+                }
             }
             fprintf(stderr,
-                    "raylib control: mouse=(%.4f, %.4f) active_buttons=%d wheel=%.0f\n",
-                    control[0], control[1], active_buttons, control[2 + s->n_buttons]);
+                    "raylib control: mouse=(%.4f, %.4f) buttons={%s} wheel=%.0f\n",
+                    control[0], control[1], active_ids, control[2 + s->n_buttons]);
         }
 
         const unsigned char *pixels = NULL;
