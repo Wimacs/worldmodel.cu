@@ -646,13 +646,12 @@ __global__ static void gather_indexed_kv_d64_hq_f16_kernel(
         const __half *__restrict__ cache_k,
         const __half *__restrict__ cache_v,
         const int64_t *__restrict__ indices,
-        const int *__restrict__ index_count,
+        int Nkv,
         __half *__restrict__ k_compact,
         __half *__restrict__ v_compact,
         int Hq,
         int Hkv,
         int Tk) {
-    int Nkv = *index_count;
     if (Nkv < 0) Nkv = 0;
     if (Nkv > Tk) Nkv = Tk;
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2170,7 +2169,7 @@ static int indexed_attention_cache_d64_cutlass_f16_kv(
         const __half *cache_k,
         const __half *cache_v,
         const int64_t *indices,
-        const int *index_count,
+        int Nkv,
         float *out_tokens,
         __half *q_h,
         __half *k_compact,
@@ -2182,8 +2181,6 @@ static int indexed_attention_cache_d64_cutlass_f16_kv(
         int Tq,
         int Tk,
         float scale) {
-    int Nkv = 0;
-    CUDA_OK(cudaMemcpy(&Nkv, index_count, sizeof(int), cudaMemcpyDeviceToHost));
     if (Nkv < 0) Nkv = 0;
     if (Nkv > Tk) Nkv = Tk;
     if (Nkv <= 0) {
@@ -2197,7 +2194,7 @@ static int indexed_attention_cache_d64_cutlass_f16_kv(
 
     int64_t kv_compact_elems = (int64_t)Hq * Nkv * 64;
     gather_indexed_kv_d64_hq_f16_kernel<<<div_up_i64(kv_compact_elems, 256), 256>>>(
-        cache_k, cache_v, indices, index_count, k_compact, v_compact, Hq, Hkv, Tk);
+        cache_k, cache_v, indices, Nkv, k_compact, v_compact, Hq, Hkv, Tk);
     CUDA_OK(cudaGetLastError());
 
     using GemmQK = cutlass::gemm::device::GemmBatched<
@@ -2381,13 +2378,39 @@ typedef struct {
     __half *k_h;
     __half *v_h;
     bool *written;
+    unsigned char *h_slot_written;
     int64_t *indices;
     int *index_count;
     int ring_length;
     int capacity;
+    int slot_count;
     int pinned_dilation;
     int is_global;
 } DeviceWorldLayerCache;
+
+static int cache_host_index_count(const DeviceWorldLayerCache *cache, int T, int base, bool write_step) {
+    if (!cache || !cache->h_slot_written || T <= 0 || cache->slot_count <= 0) return 0;
+    int base_slot = base / T;
+    int written_slots = 0;
+    for (int slot = 0; slot < cache->slot_count; ++slot) {
+        int slot_written = cache->h_slot_written[slot] != 0;
+        if (write_step && slot == base_slot) slot_written = 0;
+        if (slot_written) ++written_slots;
+    }
+    return written_slots * T;
+}
+
+static void cache_host_note_upsert(DeviceWorldLayerCache *cache, int T, int base, bool write_step, bool frozen) {
+    if (!cache || !cache->h_slot_written || T <= 0 || cache->slot_count <= 0) return;
+    int tail_slot = cache->slot_count - 1;
+    cache->h_slot_written[tail_slot] = 1;
+    if (!frozen && write_step) {
+        int base_slot = base / T;
+        if (base_slot >= 0 && base_slot < tail_slot) {
+            cache->h_slot_written[base_slot] = 1;
+        }
+    }
+}
 
 static int positive_mod_int(int x, int m) {
     int r = x % m;
@@ -2426,6 +2449,7 @@ static void free_device_world_caches(DeviceWorldLayerCache *caches, int n_layers
         cudaFree(caches[i].written);
         cudaFree(caches[i].indices);
         cudaFree(caches[i].index_count);
+        free(caches[i].h_slot_written);
     }
     free(caches);
 }
@@ -2452,7 +2476,9 @@ static int alloc_device_world_caches(
         if (window <= 0 || c->pinned_dilation <= 0) goto fail;
         c->ring_length = window * T;
         c->capacity = c->ring_length + T;
+        c->slot_count = c->capacity / T;
         if (c->ring_length % T != 0 || ((c->ring_length / T) % c->pinned_dilation) != 0) goto fail;
+        if (c->slot_count <= 0 || c->slot_count * T != c->capacity) goto fail;
 
         size_t kv_elems = (size_t)n_kv_heads * c->capacity * d_head;
         if (cudaMalloc((void **)&c->k, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
@@ -2464,6 +2490,9 @@ static int alloc_device_world_caches(
         if (cudaMalloc((void **)&c->written, (size_t)c->capacity * sizeof(bool)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->indices, (size_t)c->capacity * sizeof(int64_t)) != cudaSuccess) goto fail;
         if (cudaMalloc((void **)&c->index_count, sizeof(int)) != cudaSuccess) goto fail;
+        c->h_slot_written = (unsigned char *)calloc((size_t)c->slot_count, sizeof(unsigned char));
+        if (!c->h_slot_written) goto fail;
+        c->h_slot_written[c->slot_count - 1] = 1;
         if (cudaMemset(c->k, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (cudaMemset(c->v, 0, kv_elems * sizeof(float)) != cudaSuccess) goto fail;
         if (alloc_half_cache) {
@@ -4474,6 +4503,7 @@ extern "C" int world_cuda_runtime_step_rgb(
             int num_buckets = (cache->ring_length / rt->T) / cache->pinned_dilation;
             int base = (bucket % num_buckets) * rt->T;
             bool write_step = (current_frame_idx % cache->pinned_dilation) == 0;
+            int host_index_count = cache_host_index_count(cache, rt->T, base, write_step);
             if (rt->attn_half_cache_enabled) {
                 kv_cache_upsert_copy_f16_kernel<<<div_up_i64((int64_t)cfg->n_kv_heads * rt->T * rt->d_head, 256), 256>>>(
                     cache->k_h, cache->v_h, rt->d_k, d_v_cur, cache->written,
@@ -4488,6 +4518,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                 cache->written, cache->indices, cache->index_count,
                 cache->capacity, rt->T, base, write_step);
             STEP_CUDA(cudaGetLastError());
+            cache_host_note_upsert(cache, rt->T, base, write_step, (bool)frozen_pass);
             STEP_PROFILE_ACCUM(prof_cache_ms, prof_cache_calls);
             STEP_PROFILE_BEGIN();
             if (rt->d_head == 64) {
@@ -4500,7 +4531,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                                     cache->k_h,
                                     cache->v_h,
                                     cache->indices,
-                                    cache->index_count,
+                                    host_index_count,
                                     rt->d_attn,
                                     rt->d_attn_q_half,
                                     rt->d_attn_k_compact,
