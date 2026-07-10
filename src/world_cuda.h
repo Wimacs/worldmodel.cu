@@ -162,6 +162,13 @@ int world_cuda_vae_decode_probe(
         const WorldVaeDecoderWeights *vae,
         const char *out_path);
 
+int world_cuda_vae_decode_sequence_probe(
+        const WorldConfig *cfg,
+        const float *latents,
+        int latent_count,
+        const WorldVaeDecoderWeights *vae,
+        const char *out_path);
+
 int world_cuda_runtime_create(
         WorldCudaRuntime **out,
         const WorldConfig *cfg,

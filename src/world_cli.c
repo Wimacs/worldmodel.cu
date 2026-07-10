@@ -355,8 +355,12 @@ int main(int argc, char **argv) {
                               (size_t)(cfg.width * cfg.patch_w);
         int rc = 1;
         if (load_vae_decoder_weights(vae_weights, &vae)) goto vae_only_cleanup;
-        if (read_f32_file_exact(latent_path, latent_elems, &latent)) goto vae_only_cleanup;
-        rc = world_cuda_vae_decode_probe(&cfg, latent, &vae, out_path);
+        if (frames_to_run <= 0) {
+            fprintf(stderr, "invalid --frames %d, expected >= 1\n", frames_to_run);
+            goto vae_only_cleanup;
+        }
+        if (read_f32_file_exact(latent_path, latent_elems * (size_t)frames_to_run, &latent)) goto vae_only_cleanup;
+        rc = world_cuda_vae_decode_sequence_probe(&cfg, latent, frames_to_run, &vae, out_path);
 vae_only_cleanup:
         free(latent);
         free_vae_decoder_weights(&vae);

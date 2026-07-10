@@ -746,6 +746,72 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             )
 
 
+def test_vae_streaming_two_latents_matches_pytorch():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if not VAE_WEIGHTS_PATH.exists():
+        pytest.skip(f"missing VAE weights: {VAE_WEIGHTS_PATH}")
+
+    cfg = _load_config()
+    exe = _build_executable()
+    device = torch.device("cuda")
+    c = cfg["channels"]
+    ph, pw = int(cfg["patch"][0]), int(cfg["patch"][1])
+    h, w = cfg["height"] * ph, cfg["width"] * pw
+
+    with tempfile.TemporaryDirectory(prefix="world_vae_stream_probe_") as td:
+        td = Path(td)
+        latents_np = _lcg_normal_latent((2, c, h, w), 2468)
+        latent_path = td / "latents.f32"
+        latents_np.tofile(latent_path)
+
+        sys.path.insert(0, str(VAE_DIR))
+        from ae_model import ChunkedStreamingTAEHV
+
+        vae = ChunkedStreamingTAEHV.from_config(str(VAE_DIR / "config.json"))
+        vae.load_state_dict(load_file(str(VAE_WEIGHTS_PATH), device="cpu"), strict=True)
+        vae.eval().to(device=device, dtype=torch.float32)
+        refs = []
+        with torch.inference_mode():
+            for i in range(2):
+                latent = torch.from_numpy(latents_np[i : i + 1]).to(device)
+                refs.append(vae.decode(latent).cpu().numpy())
+        ref_rgb = np.concatenate(refs, axis=0)
+
+        for label, env_value, max_atol, mean_atol in [
+            ("f32_nchw", "0", 4, 0.2),
+            ("fp16_nhwc", "1", 8, 0.35),
+        ]:
+            out_path = td / f"out_{label}.ppm"
+            env = os.environ.copy()
+            env["WORLD_VAE_FP16_NHWC"] = env_value
+            subprocess.run(
+                [
+                    str(exe),
+                    "--model-dir",
+                    str(MODEL_DIR),
+                    "--vae-only",
+                    "--frames",
+                    "2",
+                    "--latent",
+                    str(latent_path),
+                    "--out",
+                    str(out_path),
+                ],
+                check=True,
+                cwd=str(ROOT),
+                env=env,
+            )
+            for frame_idx in range(8):
+                _assert_rgb_close(
+                    f"vae_stream_{label}_frame{frame_idx}",
+                    _read_ppm(_frame_path(out_path, frame_idx)),
+                    ref_rgb[frame_idx],
+                    max_atol=max_atol,
+                    mean_atol=mean_atol,
+                )
+
+
 def test_standalone_two_frame_cache_rollout_matches_pytorch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -1026,4 +1092,5 @@ if __name__ == "__main__":
     test_standalone_external_latent_dump_matches_input()
     test_standalone_layer0_probe_matches_pytorch()
     test_standalone_two_layer_transformer_matches_pytorch()
+    test_vae_streaming_two_latents_matches_pytorch()
     test_standalone_two_frame_cache_rollout_matches_pytorch()

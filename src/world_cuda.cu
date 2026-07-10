@@ -1395,6 +1395,14 @@ __global__ static void taehv_repeat_latent4_kernel(
     out[i] = latent[i % frame_elems];
 }
 
+__global__ static void taehv_copy_latent_clamp_kernel(
+        const float *latent,
+        float *out,
+        int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = tanhf(latent[i] / 3.0f) * 3.0f;
+}
+
 __global__ static void taehv_clamp_kernel(float *x, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = tanhf(x[i] / 3.0f) * 3.0f;
@@ -1557,6 +1565,30 @@ __global__ static void taehv_scatter_conv_tile_to_nchw_kernel(
     out[(int64_t)frame * C_out * spatial + (int64_t)co * spatial + pos] = tile[i];
 }
 
+__global__ static void taehv_concat_memory_nchw_kernel(
+        const float *x,
+        const float *past,
+        float *out,
+        int C,
+        int H,
+        int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)2 * C * H * W;
+    if (i >= total) return;
+
+    int w = (int)(i % W);
+    int64_t q = i / W;
+    int h = (int)(q % H);
+    q /= H;
+    int c2 = (int)q;
+    if (c2 < C) {
+        out[i] = x[((int64_t)c2 * H + h) * W + w];
+    } else {
+        int c = c2 - C;
+        out[i] = past[((int64_t)c * H + h) * W + w];
+    }
+}
+
 __global__ static void taehv_concat_past_nchw_kernel(
         const float *x,
         float *out,
@@ -1671,6 +1703,32 @@ __global__ static void taehv_pixel_shuffle_last4_u8_kernel(
     rgb[i] = (unsigned char)u;
 }
 
+__global__ static void taehv_pixel_shuffle_one_u8_kernel(
+        const float *in,
+        unsigned char *rgb,
+        int H,
+        int W) {
+    int H2 = H * 2;
+    int W2 = W * 2;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H2 * W2 * 3;
+    if (i >= total) return;
+
+    int c = (int)(i % 3);
+    int64_t q = i / 3;
+    int ox = (int)(q % W2);
+    q /= W2;
+    int oy = (int)(q % H2);
+    int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
+    float v = in[((int64_t)ic * H + oy / 2) * W + ox / 2];
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    int u = (int)floorf(v * 255.0f + 0.5f);
+    if (u < 0) u = 0;
+    if (u > 255) u = 255;
+    rgb[i] = (unsigned char)u;
+}
+
 __global__ static void taehv_repeat_latent4_clamp_nhwc_h_kernel(
         const float *latent,
         __half *out,
@@ -1679,6 +1737,24 @@ __global__ static void taehv_repeat_latent4_clamp_nhwc_h_kernel(
         int W) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t total = (int64_t)4 * H * W * C;
+    if (i >= total) return;
+    int c = (int)(i % C);
+    int64_t q = i / C;
+    int x = (int)(q % W);
+    q /= W;
+    int y = (int)(q % H);
+    float v = latent[((int64_t)c * H + y) * W + x];
+    out[i] = __float2half_rn(tanhf(v / 3.0f) * 3.0f);
+}
+
+__global__ static void taehv_copy_latent_clamp_nhwc_h_kernel(
+        const float *latent,
+        __half *out,
+        int C,
+        int H,
+        int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H * W * C;
     if (i >= total) return;
     int c = (int)(i % C);
     int64_t q = i / C;
@@ -1730,6 +1806,29 @@ __global__ static void taehv_concat_past_nhwc_h_kernel(
     } else {
         int c = c2 - C;
         out[i] = x[((((int64_t)n - 1) * H + h) * W + w) * C + c];
+    }
+}
+
+__global__ static void taehv_concat_memory_nhwc_h_kernel(
+        const __half *x,
+        const __half *past,
+        __half *out,
+        int C,
+        int H,
+        int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H * W * (2 * C);
+    if (i >= total) return;
+    int c2 = (int)(i % (2 * C));
+    int64_t q = i / (2 * C);
+    int w = (int)(q % W);
+    q /= W;
+    int h = (int)q;
+    if (c2 < C) {
+        out[i] = x[((int64_t)h * W + w) * C + c2];
+    } else {
+        int c = c2 - C;
+        out[i] = past[((int64_t)h * W + w) * C + c];
     }
 }
 
@@ -1810,6 +1909,32 @@ __global__ static void taehv_pixel_shuffle_last4_u8_nhwc_h_kernel(
     int n = N - frames + f;
     int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
     float v = __half2float(in[(((int64_t)n * H + oy / 2) * W + ox / 2) * 12 + ic]);
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    int u = (int)floorf(v * 255.0f + 0.5f);
+    if (u < 0) u = 0;
+    if (u > 255) u = 255;
+    rgb[i] = (unsigned char)u;
+}
+
+__global__ static void taehv_pixel_shuffle_one_u8_nhwc_h_kernel(
+        const __half *in,
+        unsigned char *rgb,
+        int H,
+        int W) {
+    int H2 = H * 2;
+    int W2 = W * 2;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)H2 * W2 * 3;
+    if (i >= total) return;
+
+    int c = (int)(i % 3);
+    int64_t q = i / 3;
+    int ox = (int)(q % W2);
+    q /= W2;
+    int oy = (int)(q % H2);
+    int ic = c * 4 + (oy & 1) * 2 + (ox & 1);
+    float v = __half2float(in[((int64_t)(oy / 2) * W + ox / 2) * 12 + ic]);
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     int u = (int)floorf(v * 255.0f + 0.5f);
@@ -2906,24 +3031,47 @@ typedef struct {
     int has_bias;
 } DeviceVaeConvWeight;
 
+enum {
+    WORLD_VAE_STREAM_MEM_MB3_0 = 0,
+    WORLD_VAE_STREAM_MEM_MB3_1 = 1,
+    WORLD_VAE_STREAM_MEM_MB3_2 = 2,
+    WORLD_VAE_STREAM_MEM_MB9_0 = 3,
+    WORLD_VAE_STREAM_MEM_MB9_1 = 4,
+    WORLD_VAE_STREAM_MEM_MB9_2 = 5,
+    WORLD_VAE_STREAM_MEM_MB15_0 = 6,
+    WORLD_VAE_STREAM_MEM_MB15_1 = 7,
+    WORLD_VAE_STREAM_MEM_MB15_2 = 8,
+    WORLD_VAE_STREAM_MEM_COUNT = 9,
+};
+
 typedef struct {
     DeviceVaeConvWeight convs[WORLD_VAE_DECODER_CONV_COUNT];
     float *buf0;
     float *buf1;
     float *buf2;
+    float *stream_branch0;
+    float *stream_branch1;
+    float *stream_mem[WORLD_VAE_STREAM_MEM_COUNT];
     float *conv3x3_cols;
     float *conv3x3_out_tile;
     __half *hbuf0;
     __half *hbuf1;
     __half *hbuf2;
+    __half *hstream_branch0;
+    __half *hstream_branch1;
+    __half *hstream_mem[WORLD_VAE_STREAM_MEM_COUNT];
     unsigned char *d_rgb;
     unsigned char *h_rgb;
     size_t max_elems;
     size_t rgb_elems;
+    size_t stream_branch0_elems;
+    size_t stream_branch1_elems;
     int out_w;
     int out_h;
     int H_pre_shuffle;
     int W_pre_shuffle;
+    int stream_started_f32;
+    int stream_started_h;
     int fp16_nhwc_enabled;
     int cutlass_1x1_enabled;
     int cutlass_3x3_enabled;
@@ -3019,16 +3167,46 @@ static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     cudaFree(dec->buf0);
     cudaFree(dec->buf1);
     cudaFree(dec->buf2);
+    cudaFree(dec->stream_branch0);
+    cudaFree(dec->stream_branch1);
+    for (int i = 0; i < WORLD_VAE_STREAM_MEM_COUNT; ++i) {
+        cudaFree(dec->stream_mem[i]);
+    }
     cudaFree(dec->conv3x3_cols);
     cudaFree(dec->conv3x3_out_tile);
     cudaFree(dec->hbuf0);
     cudaFree(dec->hbuf1);
     cudaFree(dec->hbuf2);
+    cudaFree(dec->hstream_branch0);
+    cudaFree(dec->hstream_branch1);
+    for (int i = 0; i < WORLD_VAE_STREAM_MEM_COUNT; ++i) {
+        cudaFree(dec->hstream_mem[i]);
+    }
     cudaFree(dec->d_rgb);
     cudaFreeHost(dec->h_rgb);
     if (dec->prof_start) cudaEventDestroy(dec->prof_start);
     if (dec->prof_stop) cudaEventDestroy(dec->prof_stop);
     memset(dec, 0, sizeof(*dec));
+}
+
+static size_t taehv_stream_mem_elems(const WorldConfig *cfg, int mem_idx) {
+    int H0 = cfg->height * cfg->patch_h;
+    int W0 = cfg->width * cfg->patch_w;
+    int C = 0;
+    int H = H0;
+    int W = W0;
+    if (mem_idx < WORLD_VAE_STREAM_MEM_MB9_0) {
+        C = 256;
+    } else if (mem_idx < WORLD_VAE_STREAM_MEM_MB15_0) {
+        C = 128;
+        H *= 2;
+        W *= 2;
+    } else {
+        C = 64;
+        H *= 4;
+        W *= 4;
+    }
+    return (size_t)C * H * W;
 }
 
 
@@ -3074,12 +3252,28 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf0, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf1, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
+    dec->stream_branch0_elems = (size_t)2 * 128 * (H0 * 4) * (W0 * 4);
+    dec->stream_branch1_elems = (size_t)2 * 64 * dec->H_pre_shuffle * dec->W_pre_shuffle;
+    VAE_INIT_CUDA(cudaMalloc((void **)&dec->stream_branch0, dec->stream_branch0_elems * sizeof(float)));
+    VAE_INIT_CUDA(cudaMalloc((void **)&dec->stream_branch1, dec->stream_branch1_elems * sizeof(float)));
+    for (int i = 0; i < WORLD_VAE_STREAM_MEM_COUNT; ++i) {
+        size_t elems = taehv_stream_mem_elems(cfg, i);
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->stream_mem[i], elems * sizeof(float)));
+        VAE_INIT_CUDA(cudaMemset(dec->stream_mem[i], 0, elems * sizeof(float)));
+    }
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->d_rgb, dec->rgb_elems));
     VAE_INIT_CUDA(cudaMallocHost((void **)&dec->h_rgb, dec->rgb_elems));
     if (dec->fp16_nhwc_enabled) {
         VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf0, dec->max_elems * sizeof(__half)));
         VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf1, dec->max_elems * sizeof(__half)));
         VAE_INIT_CUDA(cudaMalloc((void **)&dec->hbuf2, dec->max_elems * sizeof(__half)));
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->hstream_branch0, dec->stream_branch0_elems * sizeof(__half)));
+        VAE_INIT_CUDA(cudaMalloc((void **)&dec->hstream_branch1, dec->stream_branch1_elems * sizeof(__half)));
+        for (int i = 0; i < WORLD_VAE_STREAM_MEM_COUNT; ++i) {
+            size_t elems = taehv_stream_mem_elems(cfg, i);
+            VAE_INIT_CUDA(cudaMalloc((void **)&dec->hstream_mem[i], elems * sizeof(__half)));
+            VAE_INIT_CUDA(cudaMemset(dec->hstream_mem[i], 0, elems * sizeof(__half)));
+        }
     }
     if (dec->profile_enabled) {
         VAE_INIT_CUDA(cudaEventCreate(&dec->prof_start));
@@ -3568,6 +3762,320 @@ static int taehv_run_memblock_h_nhwc(
     return 0;
 }
 
+static int taehv_run_memblock_stream(
+        DeviceVaeDecoder *dec,
+        float **cur_io,
+        float *buf0,
+        float *buf1,
+        float *buf2,
+        float *mem,
+        const DeviceVaeConvWeight *conv0,
+        const DeviceVaeConvWeight *conv2,
+        const DeviceVaeConvWeight *conv4,
+        int C,
+        int H,
+        int W) {
+    float *cur = *cur_io;
+    float *tmp = NULL;
+    float *aux = NULL;
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux);
+
+    int64_t elems = (int64_t)C * H * W;
+    taehv_concat_memory_nchw_kernel<<<div_up_i64(elems * 2, 256), 256>>>(cur, mem, aux, C, H, W);
+    CUDA_OK(cudaGetLastError());
+    CUDA_OK(cudaMemcpy(mem, cur, elems * sizeof(float), cudaMemcpyDeviceToDevice));
+    if (taehv_run_conv(dec, aux, tmp, conv0, 1, H, W)) return 1;
+    if (taehv_run_relu(tmp, elems)) return 1;
+    if (taehv_run_conv(dec, tmp, aux, conv2, 1, H, W)) return 1;
+    if (taehv_run_relu(aux, elems)) return 1;
+    if (taehv_run_conv(dec, aux, tmp, conv4, 1, H, W)) return 1;
+    taehv_add_relu_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
+    CUDA_OK(cudaGetLastError());
+    *cur_io = aux;
+    return 0;
+}
+
+static int taehv_run_memblock_stream_h_nhwc(
+        DeviceVaeDecoder *dec,
+        __half **cur_io,
+        __half *buf0,
+        __half *buf1,
+        __half *buf2,
+        __half *mem,
+        const DeviceVaeConvWeight *conv0,
+        const DeviceVaeConvWeight *conv2,
+        const DeviceVaeConvWeight *conv4,
+        int C,
+        int H,
+        int W) {
+    __half *cur = *cur_io;
+    __half *tmp = NULL;
+    __half *aux = NULL;
+    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux);
+
+    int64_t elems = (int64_t)H * W * C;
+    taehv_concat_memory_nhwc_h_kernel<<<div_up_i64(elems * 2, 256), 256>>>(cur, mem, aux, C, H, W);
+    CUDA_OK(cudaGetLastError());
+    CUDA_OK(cudaMemcpy(mem, cur, elems * sizeof(__half), cudaMemcpyDeviceToDevice));
+    if (taehv_run_conv_h_nhwc(dec, aux, tmp, conv0, 1, H, W)) return 1;
+    if (taehv_run_relu_h(tmp, elems)) return 1;
+    if (taehv_run_conv_h_nhwc(dec, tmp, aux, conv2, 1, H, W)) return 1;
+    if (taehv_run_relu_h(aux, elems)) return 1;
+    if (taehv_run_conv_h_nhwc(dec, aux, tmp, conv4, 1, H, W)) return 1;
+    taehv_add_relu_nhwc_h_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
+    CUDA_OK(cudaGetLastError());
+    *cur_io = aux;
+    return 0;
+}
+
+static int taehv_stream_decode_one_f32(
+        const WorldConfig *cfg,
+        DeviceVaeDecoder *dec,
+        const float *d_latent,
+        int emit_rgb) {
+    int C_latent = cfg->channels;
+    int H0 = cfg->height * cfg->patch_h;
+    int W0 = cfg->width * cfg->patch_w;
+    int H = H0;
+    int W = W0;
+    int C = C_latent;
+
+    float *buf0 = dec->buf0;
+    float *buf1 = dec->buf1;
+    float *buf2 = dec->buf2;
+    float *cur = buf0;
+    float *tmp = NULL;
+    float *aux = NULL;
+
+    taehv_copy_latent_clamp_kernel<<<div_up_i64((int64_t)C * H * W, 256), 256>>>(
+        d_latent, cur, (int64_t)C * H * W);
+    CUDA_OK(cudaGetLastError());
+
+#define VAE_CONV_TO_STREAM(idx, out_c) do { \
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], 1, H, W)) return 1; \
+    cur = tmp; \
+    C = (out_c); \
+} while (0)
+#define VAE_RELU_STREAM() do { \
+    if (taehv_run_relu(cur, (int64_t)C * H * W)) return 1; \
+} while (0)
+#define VAE_MEMBLOCK_STREAM(mem_idx, a, b, c) do { \
+    if (taehv_run_memblock_stream(dec, &cur, buf0, buf1, buf2, dec->stream_mem[(mem_idx)], \
+                &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], C, H, W)) return 1; \
+} while (0)
+#define VAE_UPSAMPLE2_STREAM() do { \
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
+    taehv_upsample2_nchw_kernel<<<div_up_i64((int64_t)(H * 2) * (W * 2) * C, 256), 256>>>(cur, tmp, 1, C, H, W); \
+    CUDA_OK(cudaGetLastError()); \
+    cur = tmp; \
+    H *= 2; \
+    W *= 2; \
+} while (0)
+#define VAE_TGROW1_STREAM(idx) do { \
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], 1, H, W)) return 1; \
+    cur = tmp; \
+} while (0)
+
+    VAE_CONV_TO_STREAM(WORLD_VAE_DEC_CONV_IN, 256);
+    VAE_RELU_STREAM();
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB3_0, WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB3_1, WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB3_2, WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
+    VAE_UPSAMPLE2_STREAM();
+    VAE_TGROW1_STREAM(WORLD_VAE_DEC_TGROW7);
+
+    VAE_CONV_TO_STREAM(WORLD_VAE_DEC_CONV8, 128);
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB9_0, WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB9_1, WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
+    VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB9_2, WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
+    VAE_UPSAMPLE2_STREAM();
+
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux);
+    if (taehv_run_conv(dec, cur, tmp, &dec->convs[WORLD_VAE_DEC_TGROW13], 1, H, W)) return 1;
+    taehv_tgrow_reshape_kernel<<<div_up_i64((int64_t)2 * C * H * W, 256), 256>>>(tmp, dec->stream_branch0, 1, C, H, W, 2);
+    CUDA_OK(cudaGetLastError());
+
+    int branch0_C = C;
+    int branch0_H = H;
+    int branch0_W = W;
+    for (int b = 0; b < 2; ++b) {
+        int64_t branch_elems = (int64_t)branch0_C * branch0_H * branch0_W;
+        CUDA_OK(cudaMemcpy(buf0, dec->stream_branch0 + (int64_t)b * branch_elems,
+                    branch_elems * sizeof(float), cudaMemcpyDeviceToDevice));
+        cur = buf0;
+        C = branch0_C;
+        H = branch0_H;
+        W = branch0_W;
+
+        VAE_CONV_TO_STREAM(WORLD_VAE_DEC_CONV14, 64);
+        VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB15_0, WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
+        VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB15_1, WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
+        VAE_MEMBLOCK_STREAM(WORLD_VAE_STREAM_MEM_MB15_2, WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
+        VAE_UPSAMPLE2_STREAM();
+
+        taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux);
+        if (taehv_run_conv(dec, cur, tmp, &dec->convs[WORLD_VAE_DEC_TGROW19], 1, H, W)) return 1;
+        taehv_tgrow_reshape_kernel<<<div_up_i64((int64_t)2 * C * H * W, 256), 256>>>(tmp, dec->stream_branch1, 1, C, H, W, 2);
+        CUDA_OK(cudaGetLastError());
+
+        int branch1_C = C;
+        int branch1_H = H;
+        int branch1_W = W;
+        for (int s = 0; s < 2; ++s) {
+            int64_t sub_elems = (int64_t)branch1_C * branch1_H * branch1_W;
+            CUDA_OK(cudaMemcpy(buf0, dec->stream_branch1 + (int64_t)s * sub_elems,
+                        sub_elems * sizeof(float), cudaMemcpyDeviceToDevice));
+            cur = buf0;
+            C = branch1_C;
+            H = branch1_H;
+            W = branch1_W;
+
+            VAE_CONV_TO_STREAM(WORLD_VAE_DEC_CONV20, 64);
+            VAE_RELU_STREAM();
+            VAE_CONV_TO_STREAM(WORLD_VAE_DEC_CONV_OUT, 12);
+            if (emit_rgb) {
+                unsigned char *frame_rgb = dec->d_rgb + (size_t)(b * 2 + s) * dec->out_h * dec->out_w * 3;
+                taehv_pixel_shuffle_one_u8_kernel<<<div_up_i64((int64_t)dec->out_h * dec->out_w * 3, 256), 256>>>(
+                    cur, frame_rgb, H, W);
+                CUDA_OK(cudaGetLastError());
+            }
+        }
+    }
+
+#undef VAE_CONV_TO_STREAM
+#undef VAE_RELU_STREAM
+#undef VAE_MEMBLOCK_STREAM
+#undef VAE_UPSAMPLE2_STREAM
+#undef VAE_TGROW1_STREAM
+    return 0;
+}
+
+static int taehv_stream_decode_one_h_nhwc(
+        const WorldConfig *cfg,
+        DeviceVaeDecoder *dec,
+        const float *d_latent,
+        int emit_rgb) {
+    int C_latent = cfg->channels;
+    int H0 = cfg->height * cfg->patch_h;
+    int W0 = cfg->width * cfg->patch_w;
+    int H = H0;
+    int W = W0;
+    int C = C_latent;
+
+    __half *buf0 = dec->hbuf0;
+    __half *buf1 = dec->hbuf1;
+    __half *buf2 = dec->hbuf2;
+    __half *cur = buf0;
+    __half *tmp = NULL;
+    __half *aux = NULL;
+
+    taehv_copy_latent_clamp_nhwc_h_kernel<<<div_up_i64((int64_t)H * W * C, 256), 256>>>(
+        d_latent, cur, C, H, W);
+    CUDA_OK(cudaGetLastError());
+
+#define VAE_CONV_TO_STREAM_H(idx, out_c) do { \
+    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[(idx)], 1, H, W)) return 1; \
+    cur = tmp; \
+    C = (out_c); \
+} while (0)
+#define VAE_RELU_STREAM_H() do { \
+    if (taehv_run_relu_h(cur, (int64_t)H * W * C)) return 1; \
+} while (0)
+#define VAE_MEMBLOCK_STREAM_H(mem_idx, a, b, c) do { \
+    if (taehv_run_memblock_stream_h_nhwc(dec, &cur, buf0, buf1, buf2, dec->hstream_mem[(mem_idx)], \
+                &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], C, H, W)) return 1; \
+} while (0)
+#define VAE_UPSAMPLE2_STREAM_H() do { \
+    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
+    taehv_upsample2_nhwc_h_kernel<<<div_up_i64((int64_t)(H * 2) * (W * 2) * C, 256), 256>>>(cur, tmp, 1, C, H, W); \
+    CUDA_OK(cudaGetLastError()); \
+    cur = tmp; \
+    H *= 2; \
+    W *= 2; \
+} while (0)
+#define VAE_TGROW1_STREAM_H(idx) do { \
+    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[(idx)], 1, H, W)) return 1; \
+    cur = tmp; \
+} while (0)
+
+    VAE_CONV_TO_STREAM_H(WORLD_VAE_DEC_CONV_IN, 256);
+    VAE_RELU_STREAM_H();
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB3_0, WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB3_1, WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB3_2, WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
+    VAE_UPSAMPLE2_STREAM_H();
+    VAE_TGROW1_STREAM_H(WORLD_VAE_DEC_TGROW7);
+
+    VAE_CONV_TO_STREAM_H(WORLD_VAE_DEC_CONV8, 128);
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB9_0, WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB9_1, WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
+    VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB9_2, WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
+    VAE_UPSAMPLE2_STREAM_H();
+
+    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux);
+    if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[WORLD_VAE_DEC_TGROW13], 1, H, W)) return 1;
+    taehv_tgrow_reshape_nhwc_h_kernel<<<div_up_i64((int64_t)2 * H * W * C, 256), 256>>>(tmp, dec->hstream_branch0, 1, C, H, W, 2);
+    CUDA_OK(cudaGetLastError());
+
+    int branch0_C = C;
+    int branch0_H = H;
+    int branch0_W = W;
+    for (int b = 0; b < 2; ++b) {
+        int64_t branch_elems = (int64_t)branch0_H * branch0_W * branch0_C;
+        CUDA_OK(cudaMemcpy(buf0, dec->hstream_branch0 + (int64_t)b * branch_elems,
+                    branch_elems * sizeof(__half), cudaMemcpyDeviceToDevice));
+        cur = buf0;
+        C = branch0_C;
+        H = branch0_H;
+        W = branch0_W;
+
+        VAE_CONV_TO_STREAM_H(WORLD_VAE_DEC_CONV14, 64);
+        VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB15_0, WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
+        VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB15_1, WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
+        VAE_MEMBLOCK_STREAM_H(WORLD_VAE_STREAM_MEM_MB15_2, WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
+        VAE_UPSAMPLE2_STREAM_H();
+
+        taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux);
+        if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[WORLD_VAE_DEC_TGROW19], 1, H, W)) return 1;
+        taehv_tgrow_reshape_nhwc_h_kernel<<<div_up_i64((int64_t)2 * H * W * C, 256), 256>>>(tmp, dec->hstream_branch1, 1, C, H, W, 2);
+        CUDA_OK(cudaGetLastError());
+
+        int branch1_C = C;
+        int branch1_H = H;
+        int branch1_W = W;
+        for (int s = 0; s < 2; ++s) {
+            int64_t sub_elems = (int64_t)branch1_H * branch1_W * branch1_C;
+            CUDA_OK(cudaMemcpy(buf0, dec->hstream_branch1 + (int64_t)s * sub_elems,
+                        sub_elems * sizeof(__half), cudaMemcpyDeviceToDevice));
+            cur = buf0;
+            C = branch1_C;
+            H = branch1_H;
+            W = branch1_W;
+
+            VAE_CONV_TO_STREAM_H(WORLD_VAE_DEC_CONV20, 64);
+            VAE_RELU_STREAM_H();
+            VAE_CONV_TO_STREAM_H(WORLD_VAE_DEC_CONV_OUT, 12);
+            if (emit_rgb) {
+                unsigned char *frame_rgb = dec->d_rgb + (size_t)(b * 2 + s) * dec->out_h * dec->out_w * 3;
+                taehv_pixel_shuffle_one_u8_nhwc_h_kernel<<<div_up_i64((int64_t)dec->out_h * dec->out_w * 3, 256), 256>>>(
+                    cur, frame_rgb, H, W);
+                CUDA_OK(cudaGetLastError());
+            }
+        }
+    }
+
+#undef VAE_CONV_TO_STREAM_H
+#undef VAE_RELU_STREAM_H
+#undef VAE_MEMBLOCK_STREAM_H
+#undef VAE_UPSAMPLE2_STREAM_H
+#undef VAE_TGROW1_STREAM_H
+    return 0;
+}
+
 static int taehv_write_ppm(const char *path, const unsigned char *rgb, int width, int height) {
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -3624,103 +4132,24 @@ static int world_cuda_decode_vae_to_rgb_h_nhwc(
         int *height_out) {
     if (!dec || !dec->hbuf0 || !dec->fp16_nhwc_enabled) return 1;
 
-    int C_latent = cfg->channels;
-    int H0 = cfg->height * cfg->patch_h;
-    int W0 = cfg->width * cfg->patch_w;
-    int H = H0;
-    int W = W0;
-    int N = 4;
-    int C = C_latent;
-    int rc = 1;
-
-    __half *buf0 = dec->hbuf0;
-    __half *buf1 = dec->hbuf1;
-    __half *buf2 = dec->hbuf2;
-    __half *cur = buf0;
-    __half *tmp = NULL;
-    __half *aux = NULL;
-
-    fprintf(stderr, "VAE decode FP16/NHWC: latent [%d,%d,%d] -> RGB %dx%d\n", C_latent, H0, W0, dec->out_w, dec->out_h);
-
-    taehv_repeat_latent4_clamp_nhwc_h_kernel<<<div_up_i64((int64_t)4 * H * W * C, 256), 256>>>(d_latent, cur, C, H, W);
-    CUDA_OK(cudaGetLastError());
-
-#define VAE_CONV_TO_H(idx, out_c) do { \
-    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
-    cur = tmp; \
-    C = (out_c); \
-} while (0)
-#define VAE_RELU_H() do { \
-    if (taehv_run_relu_h(cur, (int64_t)N * H * W * C)) goto cleanup; \
-} while (0)
-#define VAE_MEMBLOCK_H(a, b, c) do { \
-    if (taehv_run_memblock_h_nhwc(dec, &cur, buf0, buf1, buf2, &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], N, C, H, W)) goto cleanup; \
-} while (0)
-#define VAE_UPSAMPLE2_H() do { \
-    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
-    taehv_upsample2_nhwc_h_kernel<<<div_up_i64((int64_t)N * (H * 2) * (W * 2) * C, 256), 256>>>(cur, tmp, N, C, H, W); \
-    CUDA_OK(cudaGetLastError()); \
-    cur = tmp; \
-    H *= 2; \
-    W *= 2; \
-} while (0)
-#define VAE_TGROW_H(idx, stride_value) do { \
-    int _stride = (stride_value); \
-    taehv_pick_scratch_h(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv_h_nhwc(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
-    if (_stride == 1) { \
-        cur = tmp; \
-    } else { \
-        taehv_tgrow_reshape_nhwc_h_kernel<<<div_up_i64((int64_t)N * _stride * H * W * C, 256), 256>>>(tmp, cur, N, C, H, W, _stride); \
-        CUDA_OK(cudaGetLastError()); \
-        N *= _stride; \
-    } \
-} while (0)
-
-    VAE_CONV_TO_H(WORLD_VAE_DEC_CONV_IN, 256);
-    VAE_RELU_H();
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
-    VAE_UPSAMPLE2_H();
-    VAE_TGROW_H(WORLD_VAE_DEC_TGROW7, 1);
-
-    VAE_CONV_TO_H(WORLD_VAE_DEC_CONV8, 128);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
-    VAE_UPSAMPLE2_H();
-    VAE_TGROW_H(WORLD_VAE_DEC_TGROW13, 2);
-
-    VAE_CONV_TO_H(WORLD_VAE_DEC_CONV14, 64);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
-    VAE_MEMBLOCK_H(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
-    VAE_UPSAMPLE2_H();
-    VAE_TGROW_H(WORLD_VAE_DEC_TGROW19, 2);
-
-    VAE_CONV_TO_H(WORLD_VAE_DEC_CONV20, 64);
-    VAE_RELU_H();
-    VAE_CONV_TO_H(WORLD_VAE_DEC_CONV_OUT, 12);
-
-    taehv_pixel_shuffle_last4_u8_nhwc_h_kernel<<<div_up_i64((int64_t)dec->rgb_elems, 256), 256>>>(cur, dec->d_rgb, N, H, W);
-    CUDA_OK(cudaGetLastError());
+    fprintf(stderr, "VAE decode FP16/NHWC streaming: latent [%d,%d,%d] -> RGB %dx%d\n",
+            cfg->channels, cfg->height * cfg->patch_h, cfg->width * cfg->patch_w, dec->out_w, dec->out_h);
+    taehv_profile_reset(dec);
+    if (!dec->stream_started_h) {
+        for (int i = 0; i < 3; ++i) {
+            if (taehv_stream_decode_one_h_nhwc(cfg, dec, d_latent, 0)) return 1;
+        }
+        dec->stream_started_h = 1;
+    }
+    if (taehv_stream_decode_one_h_nhwc(cfg, dec, d_latent, 1)) return 1;
     CUDA_OK(cudaMemcpy(dec->h_rgb, dec->d_rgb, dec->rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
+    taehv_profile_print(dec);
     if (rgb_out) *rgb_out = dec->h_rgb;
     if (frame_count_out) *frame_count_out = 4;
     if (width_out) *width_out = dec->out_w;
     if (height_out) *height_out = dec->out_h;
-    rc = 0;
-
-cleanup:
-#undef VAE_CONV_TO_H
-#undef VAE_RELU_H
-#undef VAE_MEMBLOCK_H
-#undef VAE_UPSAMPLE2_H
-#undef VAE_TGROW_H
-    return rc;
+    return 0;
 }
 
 static int world_cuda_decode_vae_to_rgb(
@@ -3740,91 +4169,16 @@ static int world_cuda_decode_vae_to_rgb(
         dec->fp16_nhwc_enabled = 0;
     }
 
-    int C_latent = cfg->channels;
-    int H0 = cfg->height * cfg->patch_h;
-    int W0 = cfg->width * cfg->patch_w;
-    int H = H0;
-    int W = W0;
-    int N = 4;
-    int C = C_latent;
-    int rc = 1;
-
-    float *buf0 = dec->buf0;
-    float *buf1 = dec->buf1;
-    float *buf2 = dec->buf2;
-    float *cur = buf0;
-    float *tmp = NULL;
-    float *aux = NULL;
-
-    fprintf(stderr, "VAE decode: latent [%d,%d,%d] -> RGB %dx%d\n", C_latent, H0, W0, dec->out_w, dec->out_h);
+    fprintf(stderr, "VAE decode streaming: latent [%d,%d,%d] -> RGB %dx%d\n",
+            cfg->channels, cfg->height * cfg->patch_h, cfg->width * cfg->patch_w, dec->out_w, dec->out_h);
     taehv_profile_reset(dec);
-
-    taehv_repeat_latent4_kernel<<<div_up_i64((int64_t)4 * C * H * W, 256), 256>>>(d_latent, cur, C, H, W);
-    CUDA_OK(cudaGetLastError());
-    taehv_clamp_kernel<<<div_up_i64((int64_t)N * C * H * W, 256), 256>>>(cur, (int64_t)N * C * H * W);
-    CUDA_OK(cudaGetLastError());
-
-#define VAE_CONV_TO(idx, out_c) do { \
-    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
-    cur = tmp; \
-    C = (out_c); \
-} while (0)
-#define VAE_RELU() do { \
-    if (taehv_run_relu(cur, (int64_t)N * C * H * W)) goto cleanup; \
-} while (0)
-#define VAE_MEMBLOCK(a, b, c) do { \
-    if (taehv_run_memblock(dec, &cur, buf0, buf1, buf2, &dec->convs[(a)], &dec->convs[(b)], &dec->convs[(c)], N, C, H, W)) goto cleanup; \
-} while (0)
-#define VAE_UPSAMPLE2() do { \
-    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
-    taehv_upsample2_nchw_kernel<<<div_up_i64((int64_t)N * C * (H * 2) * (W * 2), 256), 256>>>(cur, tmp, N, C, H, W); \
-    CUDA_OK(cudaGetLastError()); \
-    cur = tmp; \
-    H *= 2; \
-    W *= 2; \
-} while (0)
-#define VAE_TGROW(idx, stride_value) do { \
-    int _stride = (stride_value); \
-    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
-    if (taehv_run_conv(dec, cur, tmp, &dec->convs[(idx)], N, H, W)) goto cleanup; \
-    if (_stride == 1) { \
-        cur = tmp; \
-    } else { \
-        taehv_tgrow_reshape_kernel<<<div_up_i64((int64_t)N * _stride * C * H * W, 256), 256>>>(tmp, cur, N, C, H, W, _stride); \
-        CUDA_OK(cudaGetLastError()); \
-        N *= _stride; \
-    } \
-} while (0)
-
-    VAE_CONV_TO(WORLD_VAE_DEC_CONV_IN, 256);
-    VAE_RELU();
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB3_0, WORLD_VAE_DEC_MB3_2, WORLD_VAE_DEC_MB3_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB4_0, WORLD_VAE_DEC_MB4_2, WORLD_VAE_DEC_MB4_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB5_0, WORLD_VAE_DEC_MB5_2, WORLD_VAE_DEC_MB5_4);
-    VAE_UPSAMPLE2();
-    VAE_TGROW(WORLD_VAE_DEC_TGROW7, 1);
-
-    VAE_CONV_TO(WORLD_VAE_DEC_CONV8, 128);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB9_0, WORLD_VAE_DEC_MB9_2, WORLD_VAE_DEC_MB9_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB10_0, WORLD_VAE_DEC_MB10_2, WORLD_VAE_DEC_MB10_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB11_0, WORLD_VAE_DEC_MB11_2, WORLD_VAE_DEC_MB11_4);
-    VAE_UPSAMPLE2();
-    VAE_TGROW(WORLD_VAE_DEC_TGROW13, 2);
-
-    VAE_CONV_TO(WORLD_VAE_DEC_CONV14, 64);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB15_0, WORLD_VAE_DEC_MB15_2, WORLD_VAE_DEC_MB15_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB16_0, WORLD_VAE_DEC_MB16_2, WORLD_VAE_DEC_MB16_4);
-    VAE_MEMBLOCK(WORLD_VAE_DEC_MB17_0, WORLD_VAE_DEC_MB17_2, WORLD_VAE_DEC_MB17_4);
-    VAE_UPSAMPLE2();
-    VAE_TGROW(WORLD_VAE_DEC_TGROW19, 2);
-
-    VAE_CONV_TO(WORLD_VAE_DEC_CONV20, 64);
-    VAE_RELU();
-    VAE_CONV_TO(WORLD_VAE_DEC_CONV_OUT, 12);
-
-    taehv_pixel_shuffle_last4_u8_kernel<<<div_up_i64((int64_t)dec->rgb_elems, 256), 256>>>(cur, dec->d_rgb, N, H, W);
-    CUDA_OK(cudaGetLastError());
+    if (!dec->stream_started_f32) {
+        for (int i = 0; i < 3; ++i) {
+            if (taehv_stream_decode_one_f32(cfg, dec, d_latent, 0)) return 1;
+        }
+        dec->stream_started_f32 = 1;
+    }
+    if (taehv_stream_decode_one_f32(cfg, dec, d_latent, 1)) return 1;
     CUDA_OK(cudaMemcpy(dec->h_rgb, dec->d_rgb, dec->rgb_elems, cudaMemcpyDeviceToHost));
     CUDA_OK(cudaDeviceSynchronize());
     taehv_profile_print(dec);
@@ -3832,15 +4186,7 @@ static int world_cuda_decode_vae_to_rgb(
     if (frame_count_out) *frame_count_out = 4;
     if (width_out) *width_out = dec->out_w;
     if (height_out) *height_out = dec->out_h;
-    rc = 0;
-
-cleanup:
-#undef VAE_CONV_TO
-#undef VAE_RELU
-#undef VAE_MEMBLOCK
-#undef VAE_UPSAMPLE2
-#undef VAE_TGROW
-    return rc;
+    return 0;
 }
 
 static int world_cuda_decode_vae_to_ppm(
@@ -3877,6 +4223,36 @@ extern "C" int world_cuda_vae_decode_probe(
     if (cudaMemcpy(d_latent, latent, latent_elems * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
     if (taehv_decoder_init(&d_vae, cfg, vae)) goto cleanup;
     if (world_cuda_decode_vae_to_ppm(cfg, &d_vae, d_latent, out_path, 0)) goto cleanup;
+    rc = 0;
+
+cleanup:
+    taehv_decoder_free(&d_vae);
+    cudaFree(d_latent);
+    return rc;
+}
+
+extern "C" int world_cuda_vae_decode_sequence_probe(
+        const WorldConfig *cfg,
+        const float *latents,
+        int latent_count,
+        const WorldVaeDecoderWeights *vae,
+        const char *out_path) {
+    if (!cfg || !latents || latent_count <= 0 || !vae || !out_path || !out_path[0]) return 1;
+    DeviceVaeDecoder d_vae;
+    memset(&d_vae, 0, sizeof(d_vae));
+    float *d_latent = NULL;
+    int rc = 1;
+    size_t latent_elems = (size_t)cfg->channels *
+                          (size_t)(cfg->height * cfg->patch_h) *
+                          (size_t)(cfg->width * cfg->patch_w);
+
+    if (cudaMalloc((void **)&d_latent, latent_elems * sizeof(float)) != cudaSuccess) goto cleanup;
+    if (taehv_decoder_init(&d_vae, cfg, vae)) goto cleanup;
+    for (int i = 0; i < latent_count; ++i) {
+        const float *src = latents + (size_t)i * latent_elems;
+        if (cudaMemcpy(d_latent, src, latent_elems * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) goto cleanup;
+        if (world_cuda_decode_vae_to_ppm(cfg, &d_vae, d_latent, out_path, i * 4)) goto cleanup;
+    }
     rc = 0;
 
 cleanup:
