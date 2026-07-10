@@ -42,12 +42,21 @@ def find_cutlass_include():
     return None
 
 
+def find_cutlass_example_include(cutlass_include: Path):
+    example_dir = cutlass_include.parent / "examples" / "41_fused_multi_head_attention"
+    return example_dir if (example_dir / "kernel_forward.h").exists() else None
+
+
 def load_wm_cuda():
     if not torch.cuda.is_available() or CUDA_HOME is None:
         pytest.skip("CUDA and nvcc are required for worldmodel.cu parity tests")
     cutlass_include = find_cutlass_include()
     if cutlass_include is None:
         pytest.skip("CUTLASS include directory is required for worldmodel.cu parity tests")
+    include_paths = [str(cutlass_include)]
+    cutlass_fmha_include = find_cutlass_example_include(cutlass_include)
+    if cutlass_fmha_include is not None:
+        include_paths.append(str(cutlass_fmha_include))
 
     build_dir = ROOT / ".torch_extensions"
     build_dir.mkdir(exist_ok=True)
@@ -55,7 +64,7 @@ def load_wm_cuda():
         name="worldmodel_cuda_ext",
         sources=[str(ROOT / "worldmodel_kernels.cu")],
         build_directory=str(build_dir),
-        extra_include_paths=[str(cutlass_include)],
+        extra_include_paths=include_paths,
         extra_cuda_cflags=["-O3", "--use_fast_math"],
         verbose=bool(os.environ.get("WORLD_CU_VERBOSE_BUILD")),
     )
@@ -459,6 +468,22 @@ def test_indexed_attention_half_kv_cutlass_grouped_matches_materialized_half_ref
     torch.testing.assert_close(y, ref, rtol=2e-3, atol=2e-3)
 
 
+def test_cutlass_fmha_bmhk_fp16_matches_torch_half_reference(wm_cuda):
+    torch.manual_seed(126)
+    for b, m, n, h, d in [(1, 64, 64, 2, 64), (1, 128, 256, 8, 64)]:
+        q = torch.randn(b, m, h, d, device="cuda", dtype=torch.float32).half().contiguous()
+        k = torch.randn(b, n, h, d, device="cuda", dtype=torch.float32).half().contiguous()
+        v = torch.randn(b, n, h, d, device="cuda", dtype=torch.float32).half().contiguous()
+        scale = d ** -0.5
+
+        y = wm_cuda.cutlass_fmha_bmhk_fp16(q, k, v, scale)
+        scores = torch.einsum("bmhd,bnhd->bhmn", q.float(), k.float()) * scale
+        probs = torch.softmax(scores, dim=-1)
+        ref = torch.einsum("bhmn,bnhd->bmhd", probs, v.float()).half()
+
+        torch.testing.assert_close(y.float(), ref.float(), rtol=3e-3, atol=3e-3)
+
+
 def bench_indexed_attention_half_kv_variants(wm_cuda, warmup=10, iters=40):
     torch.manual_seed(125)
     b, hq, hkv, tq, tk, d = 1, 32, 16, 128, 1024, 64
@@ -804,6 +829,7 @@ if __name__ == "__main__":
         test_indexed_attention_half_kv_flash_matches_half_reference,
         test_indexed_attention_half_kv_cutlass_matches_materialized_half_reference,
         test_indexed_attention_half_kv_cutlass_grouped_matches_materialized_half_reference,
+        test_cutlass_fmha_bmhk_fp16_matches_torch_half_reference,
         test_kv_cache_upsert_matches_frozen_write_step,
         test_kv_cache_upsert_matches_unfrozen_pinned_dilation,
         test_kv_cache_upsert_half_matches_half_reference,

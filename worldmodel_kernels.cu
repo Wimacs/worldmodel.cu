@@ -16,6 +16,13 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/tensor_ref.h>
 
+#if __has_include("kernel_forward.h")
+#define WM_HAS_CUTLASS_FMHA 1
+#include "kernel_forward.h"
+#else
+#define WM_HAS_CUTLASS_FMHA 0
+#endif
+
 #include <cmath>
 #include <climits>
 #include <cstdint>
@@ -2837,6 +2844,90 @@ torch::Tensor indexed_attention_half_kv_cutlass_grouped_cuda(
     return out;
 }
 
+torch::Tensor cutlass_fmha_bmhk_fp16_cuda(
+        torch::Tensor q,
+        torch::Tensor k,
+        torch::Tensor v,
+        double scale) {
+#if WM_HAS_CUTLASS_FMHA
+    WM_CHECK_CUDA(q);
+    WM_CHECK_CUDA(k);
+    WM_CHECK_CUDA(v);
+    WM_CHECK_CONTIGUOUS(q);
+    WM_CHECK_CONTIGUOUS(k);
+    WM_CHECK_CONTIGUOUS(v);
+    WM_CHECK_F16(q);
+    WM_CHECK_F16(k);
+    WM_CHECK_F16(v);
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q, k, v must be BMHK tensors");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v shapes must match");
+    TORCH_CHECK(q.size(0) == k.size(0), "batch mismatch");
+    TORCH_CHECK(q.size(2) == k.size(2), "head count mismatch");
+    TORCH_CHECK(q.size(3) == 64 && k.size(3) == 64, "cutlass_fmha_bmhk_fp16 currently supports D=64");
+
+    int B = (int)q.size(0);
+    int M = (int)q.size(1);
+    int H = (int)q.size(2);
+    int N = (int)k.size(1);
+    int D = 64;
+
+    auto out = torch::empty({B, M, H, D}, q.options());
+
+    using Attention = AttentionKernel<
+        cutlass::half_t,
+        cutlass::arch::Sm80,
+        true,
+        64,
+        64,
+        64,
+        false,
+        false>;
+
+    typename Attention::Params p;
+    p.query_ptr = reinterpret_cast<cutlass::half_t *>(q.data_ptr<at::Half>());
+    p.key_ptr = reinterpret_cast<cutlass::half_t *>(k.data_ptr<at::Half>());
+    p.value_ptr = reinterpret_cast<cutlass::half_t *>(v.data_ptr<at::Half>());
+    p.output_ptr = reinterpret_cast<cutlass::half_t *>(out.data_ptr<at::Half>());
+    p.output_accum_ptr = nullptr;
+    p.logsumexp_ptr = nullptr;
+    p.scale = (float)scale;
+    p.num_heads = H;
+    p.num_batches = B;
+    p.head_dim = D;
+    p.head_dim_value = D;
+    p.num_queries = M;
+    p.num_keys = N;
+    p.custom_mask_type = Attention::NoCustomMask;
+    p.q_strideH = D;
+    p.k_strideH = D;
+    p.v_strideH = D;
+    p.q_strideM = H * D;
+    p.k_strideM = H * D;
+    p.v_strideM = H * D;
+    p.q_strideB = (int64_t)M * H * D;
+    p.k_strideB = (int64_t)N * H * D;
+    p.v_strideB = (int64_t)N * H * D;
+    p.o_strideM = H * D;
+
+    TORCH_CHECK(Attention::check_supported(p), "CUTLASS FMHA does not support this BMHK shape");
+    constexpr auto kernel_fn = attention_kernel_batched_impl<Attention>;
+    int smem_bytes = sizeof(typename Attention::SharedStorage);
+    if (smem_bytes > 0xc000) {
+        cudaError_t attr_err = cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        TORCH_CHECK(attr_err == cudaSuccess, "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
+    }
+    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, at::cuda::getCurrentCUDAStream()>>>(p);
+    check_last_cuda_error("cutlass_fmha_bmhk_fp16");
+    return out;
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)scale;
+    TORCH_CHECK(false, "CUTLASS FMHA example headers were not available when building this extension");
+#endif
+}
+
 torch::Tensor kv_cache_upsert_cuda(
         torch::Tensor cache_k,
         torch::Tensor cache_v,
@@ -3743,6 +3834,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("indexed_attention_half_kv_flash", &indexed_attention_half_kv_flash_cuda, "WorldModel group-flash indexed GQA attention with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv_cutlass", &indexed_attention_half_kv_cutlass_cuda, "WorldModel materialized indexed GQA attention using CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
     m.def("indexed_attention_half_kv_cutlass_grouped", &indexed_attention_half_kv_cutlass_grouped_cuda, "WorldModel materialized indexed GQA attention using grouped-M CUTLASS QK/AV GEMMs with FP16 K/V cache (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("indices"), py::arg("scale"));
+    m.def("cutlass_fmha_bmhk_fp16", &cutlass_fmha_bmhk_fp16_cuda, "CUTLASS fused MHA probe for contiguous BMHK FP16 tensors (CUDA)", py::arg("q"), py::arg("k"), py::arg("v"), py::arg("scale"));
     m.def("kv_cache_upsert", &kv_cache_upsert_cuda, "WorldModel KV ring-cache upsert (CUDA, f32)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("kv_cache_upsert_half", &kv_cache_upsert_half_cuda, "WorldModel KV ring-cache upsert with FP16 cache (CUDA)", py::arg("cache_k"), py::arg("cache_v"), py::arg("written"), py::arg("k"), py::arg("v"), py::arg("frame_idx"), py::arg("ring_length"), py::arg("pinned_dilation"), py::arg("frozen"));
     m.def("cache_frame_indices", &cache_frame_indices_cuda, "WorldModel frame-slot cache index collection (CUDA)", py::arg("written"), py::arg("tokens_per_frame"), py::arg("base"), py::arg("write_step"));
