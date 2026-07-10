@@ -9,6 +9,10 @@ option(WORLD_ENABLE_CUDA "Build CUDA backend targets" ON)
 option(WORLD_ENABLE_VULKAN "Build Vulkan backend targets" OFF)
 set(WORLD_CUTLASS_DIR "" CACHE PATH "Path to a CUTLASS checkout. If empty, common local checkouts are probed and then FetchContent is used.")
 
+if(WORLD_ENABLE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
+endif()
+
 find_package(Threads REQUIRED)
 
 set(WORLD_PLATFORM_LIBS)
@@ -42,9 +46,7 @@ if(WORLD_ENABLE_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 89)
-  endif()
+  message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
   find_package(CUDAToolkit REQUIRED)
 endif()
 

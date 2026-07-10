@@ -1296,7 +1296,7 @@ static int row_major_linear(
     return 0;
 }
 
-static int row_major_linear_fp16_weight(
+static int row_major_linear_fp16_weight_simt(
         const float *x_rm,
         __half *x_half_tmp,
         const __half *w_rm_h,
@@ -1326,6 +1326,54 @@ static int row_major_linear_fp16_weight(
         2,
         1,
         1>;
+
+    const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
+    const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
+    typename Gemm::Arguments args(
+        {m, n, k},
+        {x_h, k},
+        {w_h, k},
+        {y_rm, n},
+        {y_rm, n},
+        {1.0f, 0.0f});
+    Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
+static int row_major_linear_fp16_weight_tensorop(
+        const float *x_rm,
+        __half *x_half_tmp,
+        const __half *w_rm_h,
+        float *y_rm,
+        int m,
+        int k,
+        int n) {
+    int64_t x_elems = (int64_t)m * k;
+    f32_to_f16_kernel<<<div_up_i64(x_elems, 256), 256>>>(x_rm, x_half_tmp, x_elems);
+    CUDA_OK(cudaGetLastError());
+
+    using Gemm = cutlass::gemm::device::Gemm<
+        cutlass::half_t,
+        cutlass::layout::RowMajor,
+        cutlass::half_t,
+        cutlass::layout::ColumnMajor,
+        float,
+        cutlass::layout::RowMajor,
+        float,
+        cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80,
+        cutlass::gemm::GemmShape<128, 128, 32>,
+        cutlass::gemm::GemmShape<64, 64, 32>,
+        cutlass::gemm::GemmShape<16, 8, 16>,
+        cutlass::epilogue::thread::LinearCombination<
+            float,
+            128 / cutlass::sizeof_bits<float>::value,
+            float,
+            float>,
+        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+        4>;
 
     const cutlass::half_t *x_h = reinterpret_cast<const cutlass::half_t *>(x_half_tmp);
     const cutlass::half_t *w_h = reinterpret_cast<const cutlass::half_t *>(w_rm_h);
@@ -2641,6 +2689,7 @@ extern "C" int world_cuda_runtime_step_rgb(
     float total_ms = 0.0f;
     const char *fp16_gemm_env = getenv("WORLD_FP16_GEMM");
     int use_fp16_gemm = fp16_gemm_env ? fp16_gemm_env[0] != '0' : 1;
+    int use_fp16_tensorop = fp16_gemm_env && strcmp(fp16_gemm_env, "simt") == 0 ? 0 : 1;
 
 #define STEP_CUDA(expr) do { \
     cudaError_t _e = (expr); \
@@ -2654,7 +2703,11 @@ extern "C" int world_cuda_runtime_step_rgb(
 } while (0)
 #define STEP_LINEAR_FAST(x, w, wh, y, m, k, n) do { \
     if (use_fp16_gemm && (wh) && (m) > 1) { \
-        if (row_major_linear_fp16_weight((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+        if (use_fp16_tensorop) { \
+            if (row_major_linear_fp16_weight_tensorop((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+        } else { \
+            if (row_major_linear_fp16_weight_simt((x), rt->d_linear_half, (wh), (y), (m), (k), (n))) return 1; \
+        } \
     } else { \
         STEP_LINEAR((x), (w), (y), (m), (k), (n)); \
     } \
