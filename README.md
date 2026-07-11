@@ -69,11 +69,25 @@ Use WASD and the mouse in the interactive window. Run an executable without argu
 ```sh
 python test_worldmodel_kernels.py
 python test_standalone_probe.py
+python test_vulkan_gemm_cta.py
 python test_vulkan_sparse_gqa_fmha.py
 ./build/worldmodel_cuda_gemm_probe --tensorop
 ./build-vulkan/worldmodel_vulkan_probe --taehv
 ./build-vulkan/worldmodel_vulkan_probe --cache-indices
+./build-vulkan/worldmodel_vulkan_probe --half-boundary
 ./build-vulkan/worldmodel_vulkan_probe --sparse-fmha
+```
+
+Autotune the five model GEMM shapes and load the resulting cache at runtime:
+
+```sh
+./build-vulkan/worldmodel_vulkan_gemm_autotune \
+  --config ../Waypoint-1.5-1B-360P/config.yaml \
+  --input f16 --epilogue model --out world_vulkan_gemm.cache
+WORLD_VULKAN_GEMM_AUTOTUNE_CACHE=world_vulkan_gemm.cache \
+  ./build-vulkan/worldmodel_raylib_vulkan \
+  --model-dir ../Waypoint-1.5-1B-360P \
+  --vae-weights ../Waypoint-1.5-1B/vae/diffusion_pytorch_model.safetensors
 ```
 
 Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md) and [docs/vulkan_optimization.md](docs/vulkan_optimization.md).

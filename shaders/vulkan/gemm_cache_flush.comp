@@ -1,0 +1,18 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer FlushData {
+    uint data[];
+} flush_data;
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    uint value = flush_data.data[idx];
+    flush_data.data[idx] = value * 1664525u + 1013904223u + idx;
+}

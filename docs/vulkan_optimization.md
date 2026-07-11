@@ -117,3 +117,62 @@ v2 把输出 tile 扩成 32 通道：同一个 subgroup 维护四个 `16x8` FP32
 - attention bucket 延迟降低 `59.9%`，完整 GPU dispatch 从 `136.087 ms` 降到 `117.024 ms`，降低 `14.0%`。
 
 正常无 profile 的最后 4 个满 cache chunk：旧路径为 `135.81 ms/chunk`、`29.45 RGB FPS`；新路径为 `116.87 ms/chunk`、`34.23 RGB FPS`。端到端延迟降低 `14.0%`，吞吐提升 `16.2%`。
+
+## v4: CTA-tiled GEMM and FP16 boundaries
+
+旧 cooperative-matrix GEMM 由一个 subgroup 独立负责 `16x8/16/32` 输出块。它能使用 tensor core，但同一个 A tile 会被多个 subgroup 重复读取，且 MLP 的 RMSNorm、SiLU、FC2 和 residual 之间仍有 F32 中间张量。v4 为当前 360p 模型新增一个直接面向真实 shape 的 CTA mainloop：
+
+- 固定 `CTA_M=64`，编译 `CTA_N=64/128`、`CTA_K=32/64` 变体；分别由 8 或 16 个 subgroup 协作。
+- A/B 使用 `f16vec4` 合并加载，权重启动时转成 K-major FP16；A/B 同时进入 shared memory，再由 subgroup cooperative matrix 消费。
+- K32 提供单 stage 和双 stage ping-pong 变体。Vulkan 没有这里可用的异步 copy，所以 p2 是 software pipeline：先把当前 cooperative-matrix fragment 读入寄存器，再填充下一块 shared stage，并在换 stage 前同步。
+- epilogue 包含 F32 output、fused SiLU-to-FP16、fused gated residual，以及 split-K partial。split-K reduce 在一次 pass 中完成 partial sum、gate 和 residual。
+- attention/MLP Ada RMSNorm、controller RMSNorm、controller add+SiLU 和 sparse FMHA reduce 可直接写 FP16，GEMM 不再需要独立 F32-to-FP16 cast。
+
+FC2 的 `K=8192` 默认使用 split-K 4；split-K 2 仍作为候选。`T=128, D=2048` 下 N64/split4 产生 256 个 CTA，避免 unsplit FC2 只有 64 个 CTA 时的并行度不足。partial workspace 为 `4 * T * D * sizeof(float) = 4 MiB`，attention out 与 MLP FC2 按执行顺序复用。
+
+### Autotune
+
+`worldmodel_vulkan_gemm_autotune --epilogue model` 只搜索五个实际 shape：
+
+| label | M | N | K | epilogue |
+|---|---:|---:|---:|---|
+| qkv | 128 | 4096 | 2048 | none |
+| attn_out | 128 | 2048 | 2048 | gated residual |
+| ctrl_fc | 128 | 2048 | 2048 | none |
+| mlp_fc1 | 128 | 8192 | 2048 | SiLU-to-FP16 |
+| mlp_fc2 | 128 | 2048 | 8192 | gated residual |
+
+默认测量模拟模型的 streaming-weight 情况：每次 timestamp 前用 96 MiB workspace 连续做 64 次读写以拉起 GPU 时钟并驱逐 L2，每个候选取 5 次 cold dispatch 的中位数。cache v2 记录 `tile_m/n/k`、packed layout、split-K 和 shader 名；runtime 会按 shape 选择 stage1/p2 与 split 数，未命中则使用经过完整流水线验证的默认值。
+
+RTX 4090 D 的一次稳定 cold-cache 搜索得到：
+
+- qkv：CTA M64N64K64，`0.1033 ms`
+- attn_out：CTA M64N64K32 split-K 4 stage1，含 reduce `0.0479 ms`
+- ctrl_fc：旧 N8 subgroup kernel，`0.0603 ms`
+- mlp_fc1：CTA M64N64K32 p2，`0.1320 ms`
+- mlp_fc2：CTA M64N64K32 p2 split-K 4，含 reduce `0.1456 ms`
+
+QKV 是一个重要的整模型例外。独立 cold probe 偏向 CTA，但 24-layer 满 cache A/B 中 CTA 为 `11.784 ms/120`，N32 subgroup 为 `11.218 ms/120`；完整 dispatch 分别为 `94.940` 和 `94.057 ms`。两条路径的四张 PPM 逐字节一致，因此保留 `WORLD_VULKAN_QKV_CTA=1` 作为实验开关，默认采用整模型更快的 N32。
+
+`WORLD_VULKAN_GEMM_CTA=0` 可整体回退旧 GEMM，`WORLD_VULKAN_HALF_GEMM_BOUNDARY=0` 只关闭 FP16 边界，`WORLD_VULKAN_MLP_FC2_CTA_SPLITK=2|4` 可固定 FC2 split 数。设置 `WORLD_VULKAN_GEMM_AUTOTUNE_CACHE=PATH` 后，cache 中的 stage1/p2 和 split-K 选择优先于默认值。
+
+### Correctness
+
+`test_vulkan_gemm_cta.py` 会运行所有 packed CTA stage1/p2、none/SiLU/gated、split-K 2/4 变体，导出原始输入/权重/输出并与 PyTorch matmul 对拍；同时测试 FP16 RMSNorm、Ada RMSNorm 和 add+SiLU。当前 CTA probe 的 `max_abs=0`、`mean_abs=0`，FP16 boundary 三项同样为 0。`test_vulkan_sparse_gqa_fmha.py` 额外检查 FMHA FP16 reduce，结果与 `reference.half()` 完全一致。
+
+完整 QKV CTA/N32 A/B 的四张最终图 SHA256 一致。此前 FP16 boundary 对 F32 回退的完整图像平均绝对像素误差约 `0.039/255`、最大 `2/255`。
+
+### Performance
+
+360p、24 layer、4 step、`cache-window=8` 满 cache timestamp profile：
+
+- v3 起点：`118.194 ms` GPU dispatch。
+- v4 默认：`94.057 ms` GPU dispatch，延迟降低 `20.4%`，等效吞吐提升 `25.7%`。
+- MLP FC1：`22.130 -> 15.430 ms/120`，降低 `30.3%`。
+- MLP FC2：`23.622 -> 16.366 + 0.572 = 16.938 ms/120`，降低 `28.3%`。
+- attention out：`11.667 -> 4.458 + 0.570 = 5.028 ms/120`，降低 `56.9%`。
+- controller FC1/FC2：`7.591 -> 4.851 ms/80`，降低 `36.1%`。
+
+双 stage 相对第一版单 stage 的完整 dispatch 从 `95.708` 降至 `94.057 ms`；主要收益在 FC1（约 `8.8%`），FC2 因 split-K 已有足够并行度，p2 只再改善约 `1.5%`。这也是保留 autotune 选择而不强制所有 shape 使用 ping-pong 的原因。
+
+默认无 profile 连续生成 11 个 chunk，满 cache 最后 4 个 chunk 平均为 `94.68 ms/chunk`、`42.25 RGB FPS`，最后一个 chunk 为 `95.02 ms`、`42.10 RGB FPS`。相对 v3 的 `116.87 ms/chunk`、`34.23 RGB FPS`，端到端延迟降低 `19.0%`，吞吐提升 `23.4%`。

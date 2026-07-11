@@ -88,11 +88,17 @@ def test_vulkan_sparse_gqa_fmha_matches_torch():
         v = read_tensor(f"{prefix}.v_f16.bin", torch.float16, (B, HKV, TK, D))
         block_ids = read_tensor(f"{prefix}.blocks_u32.bin", torch.uint32, (2,))
         got = read_tensor(f"{prefix}.out_f32.bin", torch.float32, (B, TQ, HQ, D))
+        got_f16 = read_tensor(
+            f"{prefix}.out_f16.bin", torch.float16, (B, TQ, HQ, D)
+        ).float()
         ref = torch_sparse_gqa_reference(q, k, v, block_ids)
 
         diff = (got - ref).abs()
         assert diff.max().item() <= 2.0e-3
         assert diff.mean().item() <= 2.0e-4
+        diff_f16 = (got_f16 - ref.half().float()).abs()
+        assert diff_f16.max().item() <= 1.0e-3
+        assert diff_f16.mean().item() <= 1.0e-4
 
 
 if __name__ == "__main__":

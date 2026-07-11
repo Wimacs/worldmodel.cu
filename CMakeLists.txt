@@ -141,11 +141,14 @@ if(WORLD_ENABLE_VULKAN)
   file(TO_CMAKE_PATH "${WORLD_VULKAN_SHADER_OUTPUT_DIR}" WORLD_VULKAN_SHADER_DEFINE_DIR)
   set(WORLD_VULKAN_SHADER_INCLUDE_DEPS
     ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/gemm_wf16_coopmat_template.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/vulkan/gemm_cta_wf16_coopmat_template.comp
   )
   set(WORLD_VULKAN_SHADER_SOURCES
     add_bias_silu_f32.comp
+    add_channel_silu_f16.comp
     add_channel_silu_f32.comp
     add_f32.comp
+    ada_rms_norm_f16.comp
     ada_rms_norm_f32.comp
     cache_frame_indices.comp
     fill_rgba.comp
@@ -163,6 +166,7 @@ if(WORLD_ENABLE_VULKAN)
     indexed_attention_d64_splitk64_part_kvf16_f32.comp
     indexed_attention_d64_splitk96_part_f32.comp
     indexed_attention_d64_splitk64_reduce_f32.comp
+    indexed_attention_d64_splitk64_reduce_f16.comp
     indexed_attention_d64_warp_f32.comp
     indexed_attention_f32.comp
     kv_cache_mask.comp
@@ -187,6 +191,30 @@ if(WORLD_ENABLE_VULKAN)
     gemm_f16x_wf16_gated_n8.comp
     gemm_f16x_wf16_gated_n16.comp
     gemm_f16x_wf16_gated_n32.comp
+    gemm_cache_flush.comp
+    gemm_cta_m64n64k32_f16_none.comp
+    gemm_cta_m64n64k32_f16_none_p2.comp
+    gemm_cta_m64n64k64_f16_none.comp
+    gemm_cta_m64n128k32_f16_none.comp
+    gemm_cta_m64n128k32_f16_none_p2.comp
+    gemm_cta_m64n128k64_f16_none.comp
+    gemm_cta_m64n64k32_f16_silu.comp
+    gemm_cta_m64n64k32_f16_silu_p2.comp
+    gemm_cta_m64n64k64_f16_silu.comp
+    gemm_cta_m64n128k32_f16_silu.comp
+    gemm_cta_m64n128k32_f16_silu_p2.comp
+    gemm_cta_m64n128k64_f16_silu.comp
+    gemm_cta_m64n64k32_f16_gated.comp
+    gemm_cta_m64n64k32_f16_gated_p2.comp
+    gemm_cta_m64n64k64_f16_gated.comp
+    gemm_cta_m64n128k32_f16_gated.comp
+    gemm_cta_m64n128k32_f16_gated_p2.comp
+    gemm_cta_m64n128k64_f16_gated.comp
+    gemm_cta_m64n64k32_f16_splitk.comp
+    gemm_cta_m64n64k32_f16_splitk_p2.comp
+    gemm_cta_m64n128k32_f16_splitk.comp
+    gemm_cta_m64n128k32_f16_splitk_p2.comp
+    gemm_splitk_gated_reduce.comp
     linear_f16_coopmat.comp
     linear_f16x_wf16_gated_residual.comp
     linear_f16x_wf16_gated_residual_n16.comp
@@ -209,6 +237,7 @@ if(WORLD_ENABLE_VULKAN)
     patchify_f32.comp
     qkv_rms_rope_f32.comp
     rms_norm_f32.comp
+    rms_norm_f16.comp
     silu_f32_to_f16.comp
     silu_f32.comp
     sparse_gqa_fmha_d64_wf16_coopmat.comp

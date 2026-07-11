@@ -1,0 +1,304 @@
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#ifndef GEMM_CTA_N
+#define GEMM_CTA_N 64
+#endif
+
+#ifndef GEMM_CTA_K
+#define GEMM_CTA_K 32
+#endif
+
+#ifndef GEMM_EPILOGUE
+#define GEMM_EPILOGUE 0
+#endif
+
+#ifndef GEMM_PIPELINE_STAGES
+#define GEMM_PIPELINE_STAGES 1
+#endif
+
+#define GEMM_CTA_M 64
+#define GEMM_SUBGROUP_M 16
+#define GEMM_SUBGROUP_N 32
+#define GEMM_COL_GROUPS (GEMM_CTA_N / GEMM_SUBGROUP_N)
+#define GEMM_SUBGROUPS (4 * GEMM_COL_GROUPS)
+#define GEMM_THREADS (32 * GEMM_SUBGROUPS)
+
+#define GEMM_EPILOGUE_NONE 0
+#define GEMM_EPILOGUE_SILU_F16 1
+#define GEMM_EPILOGUE_GATED_RESIDUAL 2
+#define GEMM_EPILOGUE_SPLIT_K_PART 3
+
+#if GEMM_CTA_N != 64 && GEMM_CTA_N != 128
+#error "CTA GEMM supports CTA_N=64 or CTA_N=128"
+#endif
+
+#if GEMM_CTA_K != 32 && GEMM_CTA_K != 64
+#error "CTA GEMM supports CTA_K=32 or CTA_K=64"
+#endif
+
+#if GEMM_PIPELINE_STAGES != 1 && GEMM_PIPELINE_STAGES != 2
+#error "CTA GEMM supports one or two shared-memory stages"
+#endif
+
+#if GEMM_PIPELINE_STAGES == 2 && GEMM_CTA_K != 32
+#error "Ping-pong CTA GEMM is limited to CTA_K=32 to bound register/shared usage"
+#endif
+
+layout(local_size_x = GEMM_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputX {
+    f16vec4 x4[];
+} in_x;
+
+/* Packed K-major weight: w[k * cols + col]. */
+layout(std430, binding = 1) readonly buffer Weight {
+    f16vec4 w4[];
+} in_w;
+
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_GATED_RESIDUAL
+layout(std430, binding = 2) readonly buffer Residual {
+    float residual[];
+} in_residual;
+
+layout(std430, binding = 3) readonly buffer Gate {
+    float gate[];
+} in_gate;
+
+layout(std430, binding = 4) buffer OutputY {
+    float y[];
+} out_y;
+#elif GEMM_EPILOGUE == GEMM_EPILOGUE_SPLIT_K_PART
+layout(std430, binding = 2) buffer OutputY {
+    float y[];
+} out_y;
+#else
+layout(std430, binding = 2) readonly buffer Bias {
+    float b[];
+} in_b;
+
+layout(std430, binding = 3) buffer OutputY {
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SILU_F16
+    float16_t y[];
+#else
+    float y[];
+#endif
+} out_y;
+#endif
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+    uint inner;
+    uint has_bias;
+} pc;
+
+shared float16_t tile_a[GEMM_PIPELINE_STAGES * GEMM_CTA_M * GEMM_CTA_K];
+shared float16_t tile_b[GEMM_PIPELINE_STAGES * GEMM_CTA_K * GEMM_CTA_N];
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SILU_F16 || GEMM_EPILOGUE == GEMM_EPILOGUE_GATED_RESIDUAL
+shared float tile_y[GEMM_CTA_M * GEMM_CTA_N];
+#endif
+
+void stage_gemm_tile(uint stage, uint k0, uint tid, uint row_base, uint col_base) {
+    uint a_stage = stage * uint(GEMM_CTA_M * GEMM_CTA_K);
+    uint b_stage = stage * uint(GEMM_CTA_K * GEMM_CTA_N);
+    for (uint vi = tid; vi < uint(GEMM_CTA_M * GEMM_CTA_K / 4); vi += uint(GEMM_THREADS)) {
+        uint i = vi * 4u;
+        uint r = i / uint(GEMM_CTA_K);
+        uint k = i - r * uint(GEMM_CTA_K);
+        uint src = ((row_base + r) * pc.inner + k0 + k) / 4u;
+        f16vec4 v = in_x.x4[src];
+        tile_a[a_stage + i + 0u] = v.x;
+        tile_a[a_stage + i + 1u] = v.y;
+        tile_a[a_stage + i + 2u] = v.z;
+        tile_a[a_stage + i + 3u] = v.w;
+    }
+    for (uint vi = tid; vi < uint(GEMM_CTA_K * GEMM_CTA_N / 4); vi += uint(GEMM_THREADS)) {
+        uint i = vi * 4u;
+        uint k = i / uint(GEMM_CTA_N);
+        uint c = i - k * uint(GEMM_CTA_N);
+        uint src = ((k0 + k) * pc.cols + col_base + c) / 4u;
+        f16vec4 v = in_w.w4[src];
+        tile_b[b_stage + i + 0u] = v.x;
+        tile_b[b_stage + i + 1u] = v.y;
+        tile_b[b_stage + i + 2u] = v.z;
+        tile_b[b_stage + i + 3u] = v.w;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint subgroup = gl_SubgroupID;
+    uint subgroup_row = subgroup / uint(GEMM_COL_GROUPS);
+    uint subgroup_col = subgroup - subgroup_row * uint(GEMM_COL_GROUPS);
+    uint row_base = gl_WorkGroupID.y * uint(GEMM_CTA_M);
+    uint col_base = gl_WorkGroupID.x * uint(GEMM_CTA_N);
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SPLIT_K_PART
+    uint split_count = pc.has_bias;
+    uint split_idx = gl_WorkGroupID.z;
+    bool invalid_split = split_count == 0u || split_idx >= split_count ||
+        (pc.inner % split_count) != 0u ||
+        ((pc.inner / split_count) % uint(GEMM_CTA_K)) != 0u;
+#else
+    bool invalid_split = pc.has_bias != 0u;
+#endif
+    if (gl_SubgroupSize != 32u || invalid_split ||
+            row_base + uint(GEMM_CTA_M - 1) >= pc.rows ||
+            col_base + uint(GEMM_CTA_N - 1) >= pc.cols ||
+            (pc.inner % uint(GEMM_CTA_K)) != 0u) {
+        return;
+    }
+
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SPLIT_K_PART
+    uint split_inner = pc.inner / split_count;
+    uint k_begin = split_idx * split_inner;
+    uint k_end = k_begin + split_inner;
+#else
+    uint k_begin = 0u;
+    uint k_end = pc.inner;
+#endif
+
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc2 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> acc3 =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+
+#if GEMM_PIPELINE_STAGES == 2
+    uint stage = 0u;
+    stage_gemm_tile(stage, k_begin, tid, row_base, col_base);
+    barrier();
+    for (uint k0 = k_begin; k0 < k_end; k0 += uint(GEMM_CTA_K)) {
+        uint a_stage = stage * uint(GEMM_CTA_M * GEMM_CTA_K);
+        uint b_stage = stage * uint(GEMM_CTA_K * GEMM_CTA_N);
+        for (uint kk = 0u; kk < uint(GEMM_CTA_K); kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b2;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b3;
+            uint a_offset = a_stage + subgroup_row * 16u * uint(GEMM_CTA_K) + kk;
+            uint b_offset = b_stage + kk * uint(GEMM_CTA_N) + subgroup_col * 32u;
+            coopMatLoad(a, tile_a, a_offset, uint(GEMM_CTA_K),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, tile_b, b_offset + 0u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, tile_b, b_offset + 8u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b2, tile_b, b_offset + 16u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b3, tile_b, b_offset + 24u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+
+            uint next_k = k0 + uint(GEMM_CTA_K);
+            if (kk == 0u && next_k < k_end) {
+                stage_gemm_tile(stage ^ 1u, next_k, tid, row_base, col_base);
+            }
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+            acc2 = coopMatMulAdd(a, b2, acc2);
+            acc3 = coopMatMulAdd(a, b3, acc3);
+        }
+        barrier();
+        stage ^= 1u;
+    }
+#else
+    for (uint k0 = k_begin; k0 < k_end; k0 += uint(GEMM_CTA_K)) {
+        for (uint vi = tid; vi < uint(GEMM_CTA_M * GEMM_CTA_K / 4); vi += uint(GEMM_THREADS)) {
+            uint i = vi * 4u;
+            uint r = i / uint(GEMM_CTA_K);
+            uint k = i - r * uint(GEMM_CTA_K);
+            uint src = ((row_base + r) * pc.inner + k0 + k) / 4u;
+            f16vec4 v = in_x.x4[src];
+            tile_a[i + 0u] = v.x;
+            tile_a[i + 1u] = v.y;
+            tile_a[i + 2u] = v.z;
+            tile_a[i + 3u] = v.w;
+        }
+        for (uint vi = tid; vi < uint(GEMM_CTA_K * GEMM_CTA_N / 4); vi += uint(GEMM_THREADS)) {
+            uint i = vi * 4u;
+            uint k = i / uint(GEMM_CTA_N);
+            uint c = i - k * uint(GEMM_CTA_N);
+            uint src = ((k0 + k) * pc.cols + col_base + c) / 4u;
+            f16vec4 v = in_w.w4[src];
+            tile_b[i + 0u] = v.x;
+            tile_b[i + 1u] = v.y;
+            tile_b[i + 2u] = v.z;
+            tile_b[i + 3u] = v.w;
+        }
+        barrier();
+
+        for (uint kk = 0u; kk < uint(GEMM_CTA_K); kk += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b0;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b1;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b2;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b3;
+            uint a_offset = subgroup_row * 16u * uint(GEMM_CTA_K) + kk;
+            uint b_offset = kk * uint(GEMM_CTA_N) + subgroup_col * 32u;
+            coopMatLoad(a, tile_a, a_offset, uint(GEMM_CTA_K),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, tile_b, b_offset + 0u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, tile_b, b_offset + 8u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b2, tile_b, b_offset + 16u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b3, tile_b, b_offset + 24u, uint(GEMM_CTA_N),
+                    gl_CooperativeMatrixLayoutRowMajor);
+            acc0 = coopMatMulAdd(a, b0, acc0);
+            acc1 = coopMatMulAdd(a, b1, acc1);
+            acc2 = coopMatMulAdd(a, b2, acc2);
+            acc3 = coopMatMulAdd(a, b3, acc3);
+        }
+        barrier();
+    }
+#endif
+
+    uint out_row = row_base + subgroup_row * 16u;
+    uint out_col = col_base + subgroup_col * 32u;
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_NONE || GEMM_EPILOGUE == GEMM_EPILOGUE_SPLIT_K_PART
+    uint out_base = out_row * pc.cols + out_col;
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SPLIT_K_PART
+    out_base += split_idx * pc.rows * pc.cols;
+#endif
+    coopMatStore(acc0, out_y.y, out_base + 0u, pc.cols,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, out_y.y, out_base + 8u, pc.cols,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc2, out_y.y, out_base + 16u, pc.cols,
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc3, out_y.y, out_base + 24u, pc.cols,
+            gl_CooperativeMatrixLayoutRowMajor);
+#else
+    uint shared_out = subgroup_row * 16u * uint(GEMM_CTA_N) + subgroup_col * 32u;
+    coopMatStore(acc0, tile_y, shared_out + 0u, uint(GEMM_CTA_N),
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, tile_y, shared_out + 8u, uint(GEMM_CTA_N),
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc2, tile_y, shared_out + 16u, uint(GEMM_CTA_N),
+            gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc3, tile_y, shared_out + 24u, uint(GEMM_CTA_N),
+            gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    for (uint i = tid; i < uint(GEMM_CTA_M * GEMM_CTA_N); i += uint(GEMM_THREADS)) {
+        uint r = i / uint(GEMM_CTA_N);
+        uint c = i - r * uint(GEMM_CTA_N);
+        uint out_idx = (row_base + r) * pc.cols + col_base + c;
+        float v = tile_y[i];
+#if GEMM_EPILOGUE == GEMM_EPILOGUE_SILU_F16
+        out_y.y[out_idx] = float16_t(v / (1.0 + exp(-v)));
+#elif GEMM_EPILOGUE == GEMM_EPILOGUE_GATED_RESIDUAL
+        out_y.y[out_idx] = in_residual.residual[out_idx] +
+            v * in_gate.gate[col_base + c];
+#endif
+    }
+#endif
+}
