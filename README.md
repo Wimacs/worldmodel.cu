@@ -1,8 +1,21 @@
-# worldmodel.cu
+# worldmodel.c
 
-An experimental standalone C/CUDA/Vulkan runtime for Waypoint 1.5.
+An experimental standalone C/CUDA/Vulkan runtime for [Waypoint 1.5](https://raw.githubusercontent.com/Overworldai/Biome/feat/paper/research/WP1_5_Paper.pdf).
 
 The CUDA backend uses CUTLASS for GEMM, attention, and convolution kernels. It links only the CUDA runtime, without cuBLAS or cuDNN. CUDA kernels are tested against PyTorch references. The Vulkan backend is experimental.
+
+## Performance
+
+Measured on an NVIDIA GeForce RTX 4090 D (48 GiB), NVIDIA driver 610.62, using Windows Release builds. Every run uses all 24 layers, 4 denoising steps, and `--cache-window 8`. A single resident runtime generates 12 consecutive chunks; RGB FPS is the average of the final four full-cache chunks, with four RGB frames emitted per chunk. Peak VRAM is the maximum `nvidia-smi memory.used` increase over the pre-launch baseline, sampled every 100 ms.
+
+| Model | Output | Backend | RGB FPS | Peak VRAM |
+|---|---:|---|---:|---:|
+| [Waypoint-1.5-1B](https://huggingface.co/Overworld/Waypoint-1.5-1B) | 1024x512 | CUDA | 32.3 | 14.0 GiB |
+| [Waypoint-1.5-1B](https://huggingface.co/Overworld/Waypoint-1.5-1B) | 1024x512 | Vulkan | 9.9 | 13.6 GiB |
+| [Waypoint-1.5-1B-360P](https://huggingface.co/Overworld/Waypoint-1.5-1B-360P) | 512x256 | CUDA | 102.4 | 11.2 GiB |
+| [Waypoint-1.5-1B-360P](https://huggingface.co/Overworld/Waypoint-1.5-1B-360P) | 512x256 | Vulkan | 42.0 | 11.1 GiB |
+
+These figures measure backend throughput rather than the interactive window's display refresh cap. Vulkan remains experimental, and results vary with drivers, clocks, and background GPU usage.
 
 ## Requirements
 
@@ -15,10 +28,11 @@ The CUDA backend uses CUTLASS for GEMM, attention, and convolution kernels. It l
 ## Setup
 
 ```sh
-git clone --recurse-submodules https://github.com/Wimacs/worldmodel.cu.git
-cd worldmodel.cu
+git clone --recurse-submodules https://github.com/Wimacs/worldmodel.c.git
+cd worldmodel.c
 python -m pip install -U huggingface_hub
 hf download Overworld/Waypoint-1.5-1B --local-dir Waypoint-1.5-1B
+hf download Overworld/Waypoint-1.5-1B-360P --local-dir Waypoint-1.5-1B-360P
 ```
 
 ## Build

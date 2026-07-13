@@ -144,8 +144,6 @@ typedef struct {
     int paused;
     int control_debug_enabled;
     float generation_seconds;
-    float control_seconds;
-    float target_control_seconds;
     float *pending_image;
     int pending_image_width;
     int pending_image_height;
@@ -294,7 +292,7 @@ static void ray_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [MODEL_DIR|MODEL.safetensors] [IMAGE] [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-image FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-generate N] [--headless-reset-check] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
             "\n"
-            "Defaults: full model, full denoise schedule, cache window 8, mouse scale 10.0.\n",
+            "Defaults: full model, full denoise schedule, cache window 8, mouse scale 30.0.\n",
             argv0);
 }
 
@@ -475,8 +473,8 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
     if (ctrl_dim >= n_buttons + 3) {
-        control[0] = clamp_mouse_axis(delta.x * mouse_scale * 0.01f);
-        control[1] = clamp_mouse_axis(delta.y * mouse_scale * 0.01f);
+        control[0] = delta.x * mouse_scale * 0.01f;
+        control[1] = delta.y * mouse_scale * 0.01f;
         for (size_t i = 0; i < WORLD_KEY_BINDING_COUNT; ++i) {
             const WorldKeyBinding *binding = &WORLD_KEY_BINDINGS[i];
             if (binding->vk >= 0 && IsKeyDown(binding->ray_key)) {
@@ -492,13 +490,10 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
     }
 }
 
-static void merge_frame_control(LiveShared *s, const float *frame_control, float frame_seconds) {
+static void merge_frame_control(LiveShared *s, const float *frame_control) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    s->control[0] = clamp_mouse_axis(s->control[0] + frame_control[0]);
-    s->control[1] = clamp_mouse_axis(s->control[1] + frame_control[1]);
-    if (frame_seconds > 0.0f && frame_seconds < 0.25f) {
-        s->control_seconds += frame_seconds;
-    }
+    s->control[0] += frame_control[0];
+    s->control[1] += frame_control[1];
     for (int i = 0; i < s->n_buttons; ++i) {
         s->control[2 + i] = frame_control[2 + i];
     }
@@ -655,7 +650,6 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
             s->image_loading = 1;
             s->ready = 0;
             memset(s->control, 0, (size_t)s->ctrl_dim * sizeof(float));
-            s->control_seconds = 0.0f;
         }
         if (stop || (paused && !pending_image)) {
             world_mutex_unlock(&s->mutex);
@@ -716,17 +710,11 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         }
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
-            if (s->target_control_seconds > 0.0f && s->control_seconds > s->target_control_seconds) {
-                float k = s->target_control_seconds / s->control_seconds;
-                control[0] = clamp_mouse_axis(control[0] * k);
-                control[1] = clamp_mouse_axis(control[1] * k);
-            }
             control[0] = clamp_mouse_axis(control[0]);
             control[1] = clamp_mouse_axis(control[1]);
             s->control[0] = 0.0f;
             s->control[1] = 0.0f;
             s->control[2 + s->n_buttons] = 0.0f;
-            s->control_seconds = 0.0f;
         }
         world_mutex_unlock(&s->mutex);
         if (s->control_debug_enabled && s->ctrl_dim >= s->n_buttons + 3) {
@@ -873,13 +861,18 @@ static float playback_interval_seconds(float generation_seconds, int frames) {
     return generation_seconds / (float)frames;
 }
 
+static const float WORLD_HUD_SCALE = 2.0f;
+
 static void draw_hud_key(Rectangle key, const char *label, int pressed) {
-    Rectangle shadow = {key.x + 1.0f, key.y + 1.0f, key.width, key.height};
+    float s = WORLD_HUD_SCALE;
+    Rectangle shadow = {key.x + s, key.y + s, key.width, key.height};
     DrawRectangleRec(shadow, Fade(BLACK, 0.58f));
     DrawRectangleRec(key, pressed ? GREEN : Fade(BLACK, 0.48f));
-    DrawRectangleLinesEx(key, 1.0f, pressed ? RAYWHITE : Fade(RAYWHITE, 0.68f));
-    int font_size = 10;
-    while (font_size > 6 && MeasureText(label, font_size) > (int)key.width - 4) --font_size;
+    DrawRectangleLinesEx(key, s, pressed ? RAYWHITE : Fade(RAYWHITE, 0.68f));
+    int font_size = (int)(10.0f * s);
+    int min_font_size = (int)(6.0f * s);
+    int text_padding = (int)(4.0f * s);
+    while (font_size > min_font_size && MeasureText(label, font_size) > (int)key.width - text_padding) --font_size;
     int text_width = MeasureText(label, font_size);
     DrawText(label,
              (int)(key.x + (key.width - (float)text_width) * 0.5f),
@@ -888,11 +881,12 @@ static void draw_hud_key(Rectangle key, const char *label, int pressed) {
 }
 
 static void draw_keyboard_hud(int screen_width, int screen_height) {
-    const float key_w = 32.0f;
-    const float key_h = 28.0f;
-    const float gap = 4.0f;
-    float origin_x = (float)screen_width - 230.0f;
-    float origin_y = (float)screen_height - 110.0f;
+    float s = WORLD_HUD_SCALE;
+    const float key_w = 32.0f * s;
+    const float key_h = 28.0f * s;
+    const float gap = 4.0f * s;
+    float origin_x = (float)screen_width - 230.0f * s;
+    float origin_y = (float)screen_height - 142.0f * s;
 
     draw_hud_key((Rectangle){origin_x + key_w + gap, origin_y, key_w, key_h},
                  "W", IsKeyDown(KEY_W));
@@ -904,58 +898,61 @@ static void draw_keyboard_hud(int screen_width, int screen_height) {
     draw_hud_key((Rectangle){origin_x + (key_w + gap) * 2.0f, origin_y + key_h + gap, key_w, key_h},
                  "D", IsKeyDown(KEY_D));
 
-    draw_hud_key((Rectangle){origin_x, origin_y + (key_h + gap) * 2.0f, 52.0f, key_h},
-                 "Shift", IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
-    draw_hud_key((Rectangle){origin_x + 56.0f, origin_y + (key_h + gap) * 2.0f, 48.0f, key_h},
-                 "Ctrl", IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL));
+    draw_hud_key((Rectangle){origin_x, origin_y + (key_h + gap) * 2.0f, 52.0f * s, key_h},
+                  "Shift", IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
+    draw_hud_key((Rectangle){origin_x + 56.0f * s, origin_y + (key_h + gap) * 2.0f, 48.0f * s, key_h},
+                  "Ctrl", IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL));
+    draw_hud_key((Rectangle){origin_x, origin_y + (key_h + gap) * 3.0f, 104.0f * s, key_h},
+                  "Space", IsKeyDown(KEY_SPACE));
 }
 
 static void draw_mouse_hud(int screen_width, int screen_height, float mouse_x, float mouse_y, float scroll) {
+    float s = WORLD_HUD_SCALE;
     Color active = ORANGE;
     Color grid = Fade(RAYWHITE, 0.48f);
-    float radius = 30.0f;
-    Vector2 center = {(float)screen_width - 58.0f, (float)screen_height - 76.0f};
+    float radius = 30.0f * s;
+    Vector2 center = {(float)screen_width - 58.0f * s, (float)screen_height - 76.0f * s};
     DrawCircleV(center, radius, Fade(BLACK, 0.28f));
-    DrawLineEx((Vector2){center.x - radius + 7.0f, center.y},
-               (Vector2){center.x + radius - 7.0f, center.y}, 1.0f, grid);
-    DrawLineEx((Vector2){center.x, center.y - radius + 7.0f},
-               (Vector2){center.x, center.y + radius - 7.0f}, 1.0f, grid);
-    Vector2 shadow_center = {center.x + 2.0f, center.y + 2.0f};
-    DrawRing(shadow_center, radius - 1.0f, radius + 1.0f, 0.0f, 360.0f, 48,
-             Fade(BLACK, 0.62f));
-    DrawRing(center, radius - 1.0f, radius, 0.0f, 360.0f, 48, RAYWHITE);
+    DrawLineEx((Vector2){center.x - radius + 7.0f * s, center.y},
+               (Vector2){center.x + radius - 7.0f * s, center.y}, s, grid);
+    DrawLineEx((Vector2){center.x, center.y - radius + 7.0f * s},
+               (Vector2){center.x, center.y + radius - 7.0f * s}, s, grid);
+    Vector2 shadow_center = {center.x + 2.0f * s, center.y + 2.0f * s};
+    DrawRing(shadow_center, radius - s, radius + s, 0.0f, 360.0f, 48,
+              Fade(BLACK, 0.62f));
+    DrawRing(center, radius - s, radius, 0.0f, 360.0f, 48, RAYWHITE);
 
     float magnitude = sqrtf(mouse_x * mouse_x + mouse_y * mouse_y);
     if (magnitude > 1.0e-5f) {
         float nx = mouse_x / magnitude;
         float ny = mouse_y / magnitude;
         float strength = fminf(1.0f, sqrtf(fminf(magnitude, 1.0f)) * 1.6f);
-        float vector_length = (radius - 8.0f) * strength;
+        float vector_length = (radius - 8.0f * s) * strength;
         Vector2 tip = {center.x + nx * vector_length, center.y + ny * vector_length};
-        DrawLineEx(center, tip, 3.0f, active);
-        Vector2 left = {tip.x - nx * 7.0f - ny * 4.0f,
-                        tip.y - ny * 7.0f + nx * 4.0f};
-        Vector2 right = {tip.x - nx * 7.0f + ny * 4.0f,
-                         tip.y - ny * 7.0f - nx * 4.0f};
+        DrawLineEx(center, tip, 3.0f * s, active);
+        Vector2 left = {tip.x - nx * 7.0f * s - ny * 4.0f * s,
+                        tip.y - ny * 7.0f * s + nx * 4.0f * s};
+        Vector2 right = {tip.x - nx * 7.0f * s + ny * 4.0f * s,
+                         tip.y - ny * 7.0f * s - nx * 4.0f * s};
         DrawTriangle(tip, right, left, active);
     }
-    DrawCircleV(center, 3.0f, magnitude > 1.0e-5f ? active : RAYWHITE);
+    DrawCircleV(center, 3.0f * s, magnitude > 1.0e-5f ? active : RAYWHITE);
 
-    DrawRectangle((int)center.x - 3, (int)center.y - 13, 6, 9,
-                  scroll > 0.0f ? active : Fade(RAYWHITE, 0.62f));
-    DrawRectangle((int)center.x - 3, (int)center.y + 4, 6, 9,
-                  scroll < 0.0f ? active : Fade(RAYWHITE, 0.62f));
-    DrawRectangle((int)(center.x - radius - 4.0f), (int)center.y - 9, 5, 18,
-                  IsMouseButtonDown(MOUSE_BUTTON_SIDE) ? active : Fade(RAYWHITE, 0.55f));
-    DrawRectangle((int)(center.x + radius - 1.0f), (int)center.y - 9, 5, 18,
-                  IsMouseButtonDown(MOUSE_BUTTON_EXTRA) ? active : Fade(RAYWHITE, 0.55f));
+    DrawRectangle((int)(center.x - 3.0f * s), (int)(center.y - 13.0f * s), (int)(6.0f * s), (int)(9.0f * s),
+                   scroll > 0.0f ? active : Fade(RAYWHITE, 0.62f));
+    DrawRectangle((int)(center.x - 3.0f * s), (int)(center.y + 4.0f * s), (int)(6.0f * s), (int)(9.0f * s),
+                   scroll < 0.0f ? active : Fade(RAYWHITE, 0.62f));
+    DrawRectangle((int)(center.x - radius - 4.0f * s), (int)(center.y - 9.0f * s), (int)(5.0f * s), (int)(18.0f * s),
+                   IsMouseButtonDown(MOUSE_BUTTON_SIDE) ? active : Fade(RAYWHITE, 0.55f));
+    DrawRectangle((int)(center.x + radius - s), (int)(center.y - 9.0f * s), (int)(5.0f * s), (int)(18.0f * s),
+                   IsMouseButtonDown(MOUSE_BUTTON_EXTRA) ? active : Fade(RAYWHITE, 0.55f));
 
-    draw_hud_key((Rectangle){center.x - 39.0f, center.y + radius + 6.0f, 24.0f, 20.0f},
-                 "L", IsMouseButtonDown(MOUSE_BUTTON_LEFT));
-    draw_hud_key((Rectangle){center.x - 12.0f, center.y + radius + 6.0f, 24.0f, 20.0f},
-                 "M", IsMouseButtonDown(MOUSE_BUTTON_MIDDLE));
-    draw_hud_key((Rectangle){center.x + 15.0f, center.y + radius + 6.0f, 24.0f, 20.0f},
-                 "R", IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
+    draw_hud_key((Rectangle){center.x - 39.0f * s, center.y + radius + 6.0f * s, 24.0f * s, 20.0f * s},
+                  "L", IsMouseButtonDown(MOUSE_BUTTON_LEFT));
+    draw_hud_key((Rectangle){center.x - 12.0f * s, center.y + radius + 6.0f * s, 24.0f * s, 20.0f * s},
+                  "M", IsMouseButtonDown(MOUSE_BUTTON_MIDDLE));
+    draw_hud_key((Rectangle){center.x + 15.0f * s, center.y + radius + 6.0f * s, 24.0f * s, 20.0f * s},
+                  "R", IsMouseButtonDown(MOUSE_BUTTON_RIGHT));
 }
 
 static void draw_live_hud(
@@ -976,34 +973,37 @@ static void draw_live_hud(
     Color fps_color = rounded_fps >= 60 ? GREEN : (rounded_fps >= 30 ? ORANGE : RED);
     char fps_text[32];
     snprintf(fps_text, sizeof(fps_text), "%d FPS", rounded_fps);
-    int fps_font_size = 20;
+    float s = WORLD_HUD_SCALE;
+    int fps_font_size = (int)(20.0f * s);
     int fps_width = MeasureText(fps_text, fps_font_size);
-    int fps_x = screen_width - fps_width - 18;
-    DrawText(fps_text, fps_x + 2, 20, fps_font_size, Fade(BLACK, 0.82f));
-    DrawText(fps_text, fps_x, 18, fps_font_size, fps_color);
+    int fps_x = screen_width - fps_width - (int)(18.0f * s);
+    int fps_y = (int)(18.0f * s);
+    DrawText(fps_text, fps_x + (int)(2.0f * s), fps_y + (int)(2.0f * s), fps_font_size, Fade(BLACK, 0.82f));
+    DrawText(fps_text, fps_x, fps_y, fps_font_size, fps_color);
 
     if (paused) {
         const char *pause_text = "PAUSED";
-        int pause_font_size = 24;
+        int pause_font_size = (int)(24.0f * s);
         int pause_text_width = MeasureText(pause_text, pause_font_size);
-        int pause_width = 31 + pause_text_width;
+        int pause_label_x = (int)(31.0f * s);
+        int pause_width = pause_label_x + pause_text_width;
         int pause_x = (screen_width - pause_width) / 2;
         int pause_y = screen_height / 2 - pause_font_size / 2;
-        DrawRectangle(pause_x + 2, pause_y + 3, 6, 24, Fade(BLACK, 0.82f));
-        DrawRectangle(pause_x + 14, pause_y + 3, 6, 24, Fade(BLACK, 0.82f));
-        DrawRectangle(pause_x, pause_y + 1, 6, 24, ORANGE);
-        DrawRectangle(pause_x + 12, pause_y + 1, 6, 24, ORANGE);
-        DrawText(pause_text, pause_x + 31 + 2, pause_y + 2,
-                 pause_font_size, Fade(BLACK, 0.82f));
-        DrawText(pause_text, pause_x + 31, pause_y,
-                 pause_font_size, RAYWHITE);
+        DrawRectangle(pause_x + (int)(2.0f * s), pause_y + (int)(3.0f * s), (int)(6.0f * s), (int)(24.0f * s), Fade(BLACK, 0.82f));
+        DrawRectangle(pause_x + (int)(14.0f * s), pause_y + (int)(3.0f * s), (int)(6.0f * s), (int)(24.0f * s), Fade(BLACK, 0.82f));
+        DrawRectangle(pause_x, pause_y + (int)s, (int)(6.0f * s), (int)(24.0f * s), ORANGE);
+        DrawRectangle(pause_x + (int)(12.0f * s), pause_y + (int)s, (int)(6.0f * s), (int)(24.0f * s), ORANGE);
+        DrawText(pause_text, pause_x + pause_label_x + (int)(2.0f * s), pause_y + (int)(2.0f * s),
+                  pause_font_size, Fade(BLACK, 0.82f));
+        DrawText(pause_text, pause_x + pause_label_x, pause_y,
+                  pause_font_size, RAYWHITE);
     } else if (image_loading) {
         const char *loading_text = "LOADING IMAGE";
-        int font_size = 20;
+        int font_size = (int)(20.0f * s);
         int text_width = MeasureText(loading_text, font_size);
         int x = (screen_width - text_width) / 2;
         int y = screen_height / 2 - font_size / 2;
-        DrawText(loading_text, x + 2, y + 2, font_size, Fade(BLACK, 0.82f));
+        DrawText(loading_text, x + (int)(2.0f * s), y + (int)(2.0f * s), font_size, Fade(BLACK, 0.82f));
         DrawText(loading_text, x, y, font_size, RAYWHITE);
     }
 }
@@ -1018,8 +1018,8 @@ int main(int argc, char **argv) {
     int steps_to_run = -1;
     int layers_to_run = -1;
     int frame_idx = 0;
-    int window_width = 1280;
-    int window_height = 720;
+    int window_width = 1600;
+    int window_height = 800;
     int warmup_chunks = 1;
     int headless_smoke = 0;
     int headless_generate_chunks = 0;
@@ -1031,7 +1031,7 @@ int main(int argc, char **argv) {
     float headless_mouse_x = 0.0f;
     float headless_mouse_y = 0.0f;
     int headless_button = -1;
-    float mouse_scale = 10.0f;
+    float mouse_scale = 30.0f;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
     int positional_model_seen = 0;
@@ -1490,8 +1490,9 @@ int main(int argc, char **argv) {
     }
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
-    InitWindow(window_width, window_height, "worldmodel.cu");
+    InitWindow(window_width, window_height, "worldmodel.c");
     SetWindowMinSize(640, 360);
+    MaximizeWindow();
     SetExitKey(KEY_NULL);
     DisableCursor();
     SetTargetFPS(60);
@@ -1523,7 +1524,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "raylib control debug enabled by WORLD_CONTROL_DEBUG=1\n");
         }
     }
-    shared.target_control_seconds = cfg.inference_fps > 0 ? (float)rgb_frames / (float)cfg.inference_fps : 0.0f;
     shared.latent_elems = seed_latent_elems;
     shared.reset_frame_idx = frame_idx;
     shared.seed = seed;
@@ -1597,7 +1597,6 @@ int main(int argc, char **argv) {
                 shared.ready = 0;
                 shared.paused = 0;
                 memset(shared.control, 0, (size_t)shared.ctrl_dim * sizeof(float));
-                shared.control_seconds = 0.0f;
                 world_mutex_unlock(&shared.mutex);
                 paused = 0;
                 DisableCursor();
@@ -1619,11 +1618,10 @@ int main(int argc, char **argv) {
             shared.paused = paused;
             if (paused) {
                 memset(shared.control, 0, (size_t)shared.ctrl_dim * sizeof(float));
-                shared.control_seconds = 0.0f;
             }
         }
         if (!shared.paused) {
-            merge_frame_control(&shared, frame_control, frame_seconds);
+            merge_frame_control(&shared, frame_control);
         }
         paused = shared.paused;
         image_loading = shared.image_loading || shared.image_pending;

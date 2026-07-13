@@ -7765,9 +7765,9 @@ int world_vulkan_runtime_create(
     VkApplicationInfo app_info;
     memset(&app_info, 0, sizeof(app_info));
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.pApplicationName = "worldmodel.cu";
+    app_info.pApplicationName = "worldmodel.c";
     app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-    app_info.pEngineName = "worldmodel.cu";
+    app_info.pEngineName = "worldmodel.c";
     app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     app_info.apiVersion = VK_API_VERSION_1_2;
 

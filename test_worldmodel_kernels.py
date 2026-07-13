@@ -49,10 +49,10 @@ def find_cutlass_example_include(cutlass_include: Path):
 
 def load_wm_cuda():
     if not torch.cuda.is_available() or CUDA_HOME is None:
-        pytest.skip("CUDA and nvcc are required for worldmodel.cu parity tests")
+        pytest.skip("CUDA and nvcc are required for worldmodel.c parity tests")
     cutlass_include = find_cutlass_include()
     if cutlass_include is None:
-        pytest.skip("CUTLASS include directory is required for worldmodel.cu parity tests")
+        pytest.skip("CUTLASS include directory is required for worldmodel.c parity tests")
     include_paths = [str(cutlass_include)]
     cutlass_fmha_include = find_cutlass_example_include(cutlass_include)
     if cutlass_fmha_include is not None:
