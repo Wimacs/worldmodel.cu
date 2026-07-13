@@ -1575,6 +1575,49 @@ __global__ static void taehv_conv2d_nchw_kernel(
     out[i] = sum;
 }
 
+__global__ static void taehv_conv2d_stride2_nchw_kernel(
+        const float *in,
+        const float *weight,
+        const float *bias,
+        float *out,
+        int N,
+        int C_in,
+        int C_out,
+        int H,
+        int W,
+        int K,
+        int has_bias) {
+    int H_out = (H + 1) / 2;
+    int W_out = (W + 1) / 2;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * C_out * H_out * W_out;
+    if (i >= total) return;
+
+    int x = (int)(i % W_out);
+    int64_t q = i / W_out;
+    int y = (int)(q % H_out);
+    q /= H_out;
+    int co = (int)(q % C_out);
+    int n = (int)(q / C_out);
+    int pad = K / 2;
+
+    float sum = has_bias ? bias[co] : 0.0f;
+    for (int ci = 0; ci < C_in; ++ci) {
+        for (int ky = 0; ky < K; ++ky) {
+            int iy = y * 2 + ky - pad;
+            if (iy < 0 || iy >= H) continue;
+            for (int kx = 0; kx < K; ++kx) {
+                int ix = x * 2 + kx - pad;
+                if (ix < 0 || ix >= W) continue;
+                float xv = in[((int64_t)n * C_in * H + ci * H + iy) * W + ix];
+                float wv = weight[(((int64_t)co * C_in + ci) * K + ky) * K + kx];
+                sum += xv * wv;
+            }
+        }
+    }
+    out[i] = sum;
+}
+
 __global__ static void taehv_add_bias_nchw_kernel(
         float *out,
         const float *bias,
@@ -1707,6 +1750,33 @@ __global__ static void taehv_concat_memory_nchw_kernel(
     } else {
         int c = c2 - C;
         out[i] = past[((int64_t)c * H + h) * W + w];
+    }
+}
+
+__global__ static void taehv_concat_past_nchw_kernel(
+        const float *x,
+        float *out,
+        int N,
+        int C,
+        int H,
+        int W) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * 2 * C * H * W;
+    if (i >= total) return;
+
+    int w = (int)(i % W);
+    int64_t q = i / W;
+    int h = (int)(q % H);
+    q /= H;
+    int c2 = (int)(q % (2 * C));
+    int n = (int)(q / (2 * C));
+    if (c2 < C) {
+        out[i] = x[((int64_t)n * C * H + c2 * H + h) * W + w];
+    } else if (n == 0) {
+        out[i] = 0.0f;
+    } else {
+        int c = c2 - C;
+        out[i] = x[((int64_t)(n - 1) * C * H + c * H + h) * W + w];
     }
 }
 
@@ -3471,6 +3541,7 @@ enum {
 
 typedef struct {
     DeviceVaeConvWeight convs[WORLD_VAE_DECODER_CONV_COUNT];
+    DeviceVaeConvWeight encoder_convs[WORLD_VAE_ENCODER_CONV_COUNT];
     float *buf0;
     float *buf1;
     float *buf2;
@@ -3497,6 +3568,7 @@ typedef struct {
     int W_pre_shuffle;
     int stream_started_f32;
     int stream_started_h;
+    int encoder_enabled;
     int fp16_nhwc_enabled;
     int cutlass_1x1_enabled;
     int cutlass_3x3_enabled;
@@ -3541,10 +3613,14 @@ static void taehv_pick_scratch_h(__half *cur, __half *buf0, __half *buf1, __half
     *aux = second;
 }
 
-static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT], const WorldVaeDecoderWeights *host, int pack_krsc_half) {
-    memset(dev, 0, WORLD_VAE_DECODER_CONV_COUNT * sizeof(dev[0]));
-    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
-        const WorldVaeConvWeight *src = &host->convs[i];
+static int taehv_copy_weights(
+        DeviceVaeConvWeight *dev,
+        const WorldVaeConvWeight *host,
+        int count,
+        int pack_krsc_half) {
+    memset(dev, 0, (size_t)count * sizeof(dev[0]));
+    for (int i = 0; i < count; ++i) {
+        const WorldVaeConvWeight *src = &host[i];
         DeviceVaeConvWeight *dst = &dev[i];
         dst->out_c = src->out_c;
         dst->in_c = src->in_c;
@@ -3571,8 +3647,8 @@ static int taehv_copy_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COU
     return 0;
 }
 
-static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_COUNT]) {
-    for (int i = 0; i < WORLD_VAE_DECODER_CONV_COUNT; ++i) {
+static void taehv_free_weights(DeviceVaeConvWeight *dev, int count) {
+    for (int i = 0; i < count; ++i) {
         cudaFree(dev[i].weight);
         cudaFree(dev[i].bias);
         cudaFree(dev[i].weight_h);
@@ -3588,7 +3664,8 @@ static void taehv_free_weights(DeviceVaeConvWeight dev[WORLD_VAE_DECODER_CONV_CO
 
 static void taehv_decoder_free(DeviceVaeDecoder *dec) {
     if (!dec) return;
-    taehv_free_weights(dec->convs);
+    taehv_free_weights(dec->convs, WORLD_VAE_DECODER_CONV_COUNT);
+    taehv_free_weights(dec->encoder_convs, WORLD_VAE_ENCODER_CONV_COUNT);
     cudaFree(dec->buf0);
     cudaFree(dec->buf1);
     cudaFree(dec->buf2);
@@ -3673,7 +3750,8 @@ static int taehv_decoder_init(DeviceVaeDecoder *dec, const WorldConfig *cfg, con
     } \
 } while (0)
 
-    if (taehv_copy_weights(dec->convs, host, dec->fp16_nhwc_enabled)) goto fail;
+    if (taehv_copy_weights(dec->convs, host->convs,
+                WORLD_VAE_DECODER_CONV_COUNT, dec->fp16_nhwc_enabled)) goto fail;
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf0, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf1, dec->max_elems * sizeof(float)));
     VAE_INIT_CUDA(cudaMalloc((void **)&dec->buf2, dec->max_elems * sizeof(float)));
@@ -4111,6 +4189,24 @@ static int taehv_run_conv_h_nhwc(DeviceVaeDecoder *dec, const __half *in, __half
     return 0;
 }
 
+static int taehv_run_conv_stride2(
+        const float *in,
+        float *out,
+        const DeviceVaeConvWeight *conv,
+        int N,
+        int H,
+        int W) {
+    if (!in || !out || !conv || conv->kernel != 3) return 1;
+    int H_out = (H + 1) / 2;
+    int W_out = (W + 1) / 2;
+    int64_t total = (int64_t)N * conv->out_c * H_out * W_out;
+    taehv_conv2d_stride2_nchw_kernel<<<div_up_i64(total, 256), 256>>>(
+        in, conv->weight, conv->bias, out,
+        N, conv->in_c, conv->out_c, H, W, conv->kernel, conv->has_bias);
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int taehv_run_relu(float *x, int64_t n) {
     taehv_relu_kernel<<<div_up_i64(n, 256), 256>>>(x, n);
     CUDA_OK(cudaGetLastError());
@@ -4186,6 +4282,149 @@ static int taehv_run_memblock_stream_h_nhwc(
     taehv_add_relu_nhwc_h_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
     CUDA_OK(cudaGetLastError());
     *cur_io = aux;
+    return 0;
+}
+
+static int taehv_run_memblock_batch(
+        DeviceVaeDecoder *dec,
+        float **cur_io,
+        float *buf0,
+        float *buf1,
+        float *buf2,
+        const DeviceVaeConvWeight *conv0,
+        const DeviceVaeConvWeight *conv2,
+        const DeviceVaeConvWeight *conv4,
+        int N,
+        int C,
+        int H,
+        int W) {
+    float *cur = *cur_io;
+    float *tmp = NULL;
+    float *aux = NULL;
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux);
+
+    int64_t elems = (int64_t)N * C * H * W;
+    taehv_concat_past_nchw_kernel<<<div_up_i64(elems * 2, 256), 256>>>(
+        cur, aux, N, C, H, W);
+    CUDA_OK(cudaGetLastError());
+    if (taehv_run_conv(dec, aux, tmp, conv0, N, H, W)) return 1;
+    if (taehv_run_relu(tmp, elems)) return 1;
+    if (taehv_run_conv(dec, tmp, aux, conv2, N, H, W)) return 1;
+    if (taehv_run_relu(aux, elems)) return 1;
+    if (taehv_run_conv(dec, aux, tmp, conv4, N, H, W)) return 1;
+    taehv_add_relu_kernel<<<div_up_i64(elems, 256), 256>>>(cur, tmp, aux, elems);
+    CUDA_OK(cudaGetLastError());
+    *cur_io = aux;
+    return 0;
+}
+
+static int taehv_encode_image_rgb(
+        const WorldConfig *cfg,
+        DeviceVaeDecoder *dec,
+        const float *rgb,
+        int width,
+        int height,
+        float *latent_out) {
+    if (!cfg || !dec || !dec->encoder_enabled || !rgb || !latent_out) return 1;
+    int expected_h = cfg->height * cfg->patch_h * 16;
+    int expected_w = cfg->width * cfg->patch_w * 16;
+    if (width != expected_w || height != expected_h || (width & 1) || (height & 1)) {
+        fprintf(stderr, "VAE encoder expected RGB %dx%d, got %dx%d\n",
+                expected_w, expected_h, width, height);
+        return 1;
+    }
+
+    int N = 4;
+    int C = 12;
+    int H = height / 2;
+    int W = width / 2;
+    size_t input_elems = (size_t)N * C * H * W;
+    if (input_elems > dec->max_elems) return 1;
+    float *input = (float *)malloc(input_elems * sizeof(float));
+    if (!input) return 1;
+    for (int n = 0; n < N; ++n) {
+        for (int c = 0; c < 3; ++c) {
+            for (int dy = 0; dy < 2; ++dy) {
+                for (int dx = 0; dx < 2; ++dx) {
+                    int out_c = c * 4 + dy * 2 + dx;
+                    float *dst = input + ((size_t)n * C + out_c) * H * W;
+                    for (int y = 0; y < H; ++y) {
+                        const float *src = rgb + ((size_t)(y * 2 + dy) * width + dx) * 3 + c;
+                        for (int x = 0; x < W; ++x) dst[(size_t)y * W + x] = src[(size_t)x * 6];
+                    }
+                }
+            }
+        }
+    }
+    CUDA_OK(cudaMemcpy(dec->buf0, input, input_elems * sizeof(float), cudaMemcpyHostToDevice));
+    free(input);
+
+    float *buf0 = dec->buf0;
+    float *buf1 = dec->buf1;
+    float *buf2 = dec->buf2;
+    float *cur = buf0;
+    float *tmp = NULL;
+    float *aux = NULL;
+
+#define VAE_ENC_CONV_TO(idx, out_c) do { \
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv(dec, cur, tmp, &dec->encoder_convs[(idx)], N, H, W)) return 1; \
+    cur = tmp; \
+    C = (out_c); \
+} while (0)
+#define VAE_ENC_RELU() do { \
+    if (taehv_run_relu(cur, (int64_t)N * C * H * W)) return 1; \
+} while (0)
+#define VAE_ENC_MEMBLOCK(a, b, c) do { \
+    if (taehv_run_memblock_batch(dec, &cur, buf0, buf1, buf2, \
+                &dec->encoder_convs[(a)], &dec->encoder_convs[(b)], \
+                &dec->encoder_convs[(c)], N, C, H, W)) return 1; \
+} while (0)
+#define VAE_ENC_STRIDE2(idx, out_c) do { \
+    taehv_pick_scratch(cur, buf0, buf1, buf2, &tmp, &aux); \
+    if (taehv_run_conv_stride2(cur, tmp, &dec->encoder_convs[(idx)], N, H, W)) return 1; \
+    cur = tmp; \
+    C = (out_c); \
+    H = (H + 1) / 2; \
+    W = (W + 1) / 2; \
+} while (0)
+
+    VAE_ENC_CONV_TO(WORLD_VAE_ENC_CONV_IN, 64);
+    VAE_ENC_RELU();
+    N /= 2;
+    C *= 2;
+    VAE_ENC_CONV_TO(WORLD_VAE_ENC_TPOOL2, 64);
+    VAE_ENC_STRIDE2(WORLD_VAE_ENC_CONV3, 64);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB4_0, WORLD_VAE_ENC_MB4_2, WORLD_VAE_ENC_MB4_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB5_0, WORLD_VAE_ENC_MB5_2, WORLD_VAE_ENC_MB5_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB6_0, WORLD_VAE_ENC_MB6_2, WORLD_VAE_ENC_MB6_4);
+    N /= 2;
+    C *= 2;
+    VAE_ENC_CONV_TO(WORLD_VAE_ENC_TPOOL7, 64);
+    VAE_ENC_STRIDE2(WORLD_VAE_ENC_CONV8, 64);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB9_0, WORLD_VAE_ENC_MB9_2, WORLD_VAE_ENC_MB9_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB10_0, WORLD_VAE_ENC_MB10_2, WORLD_VAE_ENC_MB10_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB11_0, WORLD_VAE_ENC_MB11_2, WORLD_VAE_ENC_MB11_4);
+    VAE_ENC_CONV_TO(WORLD_VAE_ENC_TPOOL12, 64);
+    VAE_ENC_STRIDE2(WORLD_VAE_ENC_CONV13, 64);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB14_0, WORLD_VAE_ENC_MB14_2, WORLD_VAE_ENC_MB14_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB15_0, WORLD_VAE_ENC_MB15_2, WORLD_VAE_ENC_MB15_4);
+    VAE_ENC_MEMBLOCK(WORLD_VAE_ENC_MB16_0, WORLD_VAE_ENC_MB16_2, WORLD_VAE_ENC_MB16_4);
+    VAE_ENC_CONV_TO(WORLD_VAE_ENC_CONV_OUT, cfg->channels);
+
+#undef VAE_ENC_CONV_TO
+#undef VAE_ENC_RELU
+#undef VAE_ENC_MEMBLOCK
+#undef VAE_ENC_STRIDE2
+
+    if (N != 1 || C != cfg->channels || H != cfg->height * cfg->patch_h ||
+            W != cfg->width * cfg->patch_w) {
+        fprintf(stderr, "VAE encoder produced unexpected latent [%d,%d,%d,%d]\n", N, C, H, W);
+        return 1;
+    }
+    CUDA_OK(cudaMemcpy(latent_out, cur,
+                (size_t)C * H * W * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_OK(cudaDeviceSynchronize());
     return 0;
 }
 
@@ -5371,6 +5610,86 @@ fail:
 #undef RT_CUDA
     world_cuda_runtime_destroy(rt);
     return 1;
+}
+
+extern "C" int world_cuda_runtime_init_vae_encoder(
+        WorldCudaRuntime *rt,
+        const WorldVaeEncoderWeights *encoder) {
+    if (!rt || !encoder || !rt->d_vae.buf0) return 1;
+    CUDA_OK(cudaDeviceSynchronize());
+    taehv_free_weights(rt->d_vae.encoder_convs, WORLD_VAE_ENCODER_CONV_COUNT);
+    if (taehv_copy_weights(rt->d_vae.encoder_convs, encoder->convs,
+                WORLD_VAE_ENCODER_CONV_COUNT, 0)) {
+        taehv_free_weights(rt->d_vae.encoder_convs, WORLD_VAE_ENCODER_CONV_COUNT);
+        return 1;
+    }
+    rt->d_vae.encoder_enabled = 1;
+    fprintf(stderr, "VAE encoder initialized: RGB %dx%d -> latent [%d,%d,%d]\n",
+            rt->W * 16, rt->H * 16, rt->C, rt->H, rt->W);
+    return 0;
+}
+
+extern "C" int world_cuda_runtime_encode_image_rgb(
+        WorldCudaRuntime *rt,
+        const float *rgb,
+        int width,
+        int height,
+        float *latent_out,
+        float *seconds_out) {
+    if (!rt || !rgb || !latent_out) return 1;
+    double t0 = monotonic_seconds();
+    if (taehv_encode_image_rgb(&rt->cfg, &rt->d_vae, rgb, width, height, latent_out)) return 1;
+    float elapsed = (float)(monotonic_seconds() - t0);
+    if (seconds_out) *seconds_out = elapsed;
+    const char *dump_path = getenv("WORLD_DUMP_VAE_LATENT");
+    if (dump_path && dump_path[0]) {
+        FILE *dump = fopen(dump_path, "wb");
+        size_t elems = (size_t)rt->C * rt->H * rt->W;
+        if (!dump || fwrite(latent_out, sizeof(float), elems, dump) != elems) {
+            fprintf(stderr, "failed to write VAE latent dump: %s\n", dump_path);
+            if (dump) fclose(dump);
+            return 1;
+        }
+        fclose(dump);
+    }
+    fprintf(stderr, "VAE encode CUDA: RGB %dx%d -> latent [%d,%d,%d] in %.3fms\n",
+            width, height, rt->C, rt->H, rt->W, elapsed * 1000.0f);
+    return 0;
+}
+
+extern "C" int world_cuda_runtime_reset(WorldCudaRuntime *rt, int frame_idx, unsigned int seed) {
+    if (!rt || frame_idx < 0) return 1;
+    CUDA_OK(cudaDeviceSynchronize());
+    for (int layer = 0; layer < rt->layers_to_run; ++layer) {
+        DeviceWorldLayerCache *cache = &rt->d_caches[layer];
+        init_cache_written_kernel<<<div_up_i64(cache->capacity, 256), 256>>>(
+            cache->written, cache->ring_length, rt->T);
+        CUDA_OK(cudaGetLastError());
+        CUDA_OK(cudaMemset(cache->index_count, 0, sizeof(int)));
+        CUDA_OK(cudaMemset(cache->indices, 0, (size_t)cache->capacity * sizeof(int64_t)));
+        CUDA_OK(cudaMemset(cache->block_ids, 0,
+                    (size_t)div_up_i64(cache->capacity, 128) * sizeof(int32_t)));
+        memset(cache->h_slot_written, 0, (size_t)cache->slot_count);
+        cache->h_slot_written[cache->slot_count - 1] = 1;
+    }
+    for (int i = 0; i < WORLD_VAE_STREAM_MEM_COUNT; ++i) {
+        size_t elems = taehv_stream_mem_elems(&rt->cfg, i);
+        if (rt->d_vae.stream_mem[i]) {
+            CUDA_OK(cudaMemset(rt->d_vae.stream_mem[i], 0, elems * sizeof(float)));
+        }
+        if (rt->d_vae.hstream_mem[i]) {
+            CUDA_OK(cudaMemset(rt->d_vae.hstream_mem[i], 0, elems * sizeof(__half)));
+        }
+    }
+    rt->d_vae.stream_started_f32 = 0;
+    rt->d_vae.stream_started_h = 0;
+    rt->h_latent_override = NULL;
+    rt->next_frame_idx = frame_idx;
+    rt->frame_ordinal = 0;
+    rt->seed = seed;
+    CUDA_OK(cudaDeviceSynchronize());
+    fprintf(stderr, "CUDA runtime reset: frame_idx=%d seed=%u\n", frame_idx, seed);
+    return 0;
 }
 
 extern "C" int world_cuda_runtime_step_rgb(

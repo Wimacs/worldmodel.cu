@@ -246,6 +246,7 @@ if(WORLD_ENABLE_VULKAN)
     taehv_conv2d_nchw_1x1_c4_f32.comp
     taehv_conv2d_nchw_c4_f32.comp
     taehv_conv2d_nchw_f32.comp
+    taehv_conv2d_stride2_nchw_c4_f32.comp
     taehv_conv2d_nchw_wf16_coopmat_n32.comp
     taehv_conv_out_rgba_f32.comp
     taehv_pixel_shuffle_rgba_f32.comp
@@ -316,6 +317,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt)
   set(USE_AUDIO OFF CACHE BOOL "" FORCE)
   set(SUPPORT_MODULE_RAUDIO OFF CACHE BOOL "" FORCE)
   set(SUPPORT_MODULE_RMODELS OFF CACHE BOOL "" FORCE)
+  set(SUPPORT_FILEFORMAT_JPG ON CACHE BOOL "" FORCE)
   add_subdirectory(3rd/raylib EXCLUDE_FROM_ALL)
 
   if(WORLD_ENABLE_CUDA)

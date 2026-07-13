@@ -1625,6 +1625,48 @@ __global__ void taehv_conv2d_nchw_f32_kernel(
     out[i] = sum;
 }
 
+__global__ void taehv_conv2d_stride2_nchw_f32_kernel(
+        const float *in,
+        const float *weight,
+        const float *bias,
+        float *out,
+        int N,
+        int C_in,
+        int C_out,
+        int H,
+        int W,
+        int K) {
+    int H_out = (H + 1) / 2;
+    int W_out = (W + 1) / 2;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)N * C_out * H_out * W_out;
+    if (i >= total) return;
+
+    int x = (int)(i % W_out);
+    int64_t q = i / W_out;
+    int y = (int)(q % H_out);
+    q /= H_out;
+    int co = (int)(q % C_out);
+    int n = (int)(q / C_out);
+    int pad = K / 2;
+
+    float sum = bias ? bias[co] : 0.0f;
+    for (int ci = 0; ci < C_in; ++ci) {
+        for (int ky = 0; ky < K; ++ky) {
+            int iy = y * 2 + ky - pad;
+            if (iy < 0 || iy >= H) continue;
+            for (int kx = 0; kx < K; ++kx) {
+                int ix = x * 2 + kx - pad;
+                if (ix < 0 || ix >= W) continue;
+                float xv = in[((int64_t)n * C_in * H + ci * H + iy) * W + ix];
+                float wv = weight[(((int64_t)co * C_in + ci) * K + ky) * K + kx];
+                sum += xv * wv;
+            }
+        }
+    }
+    out[i] = sum;
+}
+
 __global__ void taehv_add_bias_nchw_f32_kernel(
         float *out,
         const float *bias,
@@ -3996,6 +4038,39 @@ torch::Tensor taehv_conv2d_cuda(torch::Tensor x, torch::Tensor weight, torch::Te
     return out;
 }
 
+torch::Tensor taehv_conv2d_stride2_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    WM_CHECK_CUDA(x);
+    WM_CHECK_CUDA(weight);
+    WM_CHECK_CUDA(bias);
+    WM_CHECK_CONTIGUOUS(x);
+    WM_CHECK_CONTIGUOUS(weight);
+    WM_CHECK_CONTIGUOUS(bias);
+    WM_CHECK_F32(x);
+    WM_CHECK_F32(weight);
+    WM_CHECK_F32(bias);
+    TORCH_CHECK(x.dim() == 4, "x must be [N,C,H,W]");
+    TORCH_CHECK(weight.dim() == 4, "weight must be [Cout,Cin,3,3]");
+    TORCH_CHECK(weight.size(1) == x.size(1), "input channel mismatch");
+    TORCH_CHECK(weight.size(2) == 3 && weight.size(3) == 3, "kernel must be 3x3");
+    TORCH_CHECK(bias.numel() == weight.size(0), "bias length must equal Cout");
+
+    int N = (int)x.size(0);
+    int C_in = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int C_out = (int)weight.size(0);
+    int H_out = (H + 1) / 2;
+    int W_out = (W + 1) / 2;
+    auto out = torch::empty({N, C_out, H_out, W_out}, x.options());
+    int64_t total = (int64_t)N * C_out * H_out * W_out;
+    taehv_conv2d_stride2_nchw_f32_kernel<<<
+        div_up_i64(total, 256), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
+        out.data_ptr<float>(), N, C_in, C_out, H, W, 3);
+    check_last_cuda_error("taehv_conv2d_stride2_nchw_f32");
+    return out;
+}
+
 torch::Tensor taehv_conv1x1_cutlass_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
     WM_CHECK_CUDA(x);
     WM_CHECK_CUDA(weight);
@@ -4519,6 +4594,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("patchify_cutlass", &patchify_cutlass_cuda, "WorldModel patchify im2row + CUTLASS GEMM (CUDA, f32)");
     m.def("unpatchify", &unpatchify_cuda, "WorldModel unpatchify Linear + image layout (CUDA, f32)", py::arg("tokens"), py::arg("weight"), py::arg("bias"), py::arg("channels"), py::arg("height"), py::arg("width"), py::arg("patch_h"), py::arg("patch_w"));
     m.def("taehv_conv2d", &taehv_conv2d_cuda, "TAEHV direct same-padding Conv2d (CUDA, f32)");
+    m.def("taehv_conv2d_stride2", &taehv_conv2d_stride2_cuda, "TAEHV stride-2 same-padding Conv2d (CUDA, f32)");
     m.def("taehv_conv1x1_cutlass", &taehv_conv1x1_cutlass_cuda, "TAEHV 1x1 Conv2d using per-frame CUTLASS GEMM (CUDA, f32)");
     m.def("taehv_conv3x3_cutlass", &taehv_conv3x3_cutlass_cuda, "TAEHV 3x3 Conv2d using im2col tile + CUTLASS GEMM (CUDA, f32)");
     m.def("taehv_conv3x3_cutlass_batched", &taehv_conv3x3_cutlass_batched_cuda, "TAEHV 3x3 Conv2d using batch-spatial im2col tile + CUTLASS GEMM (CUDA, f32)", py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("tile_cols"));

@@ -952,6 +952,17 @@ def test_taehv_concat_past_matches_reference(wm_cuda):
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
+def test_taehv_conv2d_stride2_matches_reference(wm_cuda):
+    torch.manual_seed(127)
+    for h, w in ((12, 14), (11, 13)):
+        x = torch.randn(2, 5, h, w, device="cuda", dtype=torch.float32) * 0.25
+        weight = torch.randn(7, 5, 3, 3, device="cuda", dtype=torch.float32) * 0.1
+        bias = torch.randn(7, device="cuda", dtype=torch.float32) * 0.05
+        y = wm_cuda.taehv_conv2d_stride2(x, weight, bias)
+        ref = F.conv2d(x, weight, bias=bias, stride=2, padding=1)
+        torch.testing.assert_close(y, ref, rtol=2e-5, atol=2e-5)
+
+
 def test_taehv_upsample2_matches_nearest(wm_cuda):
     torch.manual_seed(14)
     x = torch.randn(3, 5, 4, 7, device="cuda", dtype=torch.float32)
@@ -1015,6 +1026,7 @@ if __name__ == "__main__":
         test_taehv_conv3x3_cutlass_implicit_nhwc_fp16_matches_reference,
         test_taehv_conv3x3_cutlass_implicit_nhwc_pair_matches_torch,
         test_taehv_concat_past_matches_reference,
+        test_taehv_conv2d_stride2_matches_reference,
         test_taehv_upsample2_matches_nearest,
         test_taehv_tgrow_reshape_matches_torch_view,
     ):

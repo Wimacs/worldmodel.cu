@@ -58,6 +58,20 @@ int world_vulkan_runtime_seed_latent_rgba(
         int *frames_out,
         float *seconds_out);
 
+int world_vulkan_runtime_init_vae_encoder(
+        WorldVulkanRuntime *rt,
+        const WorldVaeEncoderWeights *encoder);
+
+int world_vulkan_runtime_encode_image_rgb(
+        WorldVulkanRuntime *rt,
+        const float *rgb,
+        int width,
+        int height,
+        float *latent_out,
+        float *seconds_out);
+
+int world_vulkan_runtime_reset(WorldVulkanRuntime *rt, int frame_idx, unsigned int seed);
+
 void world_vulkan_runtime_destroy(WorldVulkanRuntime *rt);
 
 int world_vulkan_linear_f32_probe(void);

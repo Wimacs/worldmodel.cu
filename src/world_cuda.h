@@ -11,6 +11,7 @@ extern "C" {
 #define WORLD_NOISE_NORMAL 1
 
 #define WORLD_VAE_DECODER_CONV_COUNT 35
+#define WORLD_VAE_ENCODER_CONV_COUNT 35
 
 enum {
     WORLD_VAE_DEC_CONV_IN = 0,
@@ -50,6 +51,44 @@ enum {
     WORLD_VAE_DEC_CONV_OUT,
 };
 
+enum {
+    WORLD_VAE_ENC_CONV_IN = 0,
+    WORLD_VAE_ENC_TPOOL2,
+    WORLD_VAE_ENC_CONV3,
+    WORLD_VAE_ENC_MB4_0,
+    WORLD_VAE_ENC_MB4_2,
+    WORLD_VAE_ENC_MB4_4,
+    WORLD_VAE_ENC_MB5_0,
+    WORLD_VAE_ENC_MB5_2,
+    WORLD_VAE_ENC_MB5_4,
+    WORLD_VAE_ENC_MB6_0,
+    WORLD_VAE_ENC_MB6_2,
+    WORLD_VAE_ENC_MB6_4,
+    WORLD_VAE_ENC_TPOOL7,
+    WORLD_VAE_ENC_CONV8,
+    WORLD_VAE_ENC_MB9_0,
+    WORLD_VAE_ENC_MB9_2,
+    WORLD_VAE_ENC_MB9_4,
+    WORLD_VAE_ENC_MB10_0,
+    WORLD_VAE_ENC_MB10_2,
+    WORLD_VAE_ENC_MB10_4,
+    WORLD_VAE_ENC_MB11_0,
+    WORLD_VAE_ENC_MB11_2,
+    WORLD_VAE_ENC_MB11_4,
+    WORLD_VAE_ENC_TPOOL12,
+    WORLD_VAE_ENC_CONV13,
+    WORLD_VAE_ENC_MB14_0,
+    WORLD_VAE_ENC_MB14_2,
+    WORLD_VAE_ENC_MB14_4,
+    WORLD_VAE_ENC_MB15_0,
+    WORLD_VAE_ENC_MB15_2,
+    WORLD_VAE_ENC_MB15_4,
+    WORLD_VAE_ENC_MB16_0,
+    WORLD_VAE_ENC_MB16_2,
+    WORLD_VAE_ENC_MB16_4,
+    WORLD_VAE_ENC_CONV_OUT,
+};
+
 typedef struct {
     const float *weight;
     const float *bias;
@@ -62,6 +101,10 @@ typedef struct {
 typedef struct {
     WorldVaeConvWeight convs[WORLD_VAE_DECODER_CONV_COUNT];
 } WorldVaeDecoderWeights;
+
+typedef struct {
+    WorldVaeConvWeight convs[WORLD_VAE_ENCODER_CONV_COUNT];
+} WorldVaeEncoderWeights;
 
 typedef struct {
     const float *patchify_weight;
@@ -198,6 +241,20 @@ int world_cuda_runtime_seed_latent_rgb(
         int *height_out,
         int *frames_out,
         float *seconds_out);
+
+int world_cuda_runtime_init_vae_encoder(
+        WorldCudaRuntime *rt,
+        const WorldVaeEncoderWeights *encoder);
+
+int world_cuda_runtime_encode_image_rgb(
+        WorldCudaRuntime *rt,
+        const float *rgb,
+        int width,
+        int height,
+        float *latent_out,
+        float *seconds_out);
+
+int world_cuda_runtime_reset(WorldCudaRuntime *rt, int frame_idx, unsigned int seed);
 
 void world_cuda_runtime_destroy(WorldCudaRuntime *rt);
 

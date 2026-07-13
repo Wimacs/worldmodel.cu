@@ -52,8 +52,10 @@ cmake --build build-win --config Release --parallel
 Interactive CUDA runtime:
 
 ```sh
-./build/worldmodel_raylib --model-dir ./Waypoint-1.5-1B --fast-realtime
+./build/worldmodel_raylib ./Waypoint-1.5-1B/model.safetensors ./image.png
 ```
+
+Drop another image onto the window to reset the world from that frame.
 
 Headless smoke test:
 
@@ -68,6 +70,7 @@ Use WASD and the mouse in the interactive window. Run an executable without argu
 
 ```sh
 python test_worldmodel_kernels.py
+python test_vae_encoder_parity.py
 python test_standalone_probe.py
 python test_vulkan_gemm_cta.py
 python test_vulkan_sparse_gqa_fmha.py

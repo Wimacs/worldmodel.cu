@@ -12,6 +12,9 @@ typedef WorldVulkanRuntime WorldRuntime;
 #define world_runtime_seed_latent_rgb world_vulkan_runtime_seed_latent_rgb
 #define world_runtime_step_pixels world_vulkan_runtime_step_rgba
 #define world_runtime_seed_latent_pixels world_vulkan_runtime_seed_latent_rgba
+#define world_runtime_init_vae_encoder world_vulkan_runtime_init_vae_encoder
+#define world_runtime_encode_image_rgb world_vulkan_runtime_encode_image_rgb
+#define world_runtime_reset world_vulkan_runtime_reset
 #define world_runtime_destroy world_vulkan_runtime_destroy
 #define WORLD_BACKEND_BYTES_PER_PIXEL 4
 #define WORLD_BACKEND_OUTPUT_LABEL "RGBA"
@@ -23,6 +26,9 @@ typedef WorldCudaRuntime WorldRuntime;
 #define world_runtime_seed_latent_rgb world_cuda_runtime_seed_latent_rgb
 #define world_runtime_step_pixels world_cuda_runtime_step_rgb
 #define world_runtime_seed_latent_pixels world_cuda_runtime_seed_latent_rgb
+#define world_runtime_init_vae_encoder world_cuda_runtime_init_vae_encoder
+#define world_runtime_encode_image_rgb world_cuda_runtime_encode_image_rgb
+#define world_runtime_reset world_cuda_runtime_reset
 #define world_runtime_destroy world_cuda_runtime_destroy
 #define WORLD_BACKEND_BYTES_PER_PIXEL 3
 #define WORLD_BACKEND_OUTPUT_LABEL "RGB"

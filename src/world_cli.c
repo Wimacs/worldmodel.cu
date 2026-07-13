@@ -200,6 +200,44 @@ static const VaeConvSpec k_vae_decoder_specs[WORLD_VAE_DECODER_CONV_COUNT] = {
     {WORLD_VAE_DEC_CONV_OUT, "decoder.22", 12, 64, 3, 1},
 };
 
+static const VaeConvSpec k_vae_encoder_specs[WORLD_VAE_ENCODER_CONV_COUNT] = {
+    {WORLD_VAE_ENC_CONV_IN, "encoder.0", 64, 12, 3, 1},
+    {WORLD_VAE_ENC_TPOOL2, "encoder.2.conv", 64, 128, 1, 0},
+    {WORLD_VAE_ENC_CONV3, "encoder.3", 64, 64, 3, 0},
+    {WORLD_VAE_ENC_MB4_0, "encoder.4.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB4_2, "encoder.4.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB4_4, "encoder.4.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB5_0, "encoder.5.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB5_2, "encoder.5.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB5_4, "encoder.5.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB6_0, "encoder.6.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB6_2, "encoder.6.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB6_4, "encoder.6.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_TPOOL7, "encoder.7.conv", 64, 128, 1, 0},
+    {WORLD_VAE_ENC_CONV8, "encoder.8", 64, 64, 3, 0},
+    {WORLD_VAE_ENC_MB9_0, "encoder.9.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB9_2, "encoder.9.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB9_4, "encoder.9.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB10_0, "encoder.10.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB10_2, "encoder.10.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB10_4, "encoder.10.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB11_0, "encoder.11.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB11_2, "encoder.11.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB11_4, "encoder.11.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_TPOOL12, "encoder.12.conv", 64, 64, 1, 0},
+    {WORLD_VAE_ENC_CONV13, "encoder.13", 64, 64, 3, 0},
+    {WORLD_VAE_ENC_MB14_0, "encoder.14.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB14_2, "encoder.14.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB14_4, "encoder.14.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB15_0, "encoder.15.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB15_2, "encoder.15.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB15_4, "encoder.15.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB16_0, "encoder.16.conv.0", 64, 128, 3, 1},
+    {WORLD_VAE_ENC_MB16_2, "encoder.16.conv.2", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_MB16_4, "encoder.16.conv.4", 64, 64, 3, 1},
+    {WORLD_VAE_ENC_CONV_OUT, "encoder.17", 32, 64, 3, 1},
+};
+
 static int load_vae_decoder_weights(const char *path, WorldVaeDecoderWeights *vae) {
     memset(vae, 0, sizeof(*vae));
     SafeTensors st;
@@ -241,6 +279,48 @@ static void free_vae_decoder_weights(WorldVaeDecoderWeights *vae) {
         free((void *)vae->convs[i].bias);
     }
     memset(vae, 0, sizeof(*vae));
+}
+
+static int load_vae_encoder_weights(const char *path, WorldVaeEncoderWeights *encoder) {
+    memset(encoder, 0, sizeof(*encoder));
+    SafeTensors st;
+    fprintf(stderr, "loading VAE encoder safetensors index: %s\n", path);
+    if (safetensors_open(&st, path)) return 1;
+
+    int rc = 1;
+    for (int i = 0; i < WORLD_VAE_ENCODER_CONV_COUNT; ++i) {
+        const VaeConvSpec *spec = &k_vae_encoder_specs[i];
+        WorldVaeConvWeight *cw = &encoder->convs[spec->index];
+        char name[256];
+        int64_t w_shape[4] = {spec->out_c, spec->in_c, spec->kernel, spec->kernel};
+        int n = snprintf(name, sizeof(name), "%s.weight", spec->base);
+        if (n < 0 || (size_t)n >= sizeof(name)) goto cleanup;
+        if (load_required_as_f32(&st, name, w_shape, 4, (float **)&cw->weight)) goto cleanup;
+        if (spec->has_bias) {
+            int64_t b_shape[1] = {spec->out_c};
+            n = snprintf(name, sizeof(name), "%s.bias", spec->base);
+            if (n < 0 || (size_t)n >= sizeof(name)) goto cleanup;
+            if (load_required_as_f32(&st, name, b_shape, 1, (float **)&cw->bias)) goto cleanup;
+        }
+        cw->out_c = spec->out_c;
+        cw->in_c = spec->in_c;
+        cw->kernel = spec->kernel;
+        cw->has_bias = spec->has_bias;
+    }
+    rc = 0;
+
+cleanup:
+    safetensors_close(&st);
+    return rc;
+}
+
+static void free_vae_encoder_weights(WorldVaeEncoderWeights *encoder) {
+    if (!encoder) return;
+    for (int i = 0; i < WORLD_VAE_ENCODER_CONV_COUNT; ++i) {
+        free((void *)encoder->convs[i].weight);
+        free((void *)encoder->convs[i].bias);
+    }
+    memset(encoder, 0, sizeof(*encoder));
 }
 
 #ifndef WORLD_CLI_NO_MAIN
