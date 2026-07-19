@@ -1,5 +1,13 @@
 # worldmodel.c
 
+<p align="center">
+  <a href="docs/assets/worldmodel-demo.mp4">
+    <img src="docs/assets/worldmodel-demo-preview.webp" alt="Interactive world generation demo running at 30 FPS" width="100%">
+  </a>
+</p>
+
+<p align="center"><sub>Interactive world generation at 30 FPS — click the preview to watch the full video.</sub></p>
+
 An experimental standalone C/CUDA/Vulkan runtime for [Waypoint 1.5](https://raw.githubusercontent.com/Overworldai/Biome/feat/paper/research/WP1_5_Paper.pdf).
 
 The CUDA backend uses CUTLASS for GEMM, attention, and convolution kernels. It links only the CUDA runtime, without cuBLAS or cuDNN. CUDA kernels are tested against PyTorch references. The Vulkan backend is experimental.
@@ -80,6 +88,18 @@ Headless smoke test:
 
 Use WASD and the mouse in the interactive window. Run an executable without arguments to see its available options.
 
+### Experimental CUDA W8A8
+
+The resident CUDA runtime has an opt-in row/channel-wise W8A8 path for WorldDiT QKV, attention output, controller, and MLP linears:
+
+```powershell
+$env:WORLD_W8A8 = '1'
+.\build-win\Release\worldmodel_raylib.exe --model-dir .\Waypoint-1.5-1B `
+  --steps 4 --cache-window 8 --headless-smoke
+```
+
+This is an experimental post-training quantization path, not a TurboDiffusion-equivalent kernel, and long autoregressive rollouts can diverge from the FP32/FP16 trajectory. The implementation, failed first attempt, benchmarks, quality checks, memory accounting, controls, and exact TurboDiffusion comparison are recorded in [docs/cuda_w8a8_optimization.md](docs/cuda_w8a8_optimization.md).
+
 ## Tests
 
 ```sh
@@ -107,4 +127,4 @@ WORLD_VULKAN_GEMM_AUTOTUNE_CACHE=world_vulkan_gemm.cache \
   --vae-weights ../Waypoint-1.5-1B/vae/diffusion_pytorch_model.safetensors
 ```
 
-Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md) and [docs/vulkan_optimization.md](docs/vulkan_optimization.md).
+Implementation and optimization notes are in [docs/cuda_cutlass_kernels.md](docs/cuda_cutlass_kernels.md), [docs/cuda_w8a8_optimization.md](docs/cuda_w8a8_optimization.md), and [docs/vulkan_optimization.md](docs/vulkan_optimization.md).

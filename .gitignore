@@ -2,6 +2,7 @@
 build/
 build-vulkan/
 build-win*/
+build-w8a8/
 __pycache__/
 *.pyc
 smoke_latent*.pt

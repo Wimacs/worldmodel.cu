@@ -8,6 +8,7 @@
 #include <cutlass/conv/device/implicit_gemm_convolution.h>
 #include <cutlass/conv/kernel/default_conv2d_fprop.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/linear_combination_clamp.h>
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_batched.h>
 #include <cutlass/gemm/device/gemm_splitk_parallel.h>
@@ -50,6 +51,14 @@
 #define WORLD_ATTN_D64_K_BLOCK 64
 #define WORLD_ATTN_D64_FLASH_WARPS 16
 
+// Experimental row-wise activation / output-channel-wise weight PTQ.  This
+// is deliberately distinct from TurboDiffusion's 128x128 blockwise W8A8.
+#define WORLD_W8A8_QKV  (1 << 0)
+#define WORLD_W8A8_OUT  (1 << 1)
+#define WORLD_W8A8_CTRL (1 << 2)
+#define WORLD_W8A8_MLP  (1 << 3)
+#define WORLD_W8A8_ALL  (WORLD_W8A8_QKV | WORLD_W8A8_OUT | WORLD_W8A8_CTRL | WORLD_W8A8_MLP)
+
 #define CUDA_OK(expr) do { \
     cudaError_t _e = (expr); \
     if (_e != cudaSuccess) { \
@@ -68,6 +77,34 @@
 
 static int div_up_i64(int64_t a, int b) {
     return (int)((a + b - 1) / b);
+}
+
+static int parse_w8a8_ops(const char *ops) {
+    if (!ops || !ops[0] || strcmp(ops, "all") == 0 || strcmp(ops, "1") == 0) {
+        return WORLD_W8A8_ALL;
+    }
+    if (strcmp(ops, "none") == 0 || strcmp(ops, "off") == 0 || strcmp(ops, "0") == 0) {
+        return 0;
+    }
+
+    int mask = 0;
+    const char *p = ops;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+        const char *begin = p;
+        while (*p && *p != ',' && *p != ' ' && *p != '\t') ++p;
+        size_t len = (size_t)(p - begin);
+        if (len == 3 && strncmp(begin, "qkv", len) == 0) mask |= WORLD_W8A8_QKV;
+        else if (len == 3 && strncmp(begin, "out", len) == 0) mask |= WORLD_W8A8_OUT;
+        else if (len == 4 && strncmp(begin, "ctrl", len) == 0) mask |= WORLD_W8A8_CTRL;
+        else if (len == 10 && strncmp(begin, "controller", len) == 0) mask |= WORLD_W8A8_CTRL;
+        else if (len == 3 && strncmp(begin, "mlp", len) == 0) mask |= WORLD_W8A8_MLP;
+        else if (len != 0) {
+            fprintf(stderr, "unknown WORLD_W8A8 op '%.*s'\n", (int)len, begin);
+            return -1;
+        }
+    }
+    return mask;
 }
 
 __device__ __forceinline__ float wm_silu(float x) {
@@ -112,6 +149,178 @@ __global__ static void silu_f32_kernel(const float *x, float *y, int64_t n) {
 __global__ static void f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half_rn(x[i]);
+}
+
+// Dynamic symmetric per-row activation quantization.  Keeping one scale per
+// token avoids a single outlier token reducing the precision of every row.
+__global__ static void quantize_rows_f32_i8_kernel(
+        const float *__restrict__ x,
+        int8_t *__restrict__ q,
+        float *__restrict__ scales,
+        int rows,
+        int cols) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (int64_t)row * cols;
+    float amax = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        amax = fmaxf(amax, fabsf(row_x[col]));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+
+    float scale = red[0] > 0.0f ? red[0] * (1.0f / 127.0f) : 1.0f;
+    float inv_scale = red[0] > 0.0f ? 1.0f / scale : 0.0f;
+    if (tid == 0) scales[row] = scale;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        int v = __float2int_rn(row_x[col] * inv_scale);
+        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        q[(int64_t)row * cols + col] = (int8_t)v;
+    }
+}
+
+// Fuses RMSNorm/AdaRMSNorm with dynamic A8 quantization.  A null mod_scale
+// and bias implements plain RMSNorm (used by the controller branch).
+__global__ static void rms_norm_quantize_rows_i8_kernel(
+        const float *__restrict__ x,
+        const float *__restrict__ mod_scale,
+        const float *__restrict__ bias,
+        int8_t *__restrict__ q,
+        float *__restrict__ q_scales,
+        int rows,
+        int cols,
+        float eps) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float *row_x = x + (int64_t)row * cols;
+    float sum = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float v = row_x[col];
+        sum += v * v;
+    }
+    red[tid] = sum;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        __syncthreads();
+    }
+
+    float inv_rms = rsqrtf(red[0] / (float)cols + eps);
+    float amax = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float v = row_x[col] * inv_rms;
+        if (mod_scale) v *= 1.0f + mod_scale[col];
+        if (bias) v += bias[col];
+        amax = fmaxf(amax, fabsf(v));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+
+    float q_scale = red[0] > 0.0f ? red[0] * (1.0f / 127.0f) : 1.0f;
+    float inv_q_scale = red[0] > 0.0f ? 1.0f / q_scale : 0.0f;
+    if (tid == 0) q_scales[row] = q_scale;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float v = row_x[col] * inv_rms;
+        if (mod_scale) v *= 1.0f + mod_scale[col];
+        if (bias) v += bias[col];
+        int qi = __float2int_rn(v * inv_q_scale);
+        qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+        q[(int64_t)row * cols + col] = (int8_t)qi;
+    }
+}
+
+// Converts an INT32 GEMM result through dequantization and SiLU directly to
+// the A8 input of the next GEMM.  This removes the large FP32 MLP hidden
+// activation and its standalone SiLU and quantization passes.
+__global__ static void dequant_silu_quantize_rows_i8_kernel(
+        const int32_t *__restrict__ acc,
+        const float *input_row_scales,
+        const float *__restrict__ weight_scales,
+        const float *__restrict__ bias,
+        int8_t *__restrict__ q,
+        float *output_row_scales,
+        int rows,
+        int cols) {
+    __shared__ float red[256];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+    float input_scale = input_row_scales[row];
+    const int32_t *row_acc = acc + (int64_t)row * cols;
+
+    float amax = 0.0f;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float v = (float)row_acc[col] * input_scale * weight_scales[col];
+        if (bias) v += bias[col];
+        v = wm_silu(v);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    red[tid] = amax;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+
+    float q_scale = red[0] > 0.0f ? red[0] * (1.0f / 127.0f) : 1.0f;
+    float inv_q_scale = red[0] > 0.0f ? 1.0f / q_scale : 0.0f;
+    if (tid == 0) output_row_scales[row] = q_scale;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float v = (float)row_acc[col] * input_scale * weight_scales[col];
+        if (bias) v += bias[col];
+        int qi = __float2int_rn(wm_silu(v) * inv_q_scale);
+        qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+        q[(int64_t)row * cols + col] = (int8_t)qi;
+    }
+}
+
+__global__ static void dequant_gated_residual_f32_kernel(
+        const int32_t *__restrict__ acc,
+        const float *__restrict__ row_scales,
+        const float *__restrict__ col_scales,
+        const float *__restrict__ residual,
+        const float *__restrict__ gate,
+        float *__restrict__ out,
+        int rows,
+        int cols) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t count = (int64_t)rows * cols;
+    if (i >= count) return;
+    int row = (int)(i / cols);
+    int col = (int)(i - (int64_t)row * cols);
+    float update = (float)acc[i] * row_scales[row] * col_scales[col];
+    out[i] = residual[i] + update * gate[col];
+}
+
+__global__ static void dequant_add_residual_f32_kernel(
+        const int32_t *__restrict__ acc,
+        const float *__restrict__ row_scales,
+        const float *__restrict__ col_scales,
+        const float *__restrict__ residual,
+        float *__restrict__ out,
+        int rows,
+        int cols) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t count = (int64_t)rows * cols;
+    if (i >= count) return;
+    int row = (int)(i / cols);
+    int col = (int)(i - (int64_t)row * cols);
+    float update = (float)acc[i] * row_scales[row] * col_scales[col];
+    out[i] = residual[i] + update;
 }
 
 __global__ static void silu_f32_to_f16_kernel(const float *x, __half *y, int64_t n) {
@@ -485,6 +694,84 @@ __global__ static void qkv_fused_rms_rope_f32_kernel(
         float *dst = v + (((int64_t)h * T + t) * d_head);
         for (int d = tid; d < d_head; d += blockDim.x) {
             dst[d] = src[d];
+        }
+    }
+}
+
+__global__ static void qkv_fused_rms_rope_i32_dequant_kernel(
+        const int32_t *__restrict__ qkv_acc,
+        const float *__restrict__ row_scales,
+        const float *__restrict__ weight_scales,
+        float *q,
+        float *k,
+        float *v,
+        const int64_t *x_pos,
+        const int64_t *y_pos,
+        const int64_t *t_pos,
+        const float *xy,
+        const float *inv_t,
+        int T,
+        int n_heads,
+        int n_kv_heads,
+        int d_head,
+        int width,
+        int height,
+        float eps) {
+    extern __shared__ float sh[];
+    float *vals = sh;
+    float *red = sh + d_head;
+
+    int t = blockIdx.x;
+    int role = blockIdx.y;
+    int tid = threadIdx.x;
+    int q_dim = n_heads * d_head;
+    int kv_dim = n_kv_heads * d_head;
+    int qkv_dim = q_dim + 2 * kv_dim;
+    int half = d_head / 2;
+    int d_xy = d_head / 8;
+    const int32_t *row = qkv_acc + (int64_t)t * qkv_dim;
+    float row_scale = row_scales[t];
+
+    if (role < n_heads + n_kv_heads) {
+        int is_k = role >= n_heads;
+        int h = is_k ? role - n_heads : role;
+        int base = is_k ? q_dim + h * d_head : h * d_head;
+
+        float sum = 0.0f;
+        for (int d = tid; d < d_head; d += blockDim.x) {
+            int col = base + d;
+            float z = (float)row[col] * row_scale * weight_scales[col];
+            vals[d] = z;
+            sum += z * z;
+        }
+        red[tid] = sum;
+        __syncthreads();
+        for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+            if (tid < step) red[tid] += red[tid + step];
+            __syncthreads();
+        }
+
+        float inv = rsqrtf(red[0] / (float)d_head + eps);
+        float *dst = is_k
+            ? k + (((int64_t)h * T + t) * d_head)
+            : q + (((int64_t)h * T + t) * d_head);
+        for (int p = tid; p < half; p += blockDim.x) {
+            float phase = wm_rope_phase(
+                p, x_pos[t], y_pos[t], t_pos[t], xy, inv_t, width, height, d_xy);
+            float c = cosf(phase);
+            float s = sinf(phase);
+            float a = vals[2 * p] * inv;
+            float b = vals[2 * p + 1] * inv;
+            dst[p] = a * c - b * s;
+            dst[half + p] = b * c + a * s;
+        }
+    } else {
+        int h = role - n_heads - n_kv_heads;
+        int base = q_dim + kv_dim + h * d_head;
+        float *dst = v + (((int64_t)h * T + t) * d_head);
+        for (int d = tid; d < d_head; d += blockDim.x) {
+            int col = base + d;
+            dst[d] = (float)row[col] * row_scale * weight_scales[col];
         }
     }
 }
@@ -2099,6 +2386,78 @@ static int row_major_linear(
     return 0;
 }
 
+using WorldW8A8Gemm = cutlass::gemm::device::Gemm<
+    int8_t,
+    cutlass::layout::RowMajor,
+    int8_t,
+    cutlass::layout::ColumnMajor,
+    int32_t,
+    cutlass::layout::RowMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 128>,
+    cutlass::gemm::GemmShape<64, 64, 128>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    cutlass::epilogue::thread::LinearCombinationClamp<
+        int32_t,
+        128 / cutlass::sizeof_bits<int32_t>::value,
+        int32_t,
+        int32_t>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    3>;
+
+static int row_major_gemm_i8_i32_can_implement(
+        const int8_t *x_i8,
+        const int8_t *w_rm_i8,
+        int32_t *acc_i32,
+        int m,
+        int k,
+        int n) {
+    if (!x_i8 || !w_rm_i8 || !acc_i32 || m <= 0 || k <= 0 || n <= 0) {
+        fprintf(stderr, "invalid INT8 GEMM arguments M=%d K=%d N=%d\n", m, k, n);
+        return 1;
+    }
+    if ((k & 31) != 0) {
+        fprintf(stderr, "INT8 tensor-op requires K divisible by 32, got K=%d\n", k);
+        return 1;
+    }
+
+    typename WorldW8A8Gemm::Arguments args(
+        {m, n, k},
+        {x_i8, k},
+        {w_rm_i8, k},
+        {acc_i32, n},
+        {acc_i32, n},
+        {1, 0});
+    WorldW8A8Gemm gemm;
+    CUTLASS_OK(gemm.can_implement(args));
+    return 0;
+}
+
+static int row_major_gemm_i8_i32(
+        const int8_t *x_i8,
+        const int8_t *w_rm_i8,
+        int32_t *acc_i32,
+        int m,
+        int k,
+        int n) {
+    if (row_major_gemm_i8_i32_can_implement(x_i8, w_rm_i8, acc_i32, m, k, n)) {
+        return 1;
+    }
+    typename WorldW8A8Gemm::Arguments args(
+        {m, n, k},
+        {x_i8, k},
+        {w_rm_i8, k},
+        {acc_i32, n},
+        {acc_i32, n},
+        {1, 0});
+    WorldW8A8Gemm gemm;
+    CUTLASS_OK(gemm(args));
+    CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
 static int row_major_linear_fp16_weight_simt(
         const float *x_rm,
         __half *x_half_tmp,
@@ -3126,6 +3485,77 @@ static int copy_f32_to_half_device(__half **dst, const float *src, size_t n) {
     return 0;
 }
 
+static int copy_f32_to_i8_per_output_device(
+        int8_t **dst,
+        float **dst_scales,
+        const float *src,
+        int out_features,
+        int in_features) {
+    *dst = NULL;
+    *dst_scales = NULL;
+    size_t count = (size_t)out_features * in_features;
+    int8_t *host_q = (int8_t *)malloc(count * sizeof(int8_t));
+    float *host_scales = (float *)malloc((size_t)out_features * sizeof(float));
+    if (!host_q || !host_scales) {
+        fprintf(stderr, "failed to allocate W8 quantization buffers [%d,%d]\n",
+                out_features, in_features);
+        free(host_q);
+        free(host_scales);
+        return 1;
+    }
+
+    for (int row = 0; row < out_features; ++row) {
+        const float *src_row = src + (int64_t)row * in_features;
+        int8_t *dst_row = host_q + (int64_t)row * in_features;
+        float amax = 0.0f;
+        for (int col = 0; col < in_features; ++col) {
+            if (!isfinite(src_row[col])) {
+                fprintf(stderr,
+                        "non-finite W8 weight at output=%d input=%d for [%d,%d]\n",
+                        row, col, out_features, in_features);
+                free(host_q);
+                free(host_scales);
+                return 1;
+            }
+            amax = fmaxf(amax, fabsf(src_row[col]));
+        }
+        float scale = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f;
+        float inv_scale = amax > 0.0f ? 1.0f / scale : 0.0f;
+        host_scales[row] = scale;
+        for (int col = 0; col < in_features; ++col) {
+            // Match CUDA __float2int_rn and the PyTorch reference: round to
+            // nearest with ties to even under the default floating mode.
+            int v = (int)nearbyintf(src_row[col] * inv_scale);
+            v = v < -127 ? -127 : (v > 127 ? 127 : v);
+            dst_row[col] = (int8_t)v;
+        }
+    }
+
+    cudaError_t err = cudaMalloc((void **)dst, count * sizeof(int8_t));
+    if (err == cudaSuccess) {
+        err = cudaMalloc((void **)dst_scales, (size_t)out_features * sizeof(float));
+    }
+    if (err == cudaSuccess) {
+        err = cudaMemcpy(*dst, host_q, count * sizeof(int8_t), cudaMemcpyHostToDevice);
+    }
+    if (err == cudaSuccess) {
+        err = cudaMemcpy(*dst_scales, host_scales,
+                         (size_t)out_features * sizeof(float), cudaMemcpyHostToDevice);
+    }
+    free(host_q);
+    free(host_scales);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error while copying W8 weights [%d,%d]: %s\n",
+                out_features, in_features, cudaGetErrorString(err));
+        cudaFree(*dst);
+        cudaFree(*dst_scales);
+        *dst = NULL;
+        *dst_scales = NULL;
+        return 1;
+    }
+    return 0;
+}
+
 static int copy_oihw_f32_to_krsc_half_device(
         __half **dst,
         const float *src,
@@ -3160,18 +3590,30 @@ typedef struct {
     float *cond_proj_weight;
     float *qkv_proj_weight;
     __half *qkv_proj_weight_h;
+    int8_t *qkv_proj_weight_i8;
+    float *qkv_proj_weight_i8_scales;
     float *out_proj_weight;
     __half *out_proj_weight_h;
+    int8_t *out_proj_weight_i8;
+    float *out_proj_weight_i8_scales;
     float v_lamb;
     float *ctrl_fc1_x_weight;
     __half *ctrl_fc1_x_weight_h;
+    int8_t *ctrl_fc1_x_weight_i8;
+    float *ctrl_fc1_x_weight_i8_scales;
     float *ctrl_fc1_c_weight;
     float *ctrl_fc2_weight;
     __half *ctrl_fc2_weight_h;
+    int8_t *ctrl_fc2_weight_i8;
+    float *ctrl_fc2_weight_i8_scales;
     float *dit_mlp_fc1_weight;
     __half *dit_mlp_fc1_weight_h;
+    int8_t *dit_mlp_fc1_weight_i8;
+    float *dit_mlp_fc1_weight_i8_scales;
     float *dit_mlp_fc2_weight;
     __half *dit_mlp_fc2_weight_h;
+    int8_t *dit_mlp_fc2_weight_i8;
+    float *dit_mlp_fc2_weight_i8_scales;
     int has_ctrl;
 } DeviceWorldLayerWeights;
 
@@ -3228,17 +3670,29 @@ static void free_device_world_layers(DeviceWorldLayerWeights *layers, int n_laye
         cudaFree(layers[i].cond_proj_weight);
         cudaFree(layers[i].qkv_proj_weight);
         cudaFree(layers[i].qkv_proj_weight_h);
+        cudaFree(layers[i].qkv_proj_weight_i8);
+        cudaFree(layers[i].qkv_proj_weight_i8_scales);
         cudaFree(layers[i].out_proj_weight);
         cudaFree(layers[i].out_proj_weight_h);
+        cudaFree(layers[i].out_proj_weight_i8);
+        cudaFree(layers[i].out_proj_weight_i8_scales);
         cudaFree(layers[i].ctrl_fc1_x_weight);
         cudaFree(layers[i].ctrl_fc1_x_weight_h);
+        cudaFree(layers[i].ctrl_fc1_x_weight_i8);
+        cudaFree(layers[i].ctrl_fc1_x_weight_i8_scales);
         cudaFree(layers[i].ctrl_fc1_c_weight);
         cudaFree(layers[i].ctrl_fc2_weight);
         cudaFree(layers[i].ctrl_fc2_weight_h);
+        cudaFree(layers[i].ctrl_fc2_weight_i8);
+        cudaFree(layers[i].ctrl_fc2_weight_i8_scales);
         cudaFree(layers[i].dit_mlp_fc1_weight);
         cudaFree(layers[i].dit_mlp_fc1_weight_h);
+        cudaFree(layers[i].dit_mlp_fc1_weight_i8);
+        cudaFree(layers[i].dit_mlp_fc1_weight_i8_scales);
         cudaFree(layers[i].dit_mlp_fc2_weight);
         cudaFree(layers[i].dit_mlp_fc2_weight_h);
+        cudaFree(layers[i].dit_mlp_fc2_weight_i8);
+        cudaFree(layers[i].dit_mlp_fc2_weight_i8_scales);
     }
     free(layers);
 }
@@ -3374,13 +3828,41 @@ static int copy_qkv_proj_to_half_device(__half **dst, const WorldLayerWeights *s
     return rc;
 }
 
+static int copy_qkv_proj_to_i8_device(
+        int8_t **dst,
+        float **dst_scales,
+        const WorldLayerWeights *src,
+        int D,
+        int kv_dim) {
+    *dst = NULL;
+    *dst_scales = NULL;
+    size_t q_elems = (size_t)D * D;
+    size_t kv_elems = (size_t)kv_dim * D;
+    size_t total = q_elems + 2 * kv_elems;
+    float *host = (float *)malloc(total * sizeof(float));
+    if (!host) {
+        fprintf(stderr, "failed to allocate fused QKV W8 host weight\n");
+        return 1;
+    }
+    memcpy(host, src->q_proj_weight, q_elems * sizeof(float));
+    memcpy(host + q_elems, src->k_proj_weight, kv_elems * sizeof(float));
+    memcpy(host + q_elems + kv_elems, src->v_proj_weight, kv_elems * sizeof(float));
+    int rc = copy_f32_to_i8_per_output_device(dst, dst_scales, host, D + 2 * kv_dim, D);
+    free(host);
+    return rc;
+}
+
 static int copy_world_layers_to_device(
         DeviceWorldLayerWeights **dst_layers,
         const WorldLayerWeights *src_layers,
         int n_layers,
         int D,
         int kv_dim,
-        int mlp_hidden) {
+        int mlp_hidden,
+        int w8a8_drop_fallback,
+        int w8a8_mask,
+        int w8a8_layer_begin,
+        int w8a8_layer_end) {
     *dst_layers = NULL;
     DeviceWorldLayerWeights *dst = (DeviceWorldLayerWeights *)calloc((size_t)n_layers, sizeof(*dst));
     if (!dst) return 1;
@@ -3388,25 +3870,77 @@ static int copy_world_layers_to_device(
     for (int i = 0; i < n_layers; ++i) {
         const WorldLayerWeights *src = &src_layers[i];
         DeviceWorldLayerWeights *dl = &dst[i];
+        int layer_w8a8_mask =
+            i >= w8a8_layer_begin && i < w8a8_layer_end ? w8a8_mask : 0;
         dl->has_ctrl = src->has_ctrl;
         dl->v_lamb = src->v_lamb ? src->v_lamb[0] : 0.0f;
         if (copy_f32_to_device(&dl->cond_bias, src->cond_bias, (size_t)D)) goto fail;
         if (copy_cond_proj_to_device(&dl->cond_proj_weight, src, D)) goto fail;
-        if (copy_qkv_proj_to_device(&dl->qkv_proj_weight, src, D, kv_dim)) goto fail;
-        if (copy_qkv_proj_to_half_device(&dl->qkv_proj_weight_h, src, D, kv_dim)) goto fail;
-        if (copy_f32_to_device(&dl->out_proj_weight, src->out_proj_weight, (size_t)D * D)) goto fail;
-        if (copy_f32_to_half_device(&dl->out_proj_weight_h, src->out_proj_weight, (size_t)D * D)) goto fail;
-        if (src->has_ctrl) {
-            if (copy_f32_to_device(&dl->ctrl_fc1_x_weight, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
-            if (copy_f32_to_half_device(&dl->ctrl_fc1_x_weight_h, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
-            if (copy_f32_to_device(&dl->ctrl_fc1_c_weight, src->ctrl_fc1_c_weight, (size_t)D * D)) goto fail;
-            if (copy_f32_to_device(&dl->ctrl_fc2_weight, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
-            if (copy_f32_to_half_device(&dl->ctrl_fc2_weight_h, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
+        if ((layer_w8a8_mask & WORLD_W8A8_QKV) &&
+                copy_qkv_proj_to_i8_device(
+                    &dl->qkv_proj_weight_i8,
+                    &dl->qkv_proj_weight_i8_scales,
+                    src,
+                    D,
+                    kv_dim)) goto fail;
+        if (!(w8a8_drop_fallback && (layer_w8a8_mask & WORLD_W8A8_QKV))) {
+            if (copy_qkv_proj_to_device(&dl->qkv_proj_weight, src, D, kv_dim)) goto fail;
+            if (copy_qkv_proj_to_half_device(&dl->qkv_proj_weight_h, src, D, kv_dim)) goto fail;
         }
-        if (copy_f32_to_device(&dl->dit_mlp_fc1_weight, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
-        if (copy_f32_to_half_device(&dl->dit_mlp_fc1_weight_h, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
-        if (copy_f32_to_device(&dl->dit_mlp_fc2_weight, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
-        if (copy_f32_to_half_device(&dl->dit_mlp_fc2_weight_h, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
+        if ((layer_w8a8_mask & WORLD_W8A8_OUT) &&
+                copy_f32_to_i8_per_output_device(
+                    &dl->out_proj_weight_i8,
+                    &dl->out_proj_weight_i8_scales,
+                    src->out_proj_weight,
+                    D,
+                    D)) goto fail;
+        if (!(w8a8_drop_fallback && (layer_w8a8_mask & WORLD_W8A8_OUT))) {
+            if (copy_f32_to_device(&dl->out_proj_weight, src->out_proj_weight, (size_t)D * D)) goto fail;
+            if (copy_f32_to_half_device(&dl->out_proj_weight_h, src->out_proj_weight, (size_t)D * D)) goto fail;
+        }
+        if (src->has_ctrl) {
+            if (copy_f32_to_device(&dl->ctrl_fc1_c_weight, src->ctrl_fc1_c_weight, (size_t)D * D)) goto fail;
+            if ((layer_w8a8_mask & WORLD_W8A8_CTRL) &&
+                    copy_f32_to_i8_per_output_device(
+                        &dl->ctrl_fc1_x_weight_i8,
+                        &dl->ctrl_fc1_x_weight_i8_scales,
+                        src->ctrl_fc1_x_weight,
+                        D,
+                        D)) goto fail;
+            if ((layer_w8a8_mask & WORLD_W8A8_CTRL) &&
+                    copy_f32_to_i8_per_output_device(
+                        &dl->ctrl_fc2_weight_i8,
+                        &dl->ctrl_fc2_weight_i8_scales,
+                        src->ctrl_fc2_weight,
+                        D,
+                        D)) goto fail;
+            if (!(w8a8_drop_fallback && (layer_w8a8_mask & WORLD_W8A8_CTRL))) {
+                if (copy_f32_to_device(&dl->ctrl_fc1_x_weight, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
+                if (copy_f32_to_half_device(&dl->ctrl_fc1_x_weight_h, src->ctrl_fc1_x_weight, (size_t)D * D)) goto fail;
+                if (copy_f32_to_device(&dl->ctrl_fc2_weight, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
+                if (copy_f32_to_half_device(&dl->ctrl_fc2_weight_h, src->ctrl_fc2_weight, (size_t)D * D)) goto fail;
+            }
+        }
+        if ((layer_w8a8_mask & WORLD_W8A8_MLP) &&
+                copy_f32_to_i8_per_output_device(
+                    &dl->dit_mlp_fc1_weight_i8,
+                    &dl->dit_mlp_fc1_weight_i8_scales,
+                    src->dit_mlp_fc1_weight,
+                    mlp_hidden,
+                    D)) goto fail;
+        if ((layer_w8a8_mask & WORLD_W8A8_MLP) &&
+                copy_f32_to_i8_per_output_device(
+                    &dl->dit_mlp_fc2_weight_i8,
+                    &dl->dit_mlp_fc2_weight_i8_scales,
+                    src->dit_mlp_fc2_weight,
+                    D,
+                    mlp_hidden)) goto fail;
+        if (!(w8a8_drop_fallback && (layer_w8a8_mask & WORLD_W8A8_MLP))) {
+            if (copy_f32_to_device(&dl->dit_mlp_fc1_weight, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
+            if (copy_f32_to_half_device(&dl->dit_mlp_fc1_weight_h, src->dit_mlp_fc1_weight, (size_t)mlp_hidden * D)) goto fail;
+            if (copy_f32_to_device(&dl->dit_mlp_fc2_weight, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
+            if (copy_f32_to_half_device(&dl->dit_mlp_fc2_weight_h, src->dit_mlp_fc2_weight, (size_t)D * mlp_hidden)) goto fail;
+        }
     }
 
     *dst_layers = dst;
@@ -4892,11 +5426,17 @@ struct WorldCudaRuntime {
     int fp16_gemm_m64n64_enabled;
     int half_gemm_boundary_enabled;
     int mlp_fc1_silu_epilogue_enabled;
+    int w8a8_mask;
+    int w8a8_drop_fallback;
+    int w8a8_layer_begin;
+    int w8a8_layer_end;
     size_t latent_elems;
     size_t token_elems;
     size_t kv_rope_elems;
     size_t q_rope_elems;
     size_t linear_half_elems;
+    size_t w8a8_x_elems;
+    size_t w8a8_acc_elems;
     size_t splitk_workspace_bytes;
     const float *h_latent_override;
     float *h_latent;
@@ -4954,6 +5494,9 @@ struct WorldCudaRuntime {
     int64_t *d_t_pos;
     __half *d_linear_half;
     __half *d_mlp_hidden_half;
+    int8_t *d_w8a8_x;
+    float *d_w8a8_x_scales;
+    int32_t *d_w8a8_acc;
     void *d_splitk_workspace;
     int attn_cutlass_enabled;
     int attn_cutlass_grouped_enabled;
@@ -5042,6 +5585,177 @@ static int precompute_runtime_layer_mods(WorldCudaRuntime *rt) {
         }
     }
     CUDA_OK(cudaGetLastError());
+    return 0;
+}
+
+static void release_runtime_precompute_and_w8a8_fallback_weights(WorldCudaRuntime *rt) {
+    if (!rt || !rt->d_layers) return;
+    size_t released_bytes = 0;
+    size_t omitted_bytes = 0;
+    for (int i = 0; i < rt->layers_to_run; ++i) {
+        DeviceWorldLayerWeights *lw = &rt->d_layers[i];
+
+        if (lw->cond_proj_weight) {
+            cudaFree(lw->cond_proj_weight);
+            lw->cond_proj_weight = NULL;
+            released_bytes += (size_t)6 * rt->D * rt->D * sizeof(float);
+        }
+
+        if (!rt->w8a8_drop_fallback) continue;
+        if ((rt->w8a8_mask & WORLD_W8A8_QKV) && lw->qkv_proj_weight_i8) {
+            size_t elems = (size_t)(rt->D + 2 * rt->kv_dim) * rt->D;
+            if (lw->qkv_proj_weight) {
+                cudaFree(lw->qkv_proj_weight);
+                released_bytes += elems * sizeof(float);
+            } else {
+                omitted_bytes += elems * sizeof(float);
+            }
+            if (lw->qkv_proj_weight_h) {
+                cudaFree(lw->qkv_proj_weight_h);
+                released_bytes += elems * sizeof(__half);
+            } else {
+                omitted_bytes += elems * sizeof(__half);
+            }
+            lw->qkv_proj_weight = NULL;
+            lw->qkv_proj_weight_h = NULL;
+        }
+        if ((rt->w8a8_mask & WORLD_W8A8_OUT) && lw->out_proj_weight_i8) {
+            size_t elems = (size_t)rt->D * rt->D;
+            if (lw->out_proj_weight) {
+                cudaFree(lw->out_proj_weight);
+                released_bytes += elems * sizeof(float);
+            } else {
+                omitted_bytes += elems * sizeof(float);
+            }
+            if (lw->out_proj_weight_h) {
+                cudaFree(lw->out_proj_weight_h);
+                released_bytes += elems * sizeof(__half);
+            } else {
+                omitted_bytes += elems * sizeof(__half);
+            }
+            lw->out_proj_weight = NULL;
+            lw->out_proj_weight_h = NULL;
+        }
+        if ((rt->w8a8_mask & WORLD_W8A8_CTRL) && lw->has_ctrl &&
+                lw->ctrl_fc1_x_weight_i8 && lw->ctrl_fc2_weight_i8) {
+            size_t elems = (size_t)rt->D * rt->D;
+            float *f32_weights[] = {lw->ctrl_fc1_x_weight, lw->ctrl_fc2_weight};
+            __half *f16_weights[] = {lw->ctrl_fc1_x_weight_h, lw->ctrl_fc2_weight_h};
+            for (int j = 0; j < 2; ++j) {
+                if (f32_weights[j]) {
+                    cudaFree(f32_weights[j]);
+                    released_bytes += elems * sizeof(float);
+                } else {
+                    omitted_bytes += elems * sizeof(float);
+                }
+                if (f16_weights[j]) {
+                    cudaFree(f16_weights[j]);
+                    released_bytes += elems * sizeof(__half);
+                } else {
+                    omitted_bytes += elems * sizeof(__half);
+                }
+            }
+            lw->ctrl_fc1_x_weight = NULL;
+            lw->ctrl_fc1_x_weight_h = NULL;
+            lw->ctrl_fc2_weight = NULL;
+            lw->ctrl_fc2_weight_h = NULL;
+        }
+        if ((rt->w8a8_mask & WORLD_W8A8_MLP) &&
+                lw->dit_mlp_fc1_weight_i8 && lw->dit_mlp_fc2_weight_i8) {
+            size_t elems = (size_t)rt->D * rt->mlp_hidden;
+            float *f32_weights[] = {lw->dit_mlp_fc1_weight, lw->dit_mlp_fc2_weight};
+            __half *f16_weights[] = {lw->dit_mlp_fc1_weight_h, lw->dit_mlp_fc2_weight_h};
+            for (int j = 0; j < 2; ++j) {
+                if (f32_weights[j]) {
+                    cudaFree(f32_weights[j]);
+                    released_bytes += elems * sizeof(float);
+                } else {
+                    omitted_bytes += elems * sizeof(float);
+                }
+                if (f16_weights[j]) {
+                    cudaFree(f16_weights[j]);
+                    released_bytes += elems * sizeof(__half);
+                } else {
+                    omitted_bytes += elems * sizeof(__half);
+                }
+            }
+            lw->dit_mlp_fc1_weight = NULL;
+            lw->dit_mlp_fc1_weight_h = NULL;
+            lw->dit_mlp_fc2_weight = NULL;
+            lw->dit_mlp_fc2_weight_h = NULL;
+        }
+    }
+    fprintf(stderr,
+            "released %.2f GiB of init-only/fallback layer weights; "
+            "skipped %.2f GiB of W8A8 FP fallback allocations\n",
+            (double)released_bytes / (1024.0 * 1024.0 * 1024.0),
+            (double)omitted_bytes / (1024.0 * 1024.0 * 1024.0));
+}
+
+static int preflight_runtime_w8a8(WorldCudaRuntime *rt) {
+    if (!rt || !rt->w8a8_mask) return 0;
+    int checked_qkv = 0;
+    int checked_out = 0;
+    int checked_ctrl = 0;
+    int checked_mlp = 0;
+    for (int i = 0; i < rt->layers_to_run; ++i) {
+        const DeviceWorldLayerWeights *lw = &rt->d_layers[i];
+        if (!checked_qkv && lw->qkv_proj_weight_i8) {
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->qkv_proj_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D + 2 * rt->kv_dim)) return 1;
+            checked_qkv = 1;
+        }
+        if (!checked_out && lw->out_proj_weight_i8) {
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->out_proj_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D)) return 1;
+            checked_out = 1;
+        }
+        if (!checked_ctrl && lw->ctrl_fc1_x_weight_i8 && lw->ctrl_fc2_weight_i8) {
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->ctrl_fc1_x_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D)) return 1;
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->ctrl_fc2_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D)) return 1;
+            checked_ctrl = 1;
+        }
+        if (!checked_mlp && lw->dit_mlp_fc1_weight_i8 && lw->dit_mlp_fc2_weight_i8) {
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->dit_mlp_fc1_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->mlp_hidden)) return 1;
+            if (row_major_gemm_i8_i32_can_implement(
+                    rt->d_w8a8_x,
+                    lw->dit_mlp_fc2_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->mlp_hidden,
+                    rt->D)) return 1;
+            checked_mlp = 1;
+        }
+    }
+    fprintf(stderr, "W8A8 CUTLASS shape/layout preflight passed\n");
     return 0;
 }
 
@@ -5191,6 +5905,9 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
     cudaFree(rt->d_t_pos);
     cudaFree(rt->d_linear_half);
     cudaFree(rt->d_mlp_hidden_half);
+    cudaFree(rt->d_w8a8_x);
+    cudaFree(rt->d_w8a8_x_scales);
+    cudaFree(rt->d_w8a8_acc);
     cudaFree(rt->d_splitk_workspace);
     cudaFree(rt->d_attn_q_half);
     cudaFree(rt->d_attn_k_compact);
@@ -5271,6 +5988,83 @@ extern "C" int world_cuda_runtime_create(
         }
     }
     {
+        const char *enable_env = getenv("WORLD_W8A8");
+        const char *ops_env = getenv("WORLD_W8A8_OPS");
+        int enabled = enable_env && enable_env[0] &&
+            strcmp(enable_env, "0") != 0 && strcmp(enable_env, "off") != 0 &&
+            strcmp(enable_env, "none") != 0;
+        if (enabled) {
+            if (ops_env && ops_env[0]) {
+                rt->w8a8_mask = parse_w8a8_ops(ops_env);
+            } else if (strcmp(enable_env, "1") == 0) {
+                // The M=128 attention out projection is below the crossover
+                // point on Ada; its dynamic A8 boundary costs more than the
+                // INT8 GEMM saves.  Keep it enabled for the M=512 main model.
+                rt->w8a8_mask = WORLD_W8A8_ALL;
+                if (rt->T <= 256) rt->w8a8_mask &= ~WORLD_W8A8_OUT;
+            } else {
+                rt->w8a8_mask = parse_w8a8_ops(enable_env);
+            }
+            if (rt->w8a8_mask < 0) {
+                world_cuda_runtime_destroy(rt);
+                return 1;
+            }
+            if (rt->w8a8_mask == 0) {
+                fprintf(stderr, "W8A8 disabled: no operations selected\n");
+                enabled = 0;
+            }
+        }
+        if (enabled) {
+            int device = 0;
+            cudaDeviceProp prop;
+            cudaError_t device_err = cudaGetDevice(&device);
+            if (device_err == cudaSuccess) {
+                device_err = cudaGetDeviceProperties(&prop, device);
+            }
+            if (device_err != cudaSuccess) {
+                fprintf(stderr, "W8A8 device query failed: %s\n", cudaGetErrorString(device_err));
+                world_cuda_runtime_destroy(rt);
+                return 1;
+            }
+            if (prop.major < 8) {
+                fprintf(stderr,
+                        "W8A8 requires SM80+; detected %s compute capability %d.%d\n",
+                        prop.name, prop.major, prop.minor);
+                world_cuda_runtime_destroy(rt);
+                return 1;
+            }
+            const char *drop_env = getenv("WORLD_W8A8_DROP_FALLBACK");
+            rt->w8a8_drop_fallback = drop_env ? drop_env[0] != '0' : 1;
+            const char *layer_begin_env = getenv("WORLD_W8A8_LAYER_BEGIN");
+            const char *layer_end_env = getenv("WORLD_W8A8_LAYER_END");
+            rt->w8a8_layer_begin = layer_begin_env && layer_begin_env[0]
+                ? atoi(layer_begin_env) : 0;
+            rt->w8a8_layer_end = layer_end_env && layer_end_env[0]
+                ? atoi(layer_end_env) : layers_to_run;
+            if (rt->w8a8_layer_begin < 0) rt->w8a8_layer_begin = 0;
+            if (rt->w8a8_layer_end > layers_to_run) rt->w8a8_layer_end = layers_to_run;
+            if (rt->w8a8_layer_end <= rt->w8a8_layer_begin) {
+                fprintf(stderr,
+                        "invalid W8A8 layer range [%d,%d) for %d layers\n",
+                        rt->w8a8_layer_begin, rt->w8a8_layer_end, layers_to_run);
+                world_cuda_runtime_destroy(rt);
+                return 1;
+            }
+            fprintf(stderr,
+                    "W8A8 enabled: ops=%s%s%s%s layers=[%d,%d) fallback_weights=%s\n",
+                    (rt->w8a8_mask & WORLD_W8A8_MLP) ? "mlp," : "",
+                    (rt->w8a8_mask & WORLD_W8A8_QKV) ? "qkv," : "",
+                    (rt->w8a8_mask & WORLD_W8A8_OUT) ? "out," : "",
+                    (rt->w8a8_mask & WORLD_W8A8_CTRL) ? "ctrl" : "",
+                    rt->w8a8_layer_begin,
+                    rt->w8a8_layer_end,
+                    rt->w8a8_drop_fallback ? "drop-after-init" : "keep");
+            fprintf(stderr,
+                    "W8A8 warning: experimental row/channel-wise PTQ; "
+                    "validate long autoregressive rollouts before deployment\n");
+        }
+    }
+    {
         const char *tile_env = getenv("WORLD_FP16_GEMM_TILE");
         rt->fp16_gemm_m64n64_enabled =
             !(tile_env && tile_env[0] && (strcmp(tile_env, "base") == 0 || strcmp(tile_env, "128x128") == 0));
@@ -5331,6 +6125,13 @@ extern "C" int world_cuda_runtime_create(
     rt->linear_half_elems = rt->token_elems;
     if ((size_t)rt->T * rt->mlp_hidden > rt->linear_half_elems) {
         rt->linear_half_elems = (size_t)rt->T * rt->mlp_hidden;
+    }
+    rt->w8a8_x_elems = (size_t)rt->T *
+        (size_t)(rt->mlp_hidden > rt->D ? rt->mlp_hidden : rt->D);
+    {
+        int max_n = rt->D + 2 * rt->kv_dim;
+        if (rt->mlp_hidden > max_n) max_n = rt->mlp_hidden;
+        rt->w8a8_acc_elems = (size_t)rt->T * max_n;
     }
     size_t qkv_token_elems = rt->token_elems + 2 * ((size_t)rt->T * rt->kv_dim);
     size_t patch_weight_elems = (size_t)rt->D * rt->C * rt->ph * rt->pw;
@@ -5403,6 +6204,18 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMalloc((void **)&rt->d_t_pos, (size_t)rt->T * sizeof(int64_t)));
     RT_CUDA(cudaMalloc((void **)&rt->d_linear_half, rt->linear_half_elems * sizeof(__half)));
     RT_CUDA(cudaMalloc((void **)&rt->d_mlp_hidden_half, (size_t)rt->T * rt->mlp_hidden * sizeof(__half)));
+    if (rt->w8a8_mask) {
+        RT_CUDA(cudaMalloc((void **)&rt->d_w8a8_x, rt->w8a8_x_elems * sizeof(int8_t)));
+        RT_CUDA(cudaMalloc((void **)&rt->d_w8a8_x_scales, (size_t)rt->T * sizeof(float)));
+        RT_CUDA(cudaMalloc((void **)&rt->d_w8a8_acc, rt->w8a8_acc_elems * sizeof(int32_t)));
+        fprintf(stderr,
+                "W8A8 shared scratch: %.2f MiB (A8 %.2f, INT32 %.2f)\n",
+                ((double)rt->w8a8_x_elems +
+                 (double)rt->T * sizeof(float) +
+                 (double)rt->w8a8_acc_elems * sizeof(int32_t)) / (1024.0 * 1024.0),
+                (double)rt->w8a8_x_elems / (1024.0 * 1024.0),
+                (double)rt->w8a8_acc_elems * sizeof(int32_t) / (1024.0 * 1024.0));
+    }
     if (rt->mlp_fc2_splitk_slices > 1) {
         if (rt->mlp_fc2_splitk_parallel_enabled) {
             rt->splitk_workspace_bytes = row_major_linear_fp16_input_weight_tensorop_splitk_parallel_workspace_size(
@@ -5427,7 +6240,18 @@ extern "C" int world_cuda_runtime_create(
     if (copy_f32_to_device(&rt->d_out_norm_w, weights->out_norm_fc_weight, out_norm_weight_elems)) goto fail;
     if (copy_f32_to_device(&rt->d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto fail;
     if (copy_f32_to_device(&rt->d_unpatch_b, weights->unpatchify_bias, (size_t)rt->C)) goto fail;
-    if (copy_world_layers_to_device(&rt->d_layers, weights->layers, layers_to_run, rt->D, rt->kv_dim, rt->mlp_hidden)) goto fail;
+    if (copy_world_layers_to_device(
+                &rt->d_layers,
+                weights->layers,
+                layers_to_run,
+                rt->D,
+                rt->kv_dim,
+                rt->mlp_hidden,
+                rt->w8a8_drop_fallback,
+                rt->w8a8_mask,
+                rt->w8a8_layer_begin,
+                rt->w8a8_layer_end)) goto fail;
+    if (preflight_runtime_w8a8(rt)) goto fail;
     flash_attn_env = getenv("WORLD_FLASH_ATTN");
     rt->attn_flash_enabled = flash_attn_env ? flash_attn_env[0] != '0' : 0;
     {
@@ -5591,6 +6415,7 @@ extern "C" int world_cuda_runtime_create(
     RT_CUDA(cudaMemcpy(rt->d_xy_table, rt->h_xy, (size_t)rt->d_xy * sizeof(float), cudaMemcpyHostToDevice));
     RT_CUDA(cudaMemcpy(rt->d_inv_t, rt->h_inv_t, (size_t)rt->d_t * sizeof(float), cudaMemcpyHostToDevice));
     if (precompute_runtime_layer_mods(rt)) goto fail;
+    release_runtime_precompute_and_w8a8_fallback_weights(rt);
     RT_CUDA(cudaEventCreate(&rt->ev_step_start));
     RT_CUDA(cudaEventCreate(&rt->ev_after_setup));
     RT_CUDA(cudaEventCreate(&rt->ev_after_transformer));
@@ -5813,13 +6638,30 @@ extern "C" int world_cuda_runtime_step_rgb(
             float *d_b1 = d_layer_mod + 4 * rt->D;
             float *d_g1 = d_layer_mod + 5 * rt->D;
 
+            int qkv_w8a8 =
+                (rt->w8a8_mask & WORLD_W8A8_QKV) &&
+                lw->qkv_proj_weight_i8 && lw->qkv_proj_weight_i8_scales;
+            int out_w8a8 =
+                (rt->w8a8_mask & WORLD_W8A8_OUT) &&
+                lw->out_proj_weight_i8 && lw->out_proj_weight_i8_scales;
             int qkv_half_boundary =
+                !qkv_w8a8 &&
                 use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
                 lw->qkv_proj_weight_h &&
                 should_use_m64n64_tensorop(
                     rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->D + 2 * rt->kv_dim);
             STEP_PROFILE_BEGIN();
-            if (qkv_half_boundary) {
+            if (qkv_w8a8) {
+                rms_norm_quantize_rows_i8_kernel<<<rt->T, 256>>>(
+                    d_tokens_cur,
+                    d_s0,
+                    d_b0,
+                    rt->d_w8a8_x,
+                    rt->d_w8a8_x_scales,
+                    rt->T,
+                    rt->D,
+                    rt->rms_eps);
+            } else if (qkv_half_boundary) {
                 ada_rms_norm_single_f16_kernel<<<rt->T, 256>>>(
                     d_tokens_cur, d_s0, d_b0, rt->d_linear_half, rt->T, rt->D, rt->rms_eps);
             } else {
@@ -5829,7 +6671,15 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_norm_ms, prof_norm_calls);
             STEP_PROFILE_BEGIN();
-            if (qkv_half_boundary) {
+            if (qkv_w8a8) {
+                if (row_major_gemm_i8_i32(
+                    rt->d_w8a8_x,
+                    lw->qkv_proj_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D + 2 * rt->kv_dim)) return 1;
+            } else if (qkv_half_boundary) {
                 if (row_major_linear_fp16_input_weight_tensorop_m64n64(
                             rt->d_linear_half,
                             lw->qkv_proj_weight_h,
@@ -5847,10 +6697,32 @@ extern "C" int world_cuda_runtime_step_rgb(
             {
                 dim3 grid(rt->T, cfg->n_heads + 2 * cfg->n_kv_heads);
                 size_t smem = (size_t)(rt->d_head + 256) * sizeof(float);
-                qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
-                    rt->d_qkv_raw, rt->d_q, rt->d_k, d_v_cur,
-                    rt->d_x_pos, rt->d_y_pos, rt->d_t_pos, rt->d_xy_table, rt->d_inv_t,
-                    rt->T, cfg->n_heads, cfg->n_kv_heads, rt->d_head, cfg->width, cfg->height, rt->rms_eps);
+                if (qkv_w8a8) {
+                    qkv_fused_rms_rope_i32_dequant_kernel<<<grid, 256, smem>>>(
+                        rt->d_w8a8_acc,
+                        rt->d_w8a8_x_scales,
+                        lw->qkv_proj_weight_i8_scales,
+                        rt->d_q,
+                        rt->d_k,
+                        d_v_cur,
+                        rt->d_x_pos,
+                        rt->d_y_pos,
+                        rt->d_t_pos,
+                        rt->d_xy_table,
+                        rt->d_inv_t,
+                        rt->T,
+                        cfg->n_heads,
+                        cfg->n_kv_heads,
+                        rt->d_head,
+                        cfg->width,
+                        cfg->height,
+                        rt->rms_eps);
+                } else {
+                    qkv_fused_rms_rope_f32_kernel<<<grid, 256, smem>>>(
+                        rt->d_qkv_raw, rt->d_q, rt->d_k, d_v_cur,
+                        rt->d_x_pos, rt->d_y_pos, rt->d_t_pos, rt->d_xy_table, rt->d_inv_t,
+                        rt->T, cfg->n_heads, cfg->n_kv_heads, rt->d_head, cfg->width, cfg->height, rt->rms_eps);
+                }
             }
             STEP_CUDA(cudaGetLastError());
             if (cfg->value_residual && layer_idx != 0) {
@@ -5892,6 +6764,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                         int cutlass_rc = 0;
                         if (rt->attn_sparse_fmha_enabled) {
                             int fmha_half_output =
+                                !out_w8a8 &&
                                 use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
                                 lw->out_proj_weight_h &&
                                 should_use_m64n64_tensorop(
@@ -5915,6 +6788,7 @@ extern "C" int world_cuda_runtime_step_rgb(
                             attn_output_half_ready = fmha_half_output;
                         } else if (rt->attn_cutlass_fmha_enabled) {
                             int fmha_half_output =
+                                !out_w8a8 &&
                                 use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
                                 lw->out_proj_weight_h &&
                                 should_use_m64n64_tensorop(
@@ -6029,7 +6903,22 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_attn_ms, prof_attn_calls);
             STEP_PROFILE_BEGIN();
-            if (attn_output_half_ready) {
+            if (out_w8a8) {
+                quantize_rows_f32_i8_kernel<<<rt->T, 256>>>(
+                    rt->d_attn,
+                    rt->d_w8a8_x,
+                    rt->d_w8a8_x_scales,
+                    rt->T,
+                    rt->D);
+                STEP_CUDA(cudaGetLastError());
+                if (row_major_gemm_i8_i32(
+                    rt->d_w8a8_x,
+                    lw->out_proj_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->D)) return 1;
+            } else if (attn_output_half_ready) {
                 if (row_major_linear_fp16_input_weight_tensorop_m64n64(
                             rt->d_linear_half,
                             lw->out_proj_weight_h,
@@ -6043,31 +6932,99 @@ extern "C" int world_cuda_runtime_step_rgb(
             }
             STEP_PROFILE_ACCUM(prof_attn_out_gemm_ms, prof_attn_out_gemm_calls);
             STEP_PROFILE_BEGIN();
-            gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
-                d_tokens_cur, rt->d_attn_out, d_g0, rt->d_tokens_after_attn, rt->T, rt->D);
+            if (out_w8a8) {
+                dequant_gated_residual_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    rt->d_w8a8_acc,
+                    rt->d_w8a8_x_scales,
+                    lw->out_proj_weight_i8_scales,
+                    d_tokens_cur,
+                    d_g0,
+                    rt->d_tokens_after_attn,
+                    rt->T,
+                    rt->D);
+            } else {
+                gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    d_tokens_cur, rt->d_attn_out, d_g0, rt->d_tokens_after_attn, rt->T, rt->D);
+            }
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_attn_residual_ms, prof_attn_residual_calls);
 
             float *d_tokens_ctrl = rt->d_tokens_after_attn;
             if (lw->has_ctrl) {
                 STEP_PROFILE_BEGIN();
-                rms_norm_rows_f32_kernel<<<rt->T, 256>>>(rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, rt->rms_eps);
-                STEP_CUDA(cudaGetLastError());
-                STEP_LINEAR_FAST(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, lw->ctrl_fc1_x_weight_h,
-                                 rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
-                add_channel_silu_inplace_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
-                    rt->d_ctrl_hidden, rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D, rt->T, rt->D);
-                STEP_CUDA(cudaGetLastError());
-                STEP_LINEAR_FAST(rt->d_ctrl_hidden, lw->ctrl_fc2_weight, lw->ctrl_fc2_weight_h,
-                                 rt->d_ctrl_out, rt->T, rt->D, rt->D);
-                add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
-                    rt->d_tokens_after_attn, rt->d_ctrl_out, rt->d_tokens_after_ctrl, rt->token_elems);
-                STEP_CUDA(cudaGetLastError());
+                int ctrl_w8a8 =
+                    (rt->w8a8_mask & WORLD_W8A8_CTRL) &&
+                    lw->ctrl_fc1_x_weight_i8 && lw->ctrl_fc1_x_weight_i8_scales &&
+                    lw->ctrl_fc2_weight_i8 && lw->ctrl_fc2_weight_i8_scales;
+                if (ctrl_w8a8) {
+                    rms_norm_quantize_rows_i8_kernel<<<rt->T, 256>>>(
+                        rt->d_tokens_after_attn,
+                        NULL,
+                        NULL,
+                        rt->d_w8a8_x,
+                        rt->d_w8a8_x_scales,
+                        rt->T,
+                        rt->D,
+                        rt->rms_eps);
+                    STEP_CUDA(cudaGetLastError());
+                    if (row_major_gemm_i8_i32(
+                        rt->d_w8a8_x,
+                        lw->ctrl_fc1_x_weight_i8,
+                        rt->d_w8a8_acc,
+                        rt->T,
+                        rt->D,
+                        rt->D)) return 1;
+                    dequant_silu_quantize_rows_i8_kernel<<<rt->T, 256>>>(
+                        rt->d_w8a8_acc,
+                        rt->d_w8a8_x_scales,
+                        lw->ctrl_fc1_x_weight_i8_scales,
+                        rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D,
+                        rt->d_w8a8_x,
+                        rt->d_w8a8_x_scales,
+                        rt->T,
+                        rt->D);
+                    STEP_CUDA(cudaGetLastError());
+                    if (row_major_gemm_i8_i32(
+                        rt->d_w8a8_x,
+                        lw->ctrl_fc2_weight_i8,
+                        rt->d_w8a8_acc,
+                        rt->T,
+                        rt->D,
+                        rt->D)) return 1;
+                    dequant_add_residual_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                        rt->d_w8a8_acc,
+                        rt->d_w8a8_x_scales,
+                        lw->ctrl_fc2_weight_i8_scales,
+                        rt->d_tokens_after_attn,
+                        rt->d_tokens_after_ctrl,
+                        rt->T,
+                        rt->D);
+                    STEP_CUDA(cudaGetLastError());
+                } else {
+                    rms_norm_rows_f32_kernel<<<rt->T, 256>>>(
+                        rt->d_tokens_after_attn, rt->d_ctrl_norm, rt->T, rt->D, rt->rms_eps);
+                    STEP_CUDA(cudaGetLastError());
+                    STEP_LINEAR_FAST(rt->d_ctrl_norm, lw->ctrl_fc1_x_weight, lw->ctrl_fc1_x_weight_h,
+                                     rt->d_ctrl_hidden, rt->T, rt->D, rt->D);
+                    add_channel_silu_inplace_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                        rt->d_ctrl_hidden, rt->d_ctrl_cond_by_layer + (size_t)layer_idx * rt->D, rt->T, rt->D);
+                    STEP_CUDA(cudaGetLastError());
+                    STEP_LINEAR_FAST(rt->d_ctrl_hidden, lw->ctrl_fc2_weight, lw->ctrl_fc2_weight_h,
+                                     rt->d_ctrl_out, rt->T, rt->D, rt->D);
+                    add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                        rt->d_tokens_after_attn, rt->d_ctrl_out, rt->d_tokens_after_ctrl, rt->token_elems);
+                    STEP_CUDA(cudaGetLastError());
+                }
                 d_tokens_ctrl = rt->d_tokens_after_ctrl;
                 STEP_PROFILE_ACCUM(prof_ctrl_ms, prof_ctrl_calls);
             }
 
+            int mlp_w8a8 =
+                (rt->w8a8_mask & WORLD_W8A8_MLP) &&
+                lw->dit_mlp_fc1_weight_i8 && lw->dit_mlp_fc1_weight_i8_scales &&
+                lw->dit_mlp_fc2_weight_i8 && lw->dit_mlp_fc2_weight_i8_scales;
             int mlp_fc1_half_boundary =
+                !mlp_w8a8 &&
                 use_fp16_gemm && use_fp16_tensorop && rt->half_gemm_boundary_enabled &&
                 rt->mlp_fc1_silu_epilogue_enabled &&
                 lw->dit_mlp_fc1_weight_h && lw->dit_mlp_fc2_weight_h &&
@@ -6075,7 +7032,17 @@ extern "C" int world_cuda_runtime_step_rgb(
                 should_use_m64n64_tensorop(
                     rt->fp16_gemm_m64n64_enabled, rt->T, rt->D, rt->mlp_hidden);
             STEP_PROFILE_BEGIN();
-            if (mlp_fc1_half_boundary) {
+            if (mlp_w8a8) {
+                rms_norm_quantize_rows_i8_kernel<<<rt->T, 256>>>(
+                    d_tokens_ctrl,
+                    d_s1,
+                    d_b1,
+                    rt->d_w8a8_x,
+                    rt->d_w8a8_x_scales,
+                    rt->T,
+                    rt->D,
+                    rt->rms_eps);
+            } else if (mlp_fc1_half_boundary) {
                 ada_rms_norm_single_f16_kernel<<<rt->T, 256>>>(
                     d_tokens_ctrl, d_s1, d_b1, rt->d_linear_half, rt->T, rt->D, rt->rms_eps);
             } else {
@@ -6087,7 +7054,15 @@ extern "C" int world_cuda_runtime_step_rgb(
             int mlp_hidden_half_ready = 0;
             __half *d_mlp_hidden_half_cur = NULL;
             STEP_PROFILE_BEGIN();
-            if (use_fp16_gemm && use_fp16_tensorop &&
+            if (mlp_w8a8) {
+                if (row_major_gemm_i8_i32(
+                    rt->d_w8a8_x,
+                    lw->dit_mlp_fc1_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->D,
+                    rt->mlp_hidden)) return 1;
+            } else if (use_fp16_gemm && use_fp16_tensorop &&
                     rt->mlp_fc1_silu_epilogue_enabled &&
                     lw->dit_mlp_fc1_weight_h && lw->dit_mlp_fc2_weight_h &&
                     rt->mlp_fc2_splitk_slices > 1 &&
@@ -6119,7 +7094,17 @@ extern "C" int world_cuda_runtime_step_rgb(
             STEP_PROFILE_ACCUM(prof_mlp_fc1_ms, prof_mlp_fc1_calls);
             if (!mlp_hidden_half_ready) {
                 STEP_PROFILE_BEGIN();
-                if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
+                if (mlp_w8a8) {
+                    dequant_silu_quantize_rows_i8_kernel<<<rt->T, 256>>>(
+                        rt->d_w8a8_acc,
+                        rt->d_w8a8_x_scales,
+                        lw->dit_mlp_fc1_weight_i8_scales,
+                        NULL,
+                        rt->d_w8a8_x,
+                        rt->d_w8a8_x_scales,
+                        rt->T,
+                        rt->mlp_hidden);
+                } else if (use_fp16_gemm && use_fp16_tensorop && lw->dit_mlp_fc2_weight_h && rt->mlp_fc2_splitk_slices > 1) {
                     silu_f32_to_f16_kernel<<<div_up_i64((int64_t)rt->T * rt->mlp_hidden, 256), 256>>>(
                         rt->d_mlp_hidden, rt->d_mlp_hidden_half, (int64_t)rt->T * rt->mlp_hidden);
                     mlp_hidden_half_ready = 1;
@@ -6132,7 +7117,15 @@ extern "C" int world_cuda_runtime_step_rgb(
                 STEP_PROFILE_ACCUM(prof_mlp_silu_ms, prof_mlp_silu_calls);
             }
             STEP_PROFILE_BEGIN();
-            if (mlp_hidden_half_ready) {
+            if (mlp_w8a8) {
+                if (row_major_gemm_i8_i32(
+                    rt->d_w8a8_x,
+                    lw->dit_mlp_fc2_weight_i8,
+                    rt->d_w8a8_acc,
+                    rt->T,
+                    rt->mlp_hidden,
+                    rt->D)) return 1;
+            } else if (mlp_hidden_half_ready) {
                 if (!d_mlp_hidden_half_cur) return 1;
                 if (rt->mlp_fc2_splitk_parallel_enabled) {
                     if (row_major_linear_fp16_input_weight_tensorop_splitk_parallel(
@@ -6173,8 +7166,20 @@ extern "C" int world_cuda_runtime_step_rgb(
             }
             STEP_PROFILE_ACCUM(prof_mlp_fc2_ms, prof_mlp_fc2_calls);
             STEP_PROFILE_BEGIN();
-            gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
-                d_tokens_ctrl, rt->d_mlp_out, d_g1, d_tokens_next, rt->T, rt->D);
+            if (mlp_w8a8) {
+                dequant_gated_residual_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    rt->d_w8a8_acc,
+                    rt->d_w8a8_x_scales,
+                    lw->dit_mlp_fc2_weight_i8_scales,
+                    d_tokens_ctrl,
+                    d_g1,
+                    d_tokens_next,
+                    rt->T,
+                    rt->D);
+            } else {
+                gated_residual_add_f32_kernel<<<div_up_i64((int64_t)rt->token_elems, 256), 256>>>(
+                    d_tokens_ctrl, rt->d_mlp_out, d_g1, d_tokens_next, rt->T, rt->D);
+            }
             STEP_CUDA(cudaGetLastError());
             STEP_PROFILE_ACCUM(prof_mlp_residual_ms, prof_mlp_residual_calls);
 
@@ -7050,7 +8055,17 @@ extern "C" int world_cuda_transformer_probe(
     if (copy_f32_to_device(&d_out_norm_w, weights->out_norm_fc_weight, out_norm_weight_elems)) goto cleanup_device;
     if (copy_f32_to_device(&d_unpatch_w, weights->unpatchify_weight, unpatch_weight_elems)) goto cleanup_device;
     if (copy_f32_to_device(&d_unpatch_b, weights->unpatchify_bias, (size_t)C)) goto cleanup_device;
-    if (copy_world_layers_to_device(&d_layers, weights->layers, layers_to_run, D, kv_dim, mlp_hidden)) goto cleanup_device;
+    if (copy_world_layers_to_device(
+                &d_layers,
+                weights->layers,
+                layers_to_run,
+                D,
+                kv_dim,
+                mlp_hidden,
+                0,
+                0,
+                0,
+                0)) goto cleanup_device;
     if (alloc_device_world_caches(&d_caches, cfg, layers_to_run, T, cfg->n_kv_heads, d_head, 0)) goto cleanup_device;
 
     TRY_CUDA2(cudaMemcpy(d_xy_table, h_xy, (size_t)d_xy * sizeof(float), cudaMemcpyHostToDevice));
