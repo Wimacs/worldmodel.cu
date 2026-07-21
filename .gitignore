@@ -1,11 +1,10 @@
 .torch_extensions/
 build/
-build-vulkan/
-build-win*/
-build-w8a8/
+build*/
 __pycache__/
 *.pyc
 smoke_latent*.pt
+/tools/results/
 
 # Local model weights and generated tensors
 /Waypoint-1.5-1B/

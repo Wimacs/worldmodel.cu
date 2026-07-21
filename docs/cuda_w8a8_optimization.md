@@ -218,9 +218,9 @@ $env:WORLD_W8A8_DROP_FALLBACK = '0'
 cmake --build build-win-cudnn --config Release `
   --target worldmodel_raylib worldmodel_cuda --parallel
 
-python test_w8a8_quantization.py
+python tools/tests/test_w8a8_quantization.py
 
-cmake -S tests/w8a8 -B build-w8a8 -G "Visual Studio 17 2022" -A x64 `
+cmake -S . -B build -DWORLD_BUILD_TOOLS=ON -G "Visual Studio 17 2022" -A x64 `
   -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-w8a8 --config Release --parallel
 .\build-w8a8\Release\worldmodel_w8a8_probe.exe --case all --samples 256

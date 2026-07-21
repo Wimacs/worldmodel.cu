@@ -1,6 +1,0 @@
-#version 450
-#extension GL_GOOGLE_include_directive : require
-#define GEMM_CTA_N 128
-#define GEMM_CTA_K 64
-#define GEMM_EPILOGUE 2
-#include "gemm_cta_wf16_coopmat_template.comp"

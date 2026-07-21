@@ -5928,7 +5928,7 @@ extern "C" void world_cuda_runtime_destroy(WorldCudaRuntime *rt) {
 extern "C" int world_cuda_runtime_create(
         WorldCudaRuntime **out,
         const WorldConfig *cfg,
-        const WorldModelProbeWeights *weights,
+        const WorldModelWeights *weights,
         int layers_to_run,
         int steps_to_run,
         int frame_idx,

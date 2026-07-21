@@ -17,7 +17,7 @@
 #endif
 
 #include "raylib.h"
-#include "world_backend.h"
+#include "world_cuda.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -33,11 +33,10 @@
 #include <pthread.h>
 #endif
 
-#if WORLD_BACKEND_BYTES_PER_PIXEL == 4
-#define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
-#else
 #define WORLD_RAYLIB_PIXEL_FORMAT PIXELFORMAT_UNCOMPRESSED_R8G8B8
-#endif
+#define WORLD_RAYLIB_BYTES_PER_PIXEL 3
+#define WORLD_RAYLIB_BACKEND_NAME "CUDA"
+#define WORLD_RAYLIB_OUTPUT_LABEL "RGB"
 
 #ifdef _WIN32
 typedef CRITICAL_SECTION WorldMutex;
@@ -117,7 +116,7 @@ static void world_thread_sleep_millis(unsigned int millis) {
 #endif
 
 typedef struct {
-    WorldModelProbeWeights probe;
+    WorldModelWeights probe;
     WorldLayerWeights *layers;
     float *patchify_weight;
     float *denoise_fc1_weight;
@@ -131,7 +130,7 @@ typedef struct {
 
 typedef struct {
     WorldMutex mutex;
-    WorldRuntime *rt;
+    WorldCudaRuntime *rt;
     float *control;
     int ctrl_dim;
     int n_buttons;
@@ -330,7 +329,6 @@ static int ray_file_exists(const char *path) {
 }
 
 static void ray_enable_default_cuda_fmha(void) {
-#if !defined(WORLD_BACKEND_VULKAN) || !WORLD_BACKEND_VULKAN
     if (getenv("WORLD_ATTN_D64_FMHA")) return;
 #ifdef _WIN32
     if (_putenv_s("WORLD_ATTN_D64_FMHA", "1") == 0) {
@@ -339,7 +337,6 @@ static void ray_enable_default_cuda_fmha(void) {
 #endif
         fprintf(stderr, "raylib default: WORLD_ATTN_D64_FMHA=1\n");
     }
-#endif
 }
 
 static void free_loaded_model(LoadedWorldModel *m) {
@@ -670,15 +667,15 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
             float seconds = 0.0f;
             memset(control, 0, (size_t)s->ctrl_dim * sizeof(float));
             int image_failed = !latent ||
-                world_runtime_encode_image_rgb(s->rt, pending_image,
+                world_cuda_runtime_encode_image_rgb(s->rt, pending_image,
                     pending_width, pending_height, latent, &encode_seconds) ||
-                world_runtime_reset(s->rt, s->reset_frame_idx, s->seed) ||
-                world_runtime_seed_latent_pixels(s->rt, latent, control,
+                world_cuda_runtime_reset(s->rt, s->reset_frame_idx, s->seed) ||
+                world_cuda_runtime_seed_latent_rgb(s->rt, latent, control,
                     &pixels, &width, &height, &frames, &seconds);
             free(latent);
             free(pending_image);
 
-            size_t bytes = (size_t)width * height * WORLD_BACKEND_BYTES_PER_PIXEL * frames;
+            size_t bytes = (size_t)width * height * WORLD_RAYLIB_BYTES_PER_PIXEL * frames;
             world_mutex_lock(&s->mutex);
             s->image_loading = 0;
             int superseded = s->image_pending;
@@ -744,7 +741,7 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         int height = 0;
         int frames = 0;
         float seconds = 0.0f;
-        if (world_runtime_step_pixels(s->rt, control, &pixels, &width, &height, &frames, &seconds)) {
+        if (world_cuda_runtime_step_rgb(s->rt, control, &pixels, &width, &height, &frames, &seconds)) {
             world_mutex_lock(&s->mutex);
             s->failed = 1;
             s->stop = 1;
@@ -752,7 +749,7 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
             break;
         }
 
-        size_t bytes = (size_t)width * height * WORLD_BACKEND_BYTES_PER_PIXEL * frames;
+        size_t bytes = (size_t)width * height * WORLD_RAYLIB_BYTES_PER_PIXEL * frames;
         world_mutex_lock(&s->mutex);
         if (s->image_pending) {
             world_mutex_unlock(&s->mutex);
@@ -1228,7 +1225,7 @@ int main(int argc, char **argv) {
     LoadedWorldModel model;
     WorldVaeDecoderWeights vae;
     WorldVaeEncoderWeights vae_encoder;
-    WorldRuntime *rt = NULL;
+    WorldCudaRuntime *rt = NULL;
     float *seed_latent = NULL;
     float *seed_image_rgb = NULL;
     memset(&st, 0, sizeof(st));
@@ -1284,7 +1281,7 @@ int main(int argc, char **argv) {
     int rgb_frames = 0;
     float warm_seconds = 0.0f;
     if (warmup_chunks > 0) {
-        WorldRuntime *prewarm_rt = NULL;
+        WorldCudaRuntime *prewarm_rt = NULL;
         const unsigned char *prewarm_pixels = NULL;
         int prewarm_w = 0;
         int prewarm_h = 0;
@@ -1292,14 +1289,14 @@ int main(int argc, char **argv) {
         float prewarm_seconds = 0.0f;
         fprintf(stderr,
                 "prewarming %s runtime for %d chunk(s) on a temporary state; displayed runtime will be reset\n",
-                WORLD_BACKEND_NAME, warmup_chunks);
-        if (world_runtime_create(&prewarm_rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+                WORLD_RAYLIB_BACKEND_NAME, warmup_chunks);
+        if (world_cuda_runtime_create(&prewarm_rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
         }
-        if (world_runtime_init_vae_encoder(prewarm_rt, &vae_encoder)) {
-            world_runtime_destroy(prewarm_rt);
+        if (world_cuda_runtime_init_vae_encoder(prewarm_rt, &vae_encoder)) {
+            world_cuda_runtime_destroy(prewarm_rt);
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
@@ -1324,11 +1321,11 @@ int main(int argc, char **argv) {
             }
             float encoder_seconds = 0.0f;
             if (!encoder_warm_image || !encoder_warm_latent ||
-                    world_runtime_encode_image_rgb(prewarm_rt, encoder_warm_image,
+                    world_cuda_runtime_encode_image_rgb(prewarm_rt, encoder_warm_image,
                         vae_image_w, vae_image_h, encoder_warm_latent, &encoder_seconds)) {
                 if (free_warm_image) free(encoder_warm_image);
                 if (free_warm_latent) free(encoder_warm_latent);
-                world_runtime_destroy(prewarm_rt);
+                world_cuda_runtime_destroy(prewarm_rt);
                 free(seed_control);
                 free(warm_control);
                 goto cleanup_before_window;
@@ -1340,9 +1337,9 @@ int main(int argc, char **argv) {
         }
         if (seed_latent) {
             fprintf(stderr, "prewarm seed latent cache pass\n");
-            if (world_runtime_seed_latent_pixels(prewarm_rt, seed_latent, seed_control,
+            if (world_cuda_runtime_seed_latent_rgb(prewarm_rt, seed_latent, seed_control,
                         &prewarm_pixels, &prewarm_w, &prewarm_h, &prewarm_frames, &prewarm_seconds)) {
-                world_runtime_destroy(prewarm_rt);
+                world_cuda_runtime_destroy(prewarm_rt);
                 free(seed_control);
                 free(warm_control);
                 goto cleanup_before_window;
@@ -1350,24 +1347,24 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < warmup_chunks; ++i) {
             fprintf(stderr, "prewarm chunk %d/%d\n", i + 1, warmup_chunks);
-            if (world_runtime_step_pixels(prewarm_rt, warm_control,
+            if (world_cuda_runtime_step_rgb(prewarm_rt, warm_control,
                         &prewarm_pixels, &prewarm_w, &prewarm_h, &prewarm_frames, &prewarm_seconds)) {
-                world_runtime_destroy(prewarm_rt);
+                world_cuda_runtime_destroy(prewarm_rt);
                 free(seed_control);
                 free(warm_control);
                 goto cleanup_before_window;
             }
         }
-        world_runtime_destroy(prewarm_rt);
+        world_cuda_runtime_destroy(prewarm_rt);
     }
 
-    fprintf(stderr, "creating resident %s runtime\n", WORLD_BACKEND_NAME);
-    if (world_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+    fprintf(stderr, "creating resident %s runtime\n", WORLD_RAYLIB_BACKEND_NAME);
+    if (world_cuda_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
         free(seed_control);
         free(warm_control);
         goto cleanup_before_window;
     }
-    if (world_runtime_init_vae_encoder(rt, &vae_encoder)) {
+    if (world_cuda_runtime_init_vae_encoder(rt, &vae_encoder)) {
         free(seed_control);
         free(warm_control);
         goto cleanup_before_window;
@@ -1375,7 +1372,7 @@ int main(int argc, char **argv) {
     if (seed_image_rgb && !seed_latent) {
         float encoder_seconds = 0.0f;
         seed_latent = (float *)malloc(seed_latent_elems * sizeof(float));
-        if (!seed_latent || world_runtime_encode_image_rgb(rt, seed_image_rgb,
+        if (!seed_latent || world_cuda_runtime_encode_image_rgb(rt, seed_image_rgb,
                     vae_image_w, vae_image_h, seed_latent, &encoder_seconds)) {
             free(seed_control);
             free(warm_control);
@@ -1390,20 +1387,20 @@ int main(int argc, char **argv) {
 
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
-        if (world_runtime_seed_latent_pixels(rt, seed_latent, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_cuda_runtime_seed_latent_rgb(rt, seed_latent, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
         }
         fprintf(stderr, "generating initial chunk after seed cache pass\n");
-        if (world_runtime_step_pixels(rt, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_cuda_runtime_step_rgb(rt, seed_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
         }
     } else {
         fprintf(stderr, "generating initial chunk before window\n");
-        if (world_runtime_step_pixels(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+        if (world_cuda_runtime_step_rgb(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
@@ -1419,7 +1416,7 @@ int main(int argc, char **argv) {
         int expected_w = rgb_w;
         int expected_h = rgb_h;
         int expected_frames = rgb_frames;
-        size_t check_bytes = (size_t)rgb_w * rgb_h * WORLD_BACKEND_BYTES_PER_PIXEL * rgb_frames;
+        size_t check_bytes = (size_t)rgb_w * rgb_h * WORLD_RAYLIB_BYTES_PER_PIXEL * rgb_frames;
         unsigned char *expected_pixels = (unsigned char *)malloc(check_bytes);
         float *check_latent = (float *)malloc(seed_latent_elems * sizeof(float));
         if (!expected_pixels || !check_latent) {
@@ -1431,12 +1428,12 @@ int main(int argc, char **argv) {
         }
         memcpy(expected_pixels, warm_pixels, check_bytes);
         float encode_seconds = 0.0f;
-        int check_failed = world_runtime_encode_image_rgb(rt, seed_image_rgb,
+        int check_failed = world_cuda_runtime_encode_image_rgb(rt, seed_image_rgb,
                     vae_image_w, vae_image_h, check_latent, &encode_seconds) ||
-            world_runtime_reset(rt, frame_idx, seed) ||
-            world_runtime_seed_latent_pixels(rt, check_latent, seed_control,
+            world_cuda_runtime_reset(rt, frame_idx, seed) ||
+            world_cuda_runtime_seed_latent_rgb(rt, check_latent, seed_control,
                     &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds) ||
-            world_runtime_step_pixels(rt, seed_control,
+            world_cuda_runtime_step_rgb(rt, seed_control,
                     &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds);
         if (!check_failed &&
                 (rgb_w != expected_w || rgb_h != expected_h || rgb_frames != expected_frames)) {
@@ -1471,7 +1468,7 @@ int main(int argc, char **argv) {
     if (headless_smoke) {
         for (int i = 0; i < headless_generate_chunks; ++i) {
             fprintf(stderr, "headless generated chunk %d/%d\n", i + 1, headless_generate_chunks);
-            if (world_runtime_step_pixels(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
+            if (world_cuda_runtime_step_rgb(rt, warm_control, &warm_pixels, &rgb_w, &rgb_h, &rgb_frames, &warm_seconds)) {
                 free(seed_control);
                 free(warm_control);
                 goto cleanup_before_window;
@@ -1482,27 +1479,27 @@ int main(int argc, char **argv) {
     free(warm_control);
     if (!warm_pixels || rgb_w <= 0 || rgb_h <= 0 || rgb_frames <= 0) goto cleanup_before_window;
 
-    size_t frame_bytes = (size_t)rgb_w * rgb_h * WORLD_BACKEND_BYTES_PER_PIXEL;
+    size_t frame_bytes = (size_t)rgb_w * rgb_h * WORLD_RAYLIB_BYTES_PER_PIXEL;
     size_t rgb_bytes = frame_bytes * (size_t)rgb_frames;
     unsigned char *display_rgb = (unsigned char *)malloc(rgb_bytes);
     if (!display_rgb) goto cleanup_before_window;
     memcpy(display_rgb, warm_pixels, rgb_bytes);
     if (headless_smoke) {
-        if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h, WORLD_BACKEND_BYTES_PER_PIXEL)) {
+        if (headless_out_path && ray_write_ppm_frames(headless_out_path, display_rgb, rgb_frames, rgb_w, rgb_h, WORLD_RAYLIB_BYTES_PER_PIXEL)) {
             free(display_rgb);
             free(seed_image_rgb);
             free(seed_latent);
-            world_runtime_destroy(rt);
+            world_cuda_runtime_destroy(rt);
             return 1;
         }
         fprintf(stderr,
                 "headless smoke: resident runtime produced %d %s frame(s) %dx%d in %.3fs%s\n",
-                rgb_frames, WORLD_BACKEND_OUTPUT_LABEL, rgb_w, rgb_h, warm_seconds,
+                rgb_frames, WORLD_RAYLIB_OUTPUT_LABEL, rgb_w, rgb_h, warm_seconds,
                 headless_out_path ? ", wrote debug frames" : ", no image files written");
         free(display_rgb);
         free(seed_image_rgb);
         free(seed_latent);
-        world_runtime_destroy(rt);
+        world_cuda_runtime_destroy(rt);
         return 0;
     }
 
@@ -1704,7 +1701,7 @@ int main(int argc, char **argv) {
 cleanup_runtime_only:
     free(seed_image_rgb);
     free(seed_latent);
-    world_runtime_destroy(rt);
+    world_cuda_runtime_destroy(rt);
     return rc;
 
 cleanup_before_window:
@@ -1714,6 +1711,6 @@ cleanup_before_window:
     free_vae_encoder_weights(&vae_encoder);
     free(seed_image_rgb);
     free(seed_latent);
-    world_runtime_destroy(rt);
+    world_cuda_runtime_destroy(rt);
     return rc;
 }

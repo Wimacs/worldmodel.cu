@@ -32,7 +32,7 @@ FP16-weight fast path：
 - MLP v1.4 做了一个有边界的 split-K 验证：新增 `row_major_linear_fp16_input_tensorop_splitk_parallel` PyTorch probe 和 runtime 开关 `WORLD_MLP_FC2_SPLITK_PARALLEL=1`，使用 CUTLASS `GemmSplitKParallel`，tile 保持 `128x128x32`，只改变 reduction 组织方式。probe 对拍真实 fc2 shape `M=128,K=8192,N=2048`，reference 为 half input/weight 转 float matmul。microbench 显示 parallel split-K 4 slices 为 `0.0604ms`，serial split-K 4 slices 为 `0.0647ms`，但 runtime 满 cache profile 反而更慢：默认 serial `mlp_fc2=8.306ms/120`、最后 chunk `total=45.981ms`；parallel `mlp_fc2=8.550ms/120`、最后 chunk `total=46.611ms`，且需要 `4.00 MiB` partial workspace 和一个 reduction kernel。因此 parallel split-K 不默认启用，保留为诊断开关。
 - activation-boundary v1.8 没继续调 fc2 tile，而是处理 `torch.compile`/Triton 通常会跨算子消掉、手写 runtime 里却仍显式存在的 dtype bridge。旧 QKV 和 MLP 链路是 `AdaRMSNorm(float output) -> f32_to_f16 -> CUTLASS GEMM`；旧 FMHA 链路是 `FMHA half output -> scatter float -> f32_to_f16 -> out_proj`。这些中间 float tensor 只为下一个 GEMM 再量化一次，没有增加有效精度。
 - v1.8 新增 `ada_rms_norm_single_f16_kernel`：平方和、`rsqrt`、scale/bias 调制保持 FP32，只把最终 store 改为 round-to-nearest half。新增 half-input CUTLASS `64x64x32` GEMM 和 SiLU-half epilogue，让 QKV、MLP fc1、attention out projection 直接消费 producer 的 half buffer；FMHA GQA scatter 也增加 token-major half 输出。残差、gate、scheduler 和归一化归约仍是 FP32，因此这不是把整个 transformer 粗暴降成 FP16。
-- PyTorch extension 为每个新边界暴露并对拍 `ada_rms_norm_half`、`row_major_linear_fp16_input_tensorop_m64n64`、`row_major_linear_fp16_input_tensorop_m64n64_silu_half`、`indexed_attention_half_kv_fmha_gqa_half_output`。reference 明确在相同位置 `.half()`，完整 `test_worldmodel_kernels.py` 43 项通过。runtime 同输入 A/B 连续导出的 14 个 latent 以及最终 PPM 都逐字节一致，说明新路径只是消掉冗余表示，没有移动量化边界。
+- PyTorch extension 为每个新边界暴露并对拍 `ada_rms_norm_half`、`row_major_linear_fp16_input_tensorop_m64n64`、`row_major_linear_fp16_input_tensorop_m64n64_silu_half`、`indexed_attention_half_kv_fmha_gqa_half_output`。reference 明确在相同位置 `.half()`，完整 `tools/tests/test_cuda_ops.py` 43 项通过。runtime 同输入 A/B 连续导出的 14 个 latent 以及最终 PPM 都逐字节一致，说明新路径只是消掉冗余表示，没有移动量化边界。
 - 360p、24 layer、4 step、`cache-window=8`、FMHA GQA 满 cache 同代码 profile：`WORLD_HALF_GEMM_BOUNDARY=0` 时 `qkv_gemm=3.899ms/120`、`attn_out_gemm=2.417ms/120`、`mlp_fc1=6.861ms/120`、profile total `43.973ms`；默认新路径为 `3.666ms`、`2.158ms`、`6.478ms`、`43.011ms`。非 profile 最后一 chunk 从 `36.830ms` 降到 `35.959ms`，约 `2.4%`；`WORLD_HALF_GEMM_BOUNDARY=0` 保留为 A/B 回退。
 - 这一版到此停止：controller 分支还有类似边界，但它总计约 `1.9ms/40 calls`，继续扩散只会得到更小收益。下一版转向 FMHA 直接读取 sparse ring cache，目标是消掉每层每 pass 的 indexed K/V gather，而不是继续微调本版 half kernel。
 - CMake/NVCC 独立探针 `worldmodel_cuda_gemm_probe --tensorop` 现在通过；此前 `ldsm RowMajor` 失败的原因是 CMake 实际编译成了 `sm_52`，导致 CUTLASS SM80 `ldsm` 实现没有启用。
@@ -42,9 +42,9 @@ FP16-weight fast path：
 独立探针命令：
 
 ```sh
-./build/worldmodel_cuda_gemm_probe --small
-./build/worldmodel_cuda_gemm_probe --small --tensorop
-./build/worldmodel_cuda_gemm_probe --tensorop
+./build/tools/worldmodel_cuda_gemm_probe --small
+./build/tools/worldmodel_cuda_gemm_probe --small --tensorop
+./build/tools/worldmodel_cuda_gemm_probe --tensorop
 ```
 
 当前预期是三条都通过。如果这里重新出现 `ldsm RowMajor`，优先检查 configure 输出里的 `CUDA architectures` 是否为 `80+`。
@@ -207,7 +207,7 @@ Triton kernel 的常见优化点不是语言本身，而是以下几件事：
 每加一个 CUTLASS kernel，都必须补测试：
 
 - PyTorch extension 暴露一个最小入口。
-- `test_worldmodel_kernels.py` 用固定 seed 构造输入。
+- `tools/tests/test_cuda_ops.py` 用固定 seed 构造输入。
 - reference 尽量使用 PyTorch 原生算子。
 - FP32 SIMT 对拍用严格阈值。
 - TF32/FP16 tensor-op 对拍要和实际量化路径一致，例如 `x.half().float() @ w.half().float().T`。
