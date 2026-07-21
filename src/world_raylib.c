@@ -19,8 +19,10 @@
 #include "raylib.h"
 #include "world_backend.h"
 
-#include <math.h>
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <stdint.h>
 #ifndef _WIN32
 #include <time.h>
 #endif
@@ -1175,7 +1177,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "fast realtime cache override: local_window=%d global_window=%d global_pinned_dilation=1\n",
                     cfg.local_window, cfg.global_window);
         } else {
-            int min_global_window = cfg.global_pinned_dilation * 2;
+            int64_t min_global_window64 = (int64_t)cfg.global_pinned_dilation * 2;
+            if (min_global_window64 > INT_MAX) {
+                fprintf(stderr,
+                        "cache override cannot preserve two global buckets: global_pinned_dilation=%d is too large\n",
+                        cfg.global_pinned_dilation);
+                return 1;
+            }
+            int min_global_window = (int)min_global_window64;
             if (cfg.global_window < min_global_window) {
                 fprintf(stderr,
                         "global cache override raised from %d to %d to keep at least two pinned global buckets (global_pinned_dilation=%d)\n",
@@ -1183,8 +1192,15 @@ int main(int argc, char **argv) {
                 cfg.global_window = min_global_window;
             }
             if (cfg.global_window % cfg.global_pinned_dilation != 0) {
-                int adjusted = ((cfg.global_window + cfg.global_pinned_dilation - 1) / cfg.global_pinned_dilation) *
-                    cfg.global_pinned_dilation;
+                int64_t adjusted64 =
+                    (((int64_t)cfg.global_window + cfg.global_pinned_dilation - 1) /
+                     cfg.global_pinned_dilation) * cfg.global_pinned_dilation;
+                if (adjusted64 > INT_MAX) {
+                    fprintf(stderr,
+                            "cache override rounding exceeds the supported integer range\n");
+                    return 1;
+                }
+                int adjusted = (int)adjusted64;
                 fprintf(stderr,
                         "global cache override rounded from %d to %d to preserve global_pinned_dilation=%d\n",
                         cfg.global_window, adjusted, cfg.global_pinned_dilation);
@@ -1198,6 +1214,7 @@ int main(int argc, char **argv) {
                     "warning: --cache-window 1 masks the current ring slot and leaves no previous-frame history; use --cache-window 2 or higher for controllable rollout\n");
         }
     }
+    if (world_config_validate(&cfg)) return 1;
     if (layers_to_run < 0) layers_to_run = cfg.n_layers;
     if (steps_to_run < 0) steps_to_run = cfg.scheduler_sigmas_count - 1;
     if (layers_to_run <= 0 || layers_to_run > cfg.n_layers || steps_to_run <= 0 || steps_to_run >= cfg.scheduler_sigmas_count) {

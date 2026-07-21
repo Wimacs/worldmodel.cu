@@ -41,6 +41,14 @@ int world_vulkan_sparse_gqa_fmha_probe(void);
 int world_vulkan_half_boundary_ops_probe(void);
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--indexed-attention") == 0) {
+        if (world_vulkan_indexed_attention_f32_probe()) {
+            fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: failed\n");
+            return 1;
+        }
+        fprintf(stderr, "world_vulkan_indexed_attention_f32_probe: ok\n");
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--taehv") == 0) {
         if (world_vulkan_taehv_primitives_probe()) {
             fprintf(stderr, "world_vulkan_taehv_primitives_probe: failed\n");
@@ -74,7 +82,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc != 1) {
-        fprintf(stderr, "usage: %s [--taehv|--sparse-fmha|--cache-indices|--half-boundary]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s [--indexed-attention|--taehv|--sparse-fmha|--cache-indices|--half-boundary]\n",
+                argv[0]);
         return 2;
     }
     if (world_vulkan_linear_f32_probe()) {

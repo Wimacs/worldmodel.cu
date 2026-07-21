@@ -341,7 +341,11 @@ struct WorldVulkanRuntime {
     uint32_t queue_family;
     int shader_float16_enabled;
     int storage_16bit_enabled;
+    int vulkan_memory_model_enabled;
     int cooperative_matrix_enabled;
+    uint32_t physical_device_api_version;
+    uint32_t subgroup_size;
+    int subgroup_32_arithmetic_enabled;
     uint32_t max_compute_shared_memory_size;
     uint32_t max_compute_work_group_invocations;
     uint32_t max_compute_work_group_size_x;
@@ -1250,12 +1254,34 @@ static int pick_physical_device(WorldVulkanRuntime *rt) {
     }
     rt->physical_device = devices[best];
     rt->queue_family = best_family;
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(rt->physical_device, &props);
-    rt->max_compute_shared_memory_size = props.limits.maxComputeSharedMemorySize;
-    rt->max_compute_work_group_invocations = props.limits.maxComputeWorkGroupInvocations;
-    rt->max_compute_work_group_size_x = props.limits.maxComputeWorkGroupSize[0];
-    fprintf(stderr, "Vulkan device: %s queue_family=%u\n", props.deviceName, rt->queue_family);
+    VkPhysicalDeviceSubgroupProperties subgroup_props;
+    memset(&subgroup_props, 0, sizeof(subgroup_props));
+    subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2;
+    memset(&props2, 0, sizeof(props2));
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &subgroup_props;
+    vkGetPhysicalDeviceProperties2(rt->physical_device, &props2);
+    const VkPhysicalDeviceProperties *props = &props2.properties;
+    rt->physical_device_api_version = props->apiVersion;
+    rt->subgroup_size = subgroup_props.subgroupSize;
+    rt->subgroup_32_arithmetic_enabled =
+        subgroup_props.subgroupSize == 32u &&
+        (subgroup_props.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0u &&
+        (subgroup_props.supportedOperations &
+            (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT)) ==
+            (VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
+    rt->max_compute_shared_memory_size = props->limits.maxComputeSharedMemorySize;
+    rt->max_compute_work_group_invocations = props->limits.maxComputeWorkGroupInvocations;
+    rt->max_compute_work_group_size_x = props->limits.maxComputeWorkGroupSize[0];
+    fprintf(stderr,
+            "Vulkan device: %s queue_family=%u subgroupSize=%u subgroup32Arithmetic=%d\n",
+            props->deviceName, rt->queue_family, rt->subgroup_size,
+            rt->subgroup_32_arithmetic_enabled);
+    if (!rt->subgroup_32_arithmetic_enabled) {
+        fprintf(stderr,
+                "warning: Vulkan 32-lane subgroup optimized paths disabled; using generic kernels\n");
+    }
     free(devices);
     return 0;
 }
@@ -4200,6 +4226,7 @@ static int create_runtime_model_slice(
                 splitk_env_enabled &&
                 !rt->runtime_sparse_gqa_fmha_requested &&
                 rt->d_head == 64 &&
+                rt->subgroup_32_arithmetic_enabled &&
                 rt->max_compute_work_group_invocations >= 768u &&
                 rt->max_compute_work_group_size_x >= 768u &&
                 rt->max_compute_shared_memory_size >= splitk_shared_bytes &&
@@ -5106,7 +5133,7 @@ static int create_runtime_model_slice(
             if (create_storage_pipeline(rt, "indexed_attention_f32.comp", 6, sizeof(WorldVulkanIndexedAttentionPush),
                         &rt->runtime_indexed_attention_shader, &rt->runtime_indexed_attention_set_layout,
                         &rt->runtime_indexed_attention_pipeline_layout, &rt->runtime_indexed_attention_pipeline)) return 1;
-            if (rt->d_head == 64) {
+            if (rt->d_head == 64 && rt->subgroup_32_arithmetic_enabled) {
                 if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_warp_f32.comp",
                             rt->runtime_indexed_attention_set_layout, sizeof(WorldVulkanIndexedAttentionPush),
                             &rt->runtime_indexed_attention_d64_shader,
@@ -5313,6 +5340,10 @@ static int create_runtime_model_slice(
                                 rt->max_compute_work_group_size_x);
                     }
                 }
+            } else if (rt->d_head == 64) {
+                fprintf(stderr,
+                        "warning: Vulkan optimized d64 attention disabled for subgroupSize=%u; using indexed_attention_f32\n",
+                        rt->subgroup_size);
             }
             if (rt->layer_attn_out_enabled) {
                 if (create_storage_pipeline(rt, "gated_residual_add_f32.comp", 4, sizeof(WorldVulkanGatedResidualPush),
@@ -6747,7 +6778,8 @@ static int record_runtime_model_slice(
                 const char *attn_label = "attention.generic";
                 uint32_t attn_dispatch_x = (uint32_t)(rt->cfg.n_heads * rt->T);
                 const char *disable_d64_attn = getenv("WORLD_VULKAN_DISABLE_D64_ATTENTION");
-                int d64_allowed = !(disable_d64_attn && disable_d64_attn[0] && disable_d64_attn[0] != '0');
+                int d64_allowed = rt->subgroup_32_arithmetic_enabled &&
+                    !(disable_d64_attn && disable_d64_attn[0] && disable_d64_attn[0] != '0');
                 uint32_t group = rt->cfg.n_kv_heads > 0 ?
                     (uint32_t)(rt->cfg.n_heads / rt->cfg.n_kv_heads) : 0u;
                 if (rt->d_head == 64 && d64_allowed) {
@@ -7793,6 +7825,10 @@ int world_vulkan_runtime_create(
             VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
     int has_coop_matrix_ext = physical_device_has_extension(rt->physical_device,
             VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    int memory_model_is_core = rt->physical_device_api_version >= VK_API_VERSION_1_2;
+    int has_memory_model_ext = physical_device_has_extension(rt->physical_device,
+            VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME);
+    int has_memory_model = memory_model_is_core || has_memory_model_ext;
 
     VkPhysicalDeviceShaderFloat16Int8Features shader_f16_avail;
     memset(&shader_f16_avail, 0, sizeof(shader_f16_avail));
@@ -7803,6 +7839,9 @@ int world_vulkan_runtime_create(
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_matrix_avail;
     memset(&coop_matrix_avail, 0, sizeof(coop_matrix_avail));
     coop_matrix_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkanMemoryModelFeatures memory_model_avail;
+    memset(&memory_model_avail, 0, sizeof(memory_model_avail));
+    memory_model_avail.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
     VkPhysicalDeviceFeatures2 avail_features;
     memset(&avail_features, 0, sizeof(avail_features));
     avail_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -7810,6 +7849,10 @@ int world_vulkan_runtime_create(
     if (has_coop_matrix_ext) {
         coop_matrix_avail.pNext = avail_chain;
         avail_chain = &coop_matrix_avail;
+    }
+    if (has_memory_model) {
+        memory_model_avail.pNext = avail_chain;
+        avail_chain = &memory_model_avail;
     }
     storage_16bit_avail.pNext = avail_chain;
     avail_chain = &storage_16bit_avail;
@@ -7829,6 +7872,9 @@ int world_vulkan_runtime_create(
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop_matrix_enable;
     memset(&coop_matrix_enable, 0, sizeof(coop_matrix_enable));
     coop_matrix_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    VkPhysicalDeviceVulkanMemoryModelFeatures memory_model_enable;
+    memset(&memory_model_enable, 0, sizeof(memory_model_enable));
+    memory_model_enable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES;
     void *enable_chain = NULL;
     if (has_shader_f16_ext && shader_f16_avail.shaderFloat16) {
         shader_f16_enable.shaderFloat16 = VK_TRUE;
@@ -7846,7 +7892,19 @@ int world_vulkan_runtime_create(
         device_extensions[device_extension_count++] = VK_KHR_16BIT_STORAGE_EXTENSION_NAME;
         rt->storage_16bit_enabled = 1;
     }
-    if (has_coop_matrix_ext && coop_matrix_avail.cooperativeMatrix) {
+    if (has_memory_model && memory_model_avail.vulkanMemoryModel) {
+        memory_model_enable.vulkanMemoryModel = VK_TRUE;
+        memory_model_enable.pNext = enable_chain;
+        enable_chain = &memory_model_enable;
+        if (!memory_model_is_core) {
+            device_extensions[device_extension_count++] =
+                VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME;
+        }
+        rt->vulkan_memory_model_enabled = 1;
+    }
+    if (has_coop_matrix_ext && coop_matrix_avail.cooperativeMatrix &&
+            rt->vulkan_memory_model_enabled &&
+            rt->subgroup_32_arithmetic_enabled) {
         coop_matrix_enable.cooperativeMatrix = VK_TRUE;
         coop_matrix_enable.pNext = enable_chain;
         enable_chain = &coop_matrix_enable;
@@ -7858,8 +7916,17 @@ int world_vulkan_runtime_create(
     enabled_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     enabled_features.pNext = enable_chain;
     fprintf(stderr,
-            "Vulkan optional compute features: shaderFloat16=%d storage16=%d cooperativeMatrix=%d\n",
-            rt->shader_float16_enabled, rt->storage_16bit_enabled, rt->cooperative_matrix_enabled);
+            "Vulkan optional compute features: shaderFloat16=%d storage16=%d vulkanMemoryModel=%d subgroup32Arithmetic=%d cooperativeMatrix=%d\n",
+            rt->shader_float16_enabled, rt->storage_16bit_enabled,
+            rt->vulkan_memory_model_enabled, rt->subgroup_32_arithmetic_enabled,
+            rt->cooperative_matrix_enabled);
+    if (has_coop_matrix_ext && coop_matrix_avail.cooperativeMatrix &&
+            !rt->cooperative_matrix_enabled) {
+        fprintf(stderr,
+                "warning: Vulkan cooperative-matrix paths disabled; vulkanMemoryModel=%d subgroup32Arithmetic=%d\n",
+                rt->vulkan_memory_model_enabled,
+                rt->subgroup_32_arithmetic_enabled);
+    }
 
     VkDeviceCreateInfo device_info;
     memset(&device_info, 0, sizeof(device_info));
@@ -14876,55 +14943,57 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     VkDeviceSize sizes_kvf16[6] = {q_bytes, kv_f16_bytes, kv_f16_bytes, indices_bytes, q_bytes, count_bytes};
     if (create_storage_descriptor_set(rt, set_layout, 6, buffers_kvf16, sizes_kvf16, NULL,
                 &descriptor_pool_kvf16, &descriptor_set_kvf16)) goto cleanup;
-    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk32_part_f32.comp",
-                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                &splitk32_part_shader, &splitk32_part_pipeline_layout, &splitk32_part_pipeline)) goto cleanup;
-    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_f32.comp",
-                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                &splitk_part_shader, &splitk_part_pipeline_layout, &splitk_part_pipeline)) goto cleanup;
-    if (rt->max_compute_work_group_invocations >= 1024u &&
-            rt->max_compute_work_group_size_x >= 1024u) {
-        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_w32_part_f32.comp",
+    if (rt->subgroup_32_arithmetic_enabled) {
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk32_part_f32.comp",
                     set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                    &splitk_w32_part_shader,
-                    &splitk_w32_part_pipeline_layout,
-                    &splitk_w32_part_pipeline)) goto cleanup;
-    }
-    if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
-        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_kvf16_f32.comp",
+                    &splitk32_part_shader, &splitk32_part_pipeline_layout, &splitk32_part_pipeline)) goto cleanup;
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_f32.comp",
                     set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                    &splitk_part_kvf16_shader,
-                    &splitk_part_kvf16_pipeline_layout,
-                    &splitk_part_kvf16_pipeline)) goto cleanup;
+                    &splitk_part_shader, &splitk_part_pipeline_layout, &splitk_part_pipeline)) goto cleanup;
+        if (rt->max_compute_work_group_invocations >= 1024u &&
+                rt->max_compute_work_group_size_x >= 1024u) {
+            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_w32_part_f32.comp",
+                        set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                        &splitk_w32_part_shader,
+                        &splitk_w32_part_pipeline_layout,
+                        &splitk_w32_part_pipeline)) goto cleanup;
+        }
+        if (rt->shader_float16_enabled && rt->storage_16bit_enabled) {
+            if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk64_part_kvf16_f32.comp",
+                        set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                        &splitk_part_kvf16_shader,
+                        &splitk_part_kvf16_pipeline_layout,
+                        &splitk_part_kvf16_pipeline)) goto cleanup;
+        }
+        if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk96_part_f32.comp",
+                    set_layout, sizeof(WorldVulkanIndexedAttentionPush),
+                    &splitk96_part_shader, &splitk96_part_pipeline_layout, &splitk96_part_pipeline)) goto cleanup;
+        VkBuffer splitk_part_buffers[6] = {q_buffer, k_buffer, v_buffer, indices_buffer, splitk_partial_buffer, count_buffer};
+        VkDeviceSize splitk_part_sizes[6] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, splitk_partial_bytes, count_bytes};
+        if (create_storage_descriptor_set(rt, set_layout, 6, splitk_part_buffers, splitk_part_sizes, NULL,
+                    &splitk_part_descriptor_pool, &splitk_part_descriptor_set)) goto cleanup;
+        if (splitk_part_kvf16_pipeline) {
+            VkBuffer splitk_part_kvf16_buffers[6] = {
+                q_buffer, k_f16_buffer, v_f16_buffer, indices_buffer, splitk_partial_buffer, count_buffer
+            };
+            VkDeviceSize splitk_part_kvf16_sizes[6] = {
+                q_bytes, kv_f16_bytes, kv_f16_bytes, indices_bytes, splitk_partial_bytes, count_bytes
+            };
+            if (create_storage_descriptor_set(rt, set_layout, 6,
+                        splitk_part_kvf16_buffers, splitk_part_kvf16_sizes, NULL,
+                        &splitk_part_kvf16_descriptor_pool,
+                        &splitk_part_kvf16_descriptor_set)) goto cleanup;
+        }
+        if (create_storage_pipeline(rt, "indexed_attention_d64_splitk64_reduce_f32.comp",
+                    3, sizeof(WorldVulkanIndexedAttentionPush),
+                    &splitk_reduce_shader, &splitk_reduce_set_layout,
+                    &splitk_reduce_pipeline_layout, &splitk_reduce_pipeline)) goto cleanup;
+        VkBuffer splitk_reduce_buffers[3] = {splitk_partial_buffer, out_buffer, count_buffer};
+        VkDeviceSize splitk_reduce_sizes[3] = {splitk_partial_bytes, q_bytes, count_bytes};
+        if (create_storage_descriptor_set(rt, splitk_reduce_set_layout, 3,
+                    splitk_reduce_buffers, splitk_reduce_sizes, NULL,
+                    &splitk_reduce_descriptor_pool, &splitk_reduce_descriptor_set)) goto cleanup;
     }
-    if (create_storage_pipeline_with_set_layout(rt, "indexed_attention_d64_splitk96_part_f32.comp",
-                set_layout, sizeof(WorldVulkanIndexedAttentionPush),
-                &splitk96_part_shader, &splitk96_part_pipeline_layout, &splitk96_part_pipeline)) goto cleanup;
-    VkBuffer splitk_part_buffers[6] = {q_buffer, k_buffer, v_buffer, indices_buffer, splitk_partial_buffer, count_buffer};
-    VkDeviceSize splitk_part_sizes[6] = {q_bytes, kv_bytes, kv_bytes, indices_bytes, splitk_partial_bytes, count_bytes};
-    if (create_storage_descriptor_set(rt, set_layout, 6, splitk_part_buffers, splitk_part_sizes, NULL,
-                &splitk_part_descriptor_pool, &splitk_part_descriptor_set)) goto cleanup;
-    if (splitk_part_kvf16_pipeline) {
-        VkBuffer splitk_part_kvf16_buffers[6] = {
-            q_buffer, k_f16_buffer, v_f16_buffer, indices_buffer, splitk_partial_buffer, count_buffer
-        };
-        VkDeviceSize splitk_part_kvf16_sizes[6] = {
-            q_bytes, kv_f16_bytes, kv_f16_bytes, indices_bytes, splitk_partial_bytes, count_bytes
-        };
-        if (create_storage_descriptor_set(rt, set_layout, 6,
-                    splitk_part_kvf16_buffers, splitk_part_kvf16_sizes, NULL,
-                    &splitk_part_kvf16_descriptor_pool,
-                    &splitk_part_kvf16_descriptor_set)) goto cleanup;
-    }
-    if (create_storage_pipeline(rt, "indexed_attention_d64_splitk64_reduce_f32.comp",
-                3, sizeof(WorldVulkanIndexedAttentionPush),
-                &splitk_reduce_shader, &splitk_reduce_set_layout,
-                &splitk_reduce_pipeline_layout, &splitk_reduce_pipeline)) goto cleanup;
-    VkBuffer splitk_reduce_buffers[3] = {splitk_partial_buffer, out_buffer, count_buffer};
-    VkDeviceSize splitk_reduce_sizes[3] = {splitk_partial_bytes, q_bytes, count_bytes};
-    if (create_storage_descriptor_set(rt, splitk_reduce_set_layout, 3,
-                splitk_reduce_buffers, splitk_reduce_sizes, NULL,
-                &splitk_reduce_descriptor_pool, &splitk_reduce_descriptor_set)) goto cleanup;
     WorldVulkanIndexedAttentionPush push;
     push.B = B;
     push.Hq = Hq;
@@ -14986,6 +15055,14 @@ int world_vulkan_indexed_attention_f32_probe(void) {
     } while (0)
 
     CHECK_INDEXED_ATTENTION("indexed_attention_f32", 0);
+
+    if (!rt->subgroup_32_arithmetic_enabled) {
+        fprintf(stderr,
+                "vulkan indexed_attention d64 optimized probes: skipped; subgroupSize=%u compute basic/arithmetic support is required\n",
+                rt->subgroup_size);
+        rc = 0;
+        goto cleanup;
+    }
 
     {
         memset(out, 0, q_bytes);

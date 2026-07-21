@@ -17,6 +17,8 @@ typedef struct {
     char *path;
     char *header;
     uint64_t header_len;
+    uint64_t data_offset;
+    uint64_t file_size;
     SafeTensorEntry *entries;
     int count;
     int capacity;

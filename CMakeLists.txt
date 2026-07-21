@@ -9,6 +9,8 @@ option(WORLD_ENABLE_CUDA "Build CUDA backend targets" ON)
 option(WORLD_ENABLE_VULKAN "Build Vulkan backend targets" OFF)
 set(WORLD_CUTLASS_DIR "" CACHE PATH "Path to a CUTLASS checkout. If empty, common local checkouts are probed and then FetchContent is used.")
 
+include(CTest)
+
 if(WORLD_ENABLE_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
 endif()
@@ -48,6 +50,31 @@ function(world_enable_cuda_options target_name)
   )
   world_enable_large_objects(${target_name})
 endfunction()
+
+if(BUILD_TESTING)
+  add_executable(worldmodel_config_tests
+    tests/test_world_config.c
+    src/world_config.c
+  )
+  target_include_directories(worldmodel_config_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(worldmodel_config_tests PRIVATE
+    ${WORLD_PLATFORM_LIBS}
+  )
+  world_enable_large_objects(worldmodel_config_tests)
+  add_test(NAME worldmodel_config_validation COMMAND worldmodel_config_tests)
+
+  add_executable(worldmodel_safetensors_tests
+    tests/test_safetensors.c
+    src/safetensors.c
+  )
+  target_include_directories(worldmodel_safetensors_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  world_enable_large_objects(worldmodel_safetensors_tests)
+  add_test(NAME worldmodel_safetensors_validation COMMAND worldmodel_safetensors_tests)
+endif()
 
 if(WORLD_ENABLE_CUDA)
   enable_language(CUDA)

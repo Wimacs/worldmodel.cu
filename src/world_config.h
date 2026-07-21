@@ -27,8 +27,17 @@ typedef struct {
     int scheduler_sigmas_count;
 } WorldConfig;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void world_config_defaults(WorldConfig *cfg);
+int world_config_validate(const WorldConfig *cfg);
 int world_config_load(WorldConfig *cfg, const char *path);
 void world_config_print(const WorldConfig *cfg);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

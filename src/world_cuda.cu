@@ -5937,6 +5937,7 @@ extern "C" int world_cuda_runtime_create(
         const WorldVaeDecoderWeights *vae) {
     if (!out || !cfg || !weights || !weights->layers || !vae) return 1;
     *out = NULL;
+    if (world_config_validate(cfg)) return 1;
     if (layers_to_run <= 0 || layers_to_run > weights->n_layers) {
         fprintf(stderr, "invalid runtime layers_to_run=%d n_layers=%d\n", layers_to_run, weights->n_layers);
         return 1;
