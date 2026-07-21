@@ -27,6 +27,7 @@ MODEL_DIR = ROOT.parent / "Waypoint-1.5-1B"
 WEIGHTS_PATH = MODEL_DIR / "transformer" / "diffusion_pytorch_model.safetensors"
 VAE_DIR = MODEL_DIR / "vae"
 VAE_WEIGHTS_PATH = VAE_DIR / "diffusion_pytorch_model.safetensors"
+RMS_EPS = torch.finfo(torch.float32).eps
 
 
 def _find_executable(build_dir, name, config="Release"):
@@ -119,6 +120,14 @@ def _control_vector(cfg):
     n = int(cfg["n_buttons"]) + 3
     idx = np.arange(n, dtype=np.float32)
     return (0.25 * np.sin(idx * 0.17) + 0.05 * np.cos(idx * 0.07)).astype(np.float32)
+
+
+def _live_control_vector(cfg):
+    control = np.zeros(int(cfg["n_buttons"]) + 3, dtype=np.float32)
+    control[0] = 10.0
+    control[1] = -6.0
+    control[2 + 0x57] = 1.0
+    return control
 
 
 def _read_dump(prefix, name, shape):
@@ -305,7 +314,7 @@ def test_standalone_layer0_probe_matches_pytorch():
 
     with tempfile.TemporaryDirectory(prefix="world_layer0_probe_") as td:
         prefix = str(Path(td) / "dump")
-        control_np = _control_vector(cfg)
+        control_np = _live_control_vector(cfg)
         control_path = Path(td) / "control.f32"
         control_np.tofile(control_path)
         subprocess.run(
@@ -372,7 +381,7 @@ def test_standalone_layer0_probe_matches_pytorch():
             state["ctrl_emb.mlp.fc2.weight"],
         )
         ctrl_cond = F.linear(
-            F.rms_norm(ctrl_emb.reshape(d_model), (d_model,), eps=1.0e-6),
+            F.rms_norm(ctrl_emb.reshape(d_model), (d_model,), eps=RMS_EPS),
             state["transformer.blocks.0.ctrl_mlpfusion.fc1_c.weight"],
         )
 
@@ -392,7 +401,7 @@ def test_standalone_layer0_probe_matches_pytorch():
 
         tokens = F.conv2d(latent, state["patchify.weight"], bias=None, stride=(ph, pw))
         tokens = tokens.permute(0, 2, 3, 1).reshape(1, tpf, d_model).contiguous()
-        norm = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s0) + b0
+        norm = F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + s0) + b0
         q_raw = F.linear(norm, state["transformer.blocks.0.attn.q_proj.weight"]).reshape(tpf, d_model)
         k_raw = F.linear(norm, state["transformer.blocks.0.attn.k_proj.weight"]).reshape(tpf, kv_dim)
         v_raw = F.linear(norm, state["transformer.blocks.0.attn.v_proj.weight"]).reshape(tpf, kv_dim)
@@ -405,8 +414,8 @@ def test_standalone_layer0_probe_matches_pytorch():
         q = q_raw.view(1, tpf, n_heads, d_head).permute(0, 2, 1, 3).contiguous()
         k = k_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
         v = v_raw.view(tpf, n_kv_heads, d_head).permute(1, 0, 2).contiguous()
-        q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
-        k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+        q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+        k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
         group = n_heads // n_kv_heads
         k_gqa = k.repeat_interleave(group, dim=0)
         v_gqa = v.repeat_interleave(group, dim=0)
@@ -417,13 +426,13 @@ def test_standalone_layer0_probe_matches_pytorch():
         attn_out = F.linear(attn, state["transformer.blocks.0.attn.out_proj.weight"])
         tokens_after_attn = tokens.reshape(tpf, d_model) + attn_out * g0
         ctrl_hidden = F.linear(
-            F.rms_norm(tokens_after_attn, (d_model,), eps=1.0e-6),
+            F.rms_norm(tokens_after_attn, (d_model,), eps=RMS_EPS),
             state["transformer.blocks.0.ctrl_mlpfusion.fc1_x.weight"],
         )
         ctrl_hidden = ctrl_hidden + ctrl_cond
         ctrl_out = F.linear(F.silu(ctrl_hidden), state["transformer.blocks.0.ctrl_mlpfusion.fc2.weight"])
         tokens_after_ctrl = tokens_after_attn + ctrl_out
-        mlp_in = F.rms_norm(tokens_after_ctrl, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+        mlp_in = F.rms_norm(tokens_after_ctrl, (d_model,), eps=RMS_EPS) * (1.0 + s1) + b1
         mlp_out = F.linear(
             F.silu(F.linear(mlp_in, state["transformer.blocks.0.dit_mlp.fc1.weight"])),
             state["transformer.blocks.0.dit_mlp.fc2.weight"],
@@ -581,7 +590,7 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             F.silu(F.linear(control, state["ctrl_emb.mlp.fc1.weight"])),
             state["ctrl_emb.mlp.fc2.weight"],
         ).reshape(d_model)
-        ctrl_norm = F.rms_norm(ctrl_emb, (d_model,), eps=1.0e-6)
+        ctrl_norm = F.rms_norm(ctrl_emb, (d_model,), eps=RMS_EPS)
 
         latent = torch.from_numpy(_lcg_latent((1, c, h, w), seed)).to(device)
         cond = F.linear(
@@ -624,15 +633,15 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             b1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.1.weight"])
             g1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.2.weight"])
 
-            norm = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s0) + b0
+            norm = F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + s0) + b0
             q_raw = F.linear(norm, state[f"{p}.attn.q_proj.weight"])
             k_raw = F.linear(norm, state[f"{p}.attn.k_proj.weight"])
             v_raw = F.linear(norm, state[f"{p}.attn.v_proj.weight"])
             q = q_raw.view(1, tpf, n_heads, d_head).permute(0, 2, 1, 3).contiguous()
             k = k_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
             v = v_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
-            q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
-            k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+            q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+            k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
             v = v[0]
             if v_first is None:
                 v_first = v
@@ -663,11 +672,11 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             tokens = tokens + F.linear(attn, state[f"{p}.attn.out_proj.weight"]) * g0
 
             if f"{p}.ctrl_mlpfusion.fc1_x.weight" in state:
-                ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=1.0e-6), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
+                ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=RMS_EPS), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
                 ctrl_hidden = ctrl_hidden + F.linear(ctrl_norm, state[f"{p}.ctrl_mlpfusion.fc1_c.weight"])
                 tokens = tokens + F.linear(F.silu(ctrl_hidden), state[f"{p}.ctrl_mlpfusion.fc2.weight"])
 
-            mlp_in = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+            mlp_in = F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + s1) + b1
             mlp_out = F.linear(
                 F.silu(F.linear(mlp_in, state[f"{p}.dit_mlp.fc1.weight"])),
                 state[f"{p}.dit_mlp.fc2.weight"],
@@ -675,7 +684,7 @@ def test_standalone_two_layer_transformer_matches_pytorch():
             tokens = tokens + mlp_out * g1
 
         mod = F.linear(F.silu(cond), state["out_norm.fc.weight"]).reshape(2, d_model)
-        final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + mod[0]) + mod[1])
+        final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + mod[0]) + mod[1])
         unpatch_w = state["unpatchify.weight"].permute(1, 2, 3, 0).reshape(c * ph * pw, d_model).contiguous()
         unpatch_b = state["unpatchify.bias"][:, None, None].expand(c, ph, pw).reshape(c * ph * pw).contiguous()
         latent_out = F.linear(final_tokens, unpatch_w, unpatch_b)
@@ -960,7 +969,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 F.silu(F.linear(control, state["ctrl_emb.mlp.fc1.weight"])),
                 state["ctrl_emb.mlp.fc2.weight"],
             ).reshape(d_model)
-            ctrl_norms.append(F.rms_norm(ctrl_emb, (d_model,), eps=1.0e-6))
+            ctrl_norms.append(F.rms_norm(ctrl_emb, (d_model,), eps=RMS_EPS))
 
         idx = torch.arange(tpf, device=device, dtype=torch.long)
         y_pos = idx.div(width, rounding_mode="floor").contiguous()
@@ -1004,15 +1013,15 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 b1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.1.weight"])
                 g1 = F.linear(cond_act, state[f"{p}.mlp_cond_head.cond_proj.2.weight"])
 
-                norm = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s0) + b0
+                norm = F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + s0) + b0
                 q_raw = F.linear(norm, state[f"{p}.attn.q_proj.weight"])
                 k_raw = F.linear(norm, state[f"{p}.attn.k_proj.weight"])
                 v_raw = F.linear(norm, state[f"{p}.attn.v_proj.weight"])
                 q = q_raw.view(1, tpf, n_heads, d_head).permute(0, 2, 1, 3).contiguous()
                 k = k_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
                 v = v_raw.view(1, tpf, n_kv_heads, d_head).permute(0, 2, 1, 3).contiguous()
-                q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
-                k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=1.0e-6), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+                q = _ref_ortho_rope(F.rms_norm(q, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
+                k = _ref_ortho_rope(F.rms_norm(k, (d_head,), eps=RMS_EPS), x_pos, y_pos, t_pos, xy, inv_t, width, height)[0]
                 v = v[0]
                 if v_first is None:
                     v_first = v
@@ -1047,11 +1056,11 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 tokens = tokens + F.linear(attn, state[f"{p}.attn.out_proj.weight"]) * g0
 
                 if f"{p}.ctrl_mlpfusion.fc1_x.weight" in state:
-                    ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=1.0e-6), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
+                    ctrl_hidden = F.linear(F.rms_norm(tokens, (d_model,), eps=RMS_EPS), state[f"{p}.ctrl_mlpfusion.fc1_x.weight"])
                     ctrl_hidden = ctrl_hidden + F.linear(ctrl_norms[frame_ordinal], state[f"{p}.ctrl_mlpfusion.fc1_c.weight"])
                     tokens = tokens + F.linear(F.silu(ctrl_hidden), state[f"{p}.ctrl_mlpfusion.fc2.weight"])
 
-                mlp_in = F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + s1) + b1
+                mlp_in = F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + s1) + b1
                 mlp_out = F.linear(
                     F.silu(F.linear(mlp_in, state[f"{p}.dit_mlp.fc1.weight"])),
                     state[f"{p}.dit_mlp.fc2.weight"],
@@ -1062,7 +1071,7 @@ def test_standalone_two_frame_cache_rollout_matches_pytorch():
                 return tokens, None, None
 
             mod = F.linear(F.silu(cond), state["out_norm.fc.weight"]).reshape(2, d_model)
-            final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=1.0e-6) * (1.0 + mod[0]) + mod[1])
+            final_tokens = F.silu(F.rms_norm(tokens, (d_model,), eps=RMS_EPS) * (1.0 + mod[0]) + mod[1])
             unpatch_w = state["unpatchify.weight"].permute(1, 2, 3, 0).reshape(c * ph * pw, d_model).contiguous()
             unpatch_b = state["unpatchify.bias"][:, None, None].expand(c, ph, pw).reshape(c * ph * pw).contiguous()
             latent_out = F.linear(final_tokens, unpatch_w, unpatch_b)

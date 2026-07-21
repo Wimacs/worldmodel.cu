@@ -501,7 +501,7 @@ extern "C" int world_cuda_layer0_probe(
     if (wm_cuda_silu_f32(d_ctrl_emb_hidden, d_ctrl_emb_hidden, mlp_hidden)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
     TRY_LINEAR(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
-    if (wm_cuda_rms_norm_rows_f32(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f)) goto cleanup_device;
+    if (wm_cuda_rms_norm_rows_f32(d_ctrl_emb, d_ctrl_emb_norm, 1, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
     TRY_LINEAR(d_ctrl_emb_norm, d_ctrl_fc1_c_w, d_ctrl_cond, 1, D, D);
 
@@ -521,7 +521,7 @@ extern "C" int world_cuda_layer0_probe(
 
     if (wm_cuda_patchify_f32(d_latent, d_patch, d_tokens, C, H, W, D, ph, pw, cfg->height, cfg->width)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
-    if (wm_cuda_ada_rms_norm_f32(d_tokens, d_s0, d_b0, d_norm, T, D, 1.0e-6f)) goto cleanup_device;
+    if (wm_cuda_ada_rms_norm_f32(d_tokens, d_s0, d_b0, d_norm, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
 
     TRY_LINEAR(d_norm, d_q_w, d_q_raw, T, D, D);
@@ -533,7 +533,7 @@ extern "C" int world_cuda_layer0_probe(
             d_q_raw, d_k_raw, d_v_raw,
             d_q, d_k, d_v,
             d_x_pos, d_y_pos, d_t_pos, d_xy_table, d_inv_t,
-            T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, 1.0e-6f)) goto cleanup_device;
+            T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
     }
     TRY_CUDA(cudaGetLastError());
 
@@ -546,7 +546,7 @@ extern "C" int world_cuda_layer0_probe(
         d_tokens, d_attn_out, d_g0, d_tokens_after_attn, T, D)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
 
-    if (wm_cuda_rms_norm_rows_f32(d_tokens_after_attn, d_ctrl_norm, T, D, 1.0e-6f)) goto cleanup_device;
+    if (wm_cuda_rms_norm_rows_f32(d_tokens_after_attn, d_ctrl_norm, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
     TRY_LINEAR(d_ctrl_norm, d_ctrl_fc1_x_w, d_ctrl_hidden, T, D, D);
     if (wm_cuda_add_channel_silu_inplace_f32(d_ctrl_hidden, d_ctrl_cond, T, D)) goto cleanup_device;
@@ -556,7 +556,7 @@ extern "C" int world_cuda_layer0_probe(
         d_tokens_after_attn, d_ctrl_out, d_tokens_after_ctrl, token_elems)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
 
-    if (wm_cuda_ada_rms_norm_f32(d_tokens_after_ctrl, d_s1, d_b1, d_mlp_in, T, D, 1.0e-6f)) goto cleanup_device;
+    if (wm_cuda_ada_rms_norm_f32(d_tokens_after_ctrl, d_s1, d_b1, d_mlp_in, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
     TRY_CUDA(cudaGetLastError());
     TRY_LINEAR(d_mlp_in, d_dit_mlp_fc1_w, d_mlp_hidden, T, D, mlp_hidden);
     if (wm_cuda_silu_f32(
@@ -969,7 +969,7 @@ extern "C" int world_cuda_transformer_probe(
         if (wm_cuda_silu_f32(d_ctrl_emb_hidden, d_ctrl_emb_hidden, mlp_hidden)) goto cleanup_device;
         TRY_CUDA2(cudaGetLastError());
         TRY_LINEAR2(d_ctrl_emb_hidden, d_ctrl_emb_fc2_w, d_ctrl_emb, 1, mlp_hidden, D);
-        if (wm_cuda_rms_norm_rows_f32(d_ctrl_emb, d_ctrl_emb_norm, 1, D, 1.0e-6f)) goto cleanup_device;
+        if (wm_cuda_rms_norm_rows_f32(d_ctrl_emb, d_ctrl_emb_norm, 1, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
         TRY_CUDA2(cudaGetLastError());
         for (int layer_idx = 0; layer_idx < layers_to_run; ++layer_idx) {
             const DeviceWorldLayerWeights *lw = &d_layers[layer_idx];
@@ -1037,7 +1037,7 @@ extern "C" int world_cuda_transformer_probe(
             float *d_b1 = d_layer_mod + 4 * D;
             float *d_g1 = d_layer_mod + 5 * D;
 
-            if (wm_cuda_ada_rms_norm_f32(d_tokens_cur, d_s0, d_b0, d_norm, T, D, 1.0e-6f)) goto cleanup_device;
+            if (wm_cuda_ada_rms_norm_f32(d_tokens_cur, d_s0, d_b0, d_norm, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_norm, lw->qkv_proj_weight, d_qkv_raw, T, D, D + 2 * kv_dim);
             float *d_v_cur = (cfg->value_residual && layer_idx == 0) ? d_v_first : d_v;
@@ -1047,7 +1047,7 @@ extern "C" int world_cuda_transformer_probe(
                     d_qkv_raw,
                     d_q, d_k, d_v_cur,
                     d_x_pos, d_y_pos, d_t_pos, d_xy_table, d_inv_t,
-                    T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, 1.0e-6f)) goto cleanup_device;
+                    T, cfg->n_heads, cfg->n_kv_heads, d_head, cfg->width, cfg->height, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
             }
             TRY_CUDA2(cudaGetLastError());
 
@@ -1085,7 +1085,7 @@ extern "C" int world_cuda_transformer_probe(
 
             float *d_tokens_ctrl = d_tokens_after_attn;
             if (lw->has_ctrl) {
-                if (wm_cuda_rms_norm_rows_f32(d_tokens_after_attn, d_ctrl_norm, T, D, 1.0e-6f)) goto cleanup_device;
+                if (wm_cuda_rms_norm_rows_f32(d_tokens_after_attn, d_ctrl_norm, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
                 TRY_CUDA2(cudaGetLastError());
                 TRY_LINEAR2(d_ctrl_norm, lw->ctrl_fc1_x_weight, d_ctrl_hidden, T, D, D);
                 if (wm_cuda_add_channel_silu_inplace_f32(
@@ -1098,7 +1098,7 @@ extern "C" int world_cuda_transformer_probe(
                 d_tokens_ctrl = d_tokens_after_ctrl;
             }
 
-            if (wm_cuda_ada_rms_norm_f32(d_tokens_ctrl, d_s1, d_b1, d_mlp_in, T, D, 1.0e-6f)) goto cleanup_device;
+            if (wm_cuda_ada_rms_norm_f32(d_tokens_ctrl, d_s1, d_b1, d_mlp_in, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
             TRY_CUDA2(cudaGetLastError());
             TRY_LINEAR2(d_mlp_in, lw->dit_mlp_fc1_weight, d_mlp_hidden, T, D, mlp_hidden);
             if (wm_cuda_silu_f32(
@@ -1121,7 +1121,7 @@ extern "C" int world_cuda_transformer_probe(
         if (wm_cuda_silu_f32(d_cond, d_cond_act, D)) goto cleanup_device;
         TRY_CUDA2(cudaGetLastError());
         TRY_LINEAR2(d_cond_act, d_out_norm_w, d_out_mod, 1, D, 2 * D);
-        if (wm_cuda_out_norm_silu_f32(d_tokens_cur, d_out_mod, d_final_tokens, T, D, 1.0e-6f)) goto cleanup_device;
+        if (wm_cuda_out_norm_silu_f32(d_tokens_cur, d_out_mod, d_final_tokens, T, D, WORLD_RMS_NORM_EPSILON)) goto cleanup_device;
         TRY_CUDA2(cudaGetLastError());
         if (wm_cuda_unpatchify_f32(
             d_final_tokens, d_unpatch_w, d_unpatch_b, d_latent_out,

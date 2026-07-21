@@ -1003,15 +1003,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
     m.def("row_major_linear_fp16_input_tensorop_splitk_parallel", &row_major_linear_fp16_input_tensorop_splitk_parallel_cuda,
           py::arg("x"), py::arg("w"), py::arg("split_k_slices"));
-    m.def("rms_norm", &rms_norm_cuda, py::arg("x"), py::arg("eps") = 1.0e-6);
+    m.def("rms_norm", &rms_norm_cuda,
+          py::arg("x"), py::arg("eps") = WORLD_RMS_NORM_EPSILON);
     m.def("ada_rms_norm", &ada_rms_norm_cuda,
-          py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
+          py::arg("x"), py::arg("scale"), py::arg("bias"),
+          py::arg("eps") = WORLD_RMS_NORM_EPSILON);
     m.def("ada_rms_norm_half", &ada_rms_norm_half_cuda,
-          py::arg("x"), py::arg("scale"), py::arg("bias"), py::arg("eps") = 1.0e-6);
+          py::arg("x"), py::arg("scale"), py::arg("bias"),
+          py::arg("eps") = WORLD_RMS_NORM_EPSILON);
     m.def("qkv_rms_rope", &qkv_rms_rope_cuda,
           py::arg("qkv"), py::arg("x_pos"), py::arg("y_pos"), py::arg("t_pos"),
           py::arg("xy"), py::arg("inv_t"), py::arg("n_heads"), py::arg("n_kv_heads"),
-          py::arg("width"), py::arg("height"), py::arg("eps") = 1.0e-6);
+          py::arg("width"), py::arg("height"),
+          py::arg("eps") = WORLD_RMS_NORM_EPSILON);
     m.def("indexed_attention", &indexed_attention_cuda);
     m.def("indexed_attention_flash", &indexed_attention_flash_cuda);
     m.def("indexed_attention_half_kv", &indexed_attention_half_kv_cuda);

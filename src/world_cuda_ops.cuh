@@ -3,8 +3,11 @@
 
 #include <cuda_fp16.h>
 
+#include <float.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define WORLD_RMS_NORM_EPSILON FLT_EPSILON
 
 // Backend-private CUDA operator entry points.  These functions launch work
 // but do not own model state, weights, caches, or scheduling policy.

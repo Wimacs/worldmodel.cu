@@ -1,4 +1,10 @@
 if(BUILD_TESTING)
+  add_executable(worldmodel_control_tests tests/test_world_control.c)
+  target_include_directories(worldmodel_control_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(worldmodel_control_tests PRIVATE ${WORLD_PLATFORM_LIBS})
+  world_enable_large_objects(worldmodel_control_tests)
+  add_test(NAME worldmodel_control_validation COMMAND worldmodel_control_tests)
+
   add_executable(worldmodel_config_tests
     tests/test_world_config.c
     ${PROJECT_SOURCE_DIR}/src/world_config.c

@@ -1,5 +1,6 @@
 #define _FILE_OFFSET_BITS 64
 
+#include "world_control.h"
 #include "world_weights.h"
 
 #ifdef _WIN32
@@ -297,7 +298,7 @@ static void ray_usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s [MODEL_DIR|MODEL.safetensors] [IMAGE] [--model-dir DIR] [--weights FILE] [--vae-weights FILE] [--seed-image FILE] [--seed-latent FILE] [--steps N] [--layers N] [--cache-window N] [--fast-realtime] [--frame-idx N] [--seed N] [--noise normal|uniform] [--mouse-scale X] [--window-width N] [--window-height N] [--warmup N] [--headless-smoke] [--headless-generate N] [--headless-reset-check] [--headless-out PATH] [--headless-mouse X Y] [--headless-button N]\n"
             "\n"
-            "Defaults: full model, full denoise schedule, cache window 8, mouse scale 30.0.\n",
+            "Defaults: full model, full denoise schedule, cache window 8, mouse scale 1.5.\n",
             argv0);
 }
 
@@ -466,18 +467,12 @@ static float clamp_scroll_sign(float x) {
     return 0.0f;
 }
 
-static float clamp_mouse_axis(float x) {
-    if (x > 1.0f) return 1.0f;
-    if (x < -1.0f) return -1.0f;
-    return x;
-}
-
 static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, float mouse_scale) {
     memset(control, 0, (size_t)ctrl_dim * sizeof(float));
     Vector2 delta = GetMouseDelta();
     if (ctrl_dim >= n_buttons + 3) {
-        control[0] = delta.x * mouse_scale * 0.01f;
-        control[1] = delta.y * mouse_scale * 0.01f;
+        control[0] = delta.x * mouse_scale;
+        control[1] = delta.y * mouse_scale;
         for (size_t i = 0; i < WORLD_KEY_BINDING_COUNT; ++i) {
             const WorldKeyBinding *binding = &WORLD_KEY_BINDINGS[i];
             if (binding->vk >= 0 && IsKeyDown(binding->ray_key)) {
@@ -495,8 +490,8 @@ static void fill_raylib_control(float *control, int ctrl_dim, int n_buttons, flo
 
 static void merge_frame_control(LiveShared *s, const float *frame_control) {
     if (s->ctrl_dim < s->n_buttons + 3) return;
-    s->control[0] += frame_control[0];
-    s->control[1] += frame_control[1];
+    s->control[0] = frame_control[0];
+    s->control[1] = frame_control[1];
     for (int i = 0; i < s->n_buttons; ++i) {
         s->control[2 + i] = frame_control[2 + i];
     }
@@ -713,10 +708,6 @@ static WORLD_THREAD_RETURN generation_worker(void *arg) {
         }
         memcpy(control, s->control, (size_t)s->ctrl_dim * sizeof(float));
         if (s->ctrl_dim >= s->n_buttons + 3) {
-            control[0] = clamp_mouse_axis(control[0]);
-            control[1] = clamp_mouse_axis(control[1]);
-            s->control[0] = 0.0f;
-            s->control[1] = 0.0f;
             s->control[2 + s->n_buttons] = 0.0f;
         }
         world_mutex_unlock(&s->mutex);
@@ -925,10 +916,12 @@ static void draw_mouse_hud(int screen_width, int screen_height, float mouse_x, f
               Fade(BLACK, 0.62f));
     DrawRing(center, radius - s, radius, 0.0f, 360.0f, 48, RAYWHITE);
 
-    float magnitude = sqrtf(mouse_x * mouse_x + mouse_y * mouse_y);
+    float display_x = mouse_x * 0.1f;
+    float display_y = mouse_y * 0.1f;
+    float magnitude = sqrtf(display_x * display_x + display_y * display_y);
     if (magnitude > 1.0e-5f) {
-        float nx = mouse_x / magnitude;
-        float ny = mouse_y / magnitude;
+        float nx = display_x / magnitude;
+        float ny = display_y / magnitude;
         float strength = fminf(1.0f, sqrtf(fminf(magnitude, 1.0f)) * 1.6f);
         float vector_length = (radius - 8.0f * s) * strength;
         Vector2 tip = {center.x + nx * vector_length, center.y + ny * vector_length};
@@ -1034,7 +1027,7 @@ int main(int argc, char **argv) {
     float headless_mouse_x = 0.0f;
     float headless_mouse_y = 0.0f;
     int headless_button = -1;
-    float mouse_scale = 30.0f;
+    float mouse_scale = WORLD_MOUSE_DEFAULT_SCALE;
     unsigned int seed = 1234;
     int noise_mode = WORLD_NOISE_NORMAL;
     int positional_model_seen = 0;
@@ -1268,8 +1261,8 @@ int main(int argc, char **argv) {
         goto cleanup_before_window;
     }
     if (headless_has_mouse) {
-        warm_control[0] = clamp_mouse_axis(headless_mouse_x);
-        warm_control[1] = clamp_mouse_axis(headless_mouse_y);
+        warm_control[0] = headless_mouse_x;
+        warm_control[1] = headless_mouse_y;
     }
     if (headless_button >= 0) {
         if (headless_button < cfg.n_buttons) {
@@ -1575,6 +1568,9 @@ int main(int argc, char **argv) {
     int paused = 0;
     int image_loading = 0;
     int suppress_mouse_frames = 0;
+    int was_window_focused = IsWindowFocused();
+    WorldMouseVelocityState mouse_velocity;
+    world_mouse_velocity_reset(&mouse_velocity, GetTime());
     float *frame_control = (float *)malloc((size_t)ctrl_dim * sizeof(float));
     if (!frame_control) {
         world_mutex_lock(&shared.mutex);
@@ -1585,9 +1581,20 @@ int main(int argc, char **argv) {
     while (!WindowShouldClose()) {
         if (!frame_control) break;
         float frame_seconds = GetFrameTime();
+        double now = GetTime();
+        int window_focused = IsWindowFocused();
+        if (window_focused != was_window_focused) {
+            world_mouse_velocity_reset(&mouse_velocity, now);
+            if (window_focused && !paused) {
+                DisableCursor();
+                suppress_mouse_frames = 2;
+            }
+            was_window_focused = window_focused;
+        }
         int pause_toggled = IsKeyPressed(KEY_ESCAPE);
         if (pause_toggled) {
             paused = !paused;
+            world_mouse_velocity_reset(&mouse_velocity, now);
             if (paused) {
                 EnableCursor();
             } else {
@@ -1617,6 +1624,7 @@ int main(int argc, char **argv) {
                 memset(shared.control, 0, (size_t)shared.ctrl_dim * sizeof(float));
                 world_mutex_unlock(&shared.mutex);
                 paused = 0;
+                world_mouse_velocity_reset(&mouse_velocity, now);
                 DisableCursor();
                 suppress_mouse_frames = 2;
             }
@@ -1627,6 +1635,15 @@ int main(int argc, char **argv) {
             frame_control[0] = 0.0f;
             frame_control[1] = 0.0f;
             suppress_mouse_frames -= 1;
+        }
+        if (!window_focused || paused) {
+            memset(frame_control, 0, (size_t)ctrl_dim * sizeof(float));
+            world_mouse_velocity_reset(&mouse_velocity, now);
+        } else {
+            world_mouse_velocity_update(
+                &mouse_velocity, frame_control[0], frame_control[1], frame_seconds, now);
+            frame_control[0] = mouse_velocity.x;
+            frame_control[1] = mouse_velocity.y;
         }
         float hud_follow = 1.0f - expf(-fminf(frame_seconds, 0.1f) * 22.0f);
         hud_mouse_x += (frame_control[0] - hud_mouse_x) * hud_follow;

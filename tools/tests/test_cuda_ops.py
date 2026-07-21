@@ -293,6 +293,12 @@ def test_rms_norm_matches_torch(wm_cuda):
     ref = F.rms_norm(x, (x.shape[-1],), eps=1.0e-6)
     torch.testing.assert_close(y, ref, rtol=2e-6, atol=2e-6)
 
+def test_rms_norm_default_matches_torch_for_tiny_controller_values(wm_cuda):
+    x = torch.linspace(-3.0e-4, 3.0e-4, 128, device="cuda", dtype=torch.float32)
+    y = wm_cuda.rms_norm(x)
+    ref = F.rms_norm(x, (x.shape[-1],))
+    torch.testing.assert_close(y, ref, rtol=2e-6, atol=2e-6)
+
 def test_ada_rms_norm_matches_world_formula(wm_cuda):
     torch.manual_seed(3)
     b, n, m, d = 2, 3, 5, 96

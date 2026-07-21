@@ -1153,7 +1153,7 @@ extern "C" int world_cuda_runtime_create(
     rt->ctrl_dim = cfg->n_buttons + 3;
     rt->d_xy = rt->d_head / 8;
     rt->d_t = rt->d_head / 4;
-    rt->rms_eps = 1.0e-6f;
+    rt->rms_eps = WORLD_RMS_NORM_EPSILON;
     {
         const char *rms_eps_env = getenv("WORLD_RMS_EPS");
         if (rms_eps_env && rms_eps_env[0]) {
