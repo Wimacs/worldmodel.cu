@@ -10,9 +10,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def find_executable(build_dir: Path, name: str, config: str):
+    suffixes = (".exe", "") if os.name == "nt" else ("", ".exe")
+    for directory in (build_dir / config, build_dir):
+        for suffix in suffixes:
+            candidate = directory / f"{name}{suffix}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=REPO_ROOT / "build")
+    parser.add_argument("--config", default="Release", help="multi-config CMake configuration")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--vae-weights", type=Path)
     parser.add_argument("--steps", type=int, default=4)
@@ -22,9 +33,12 @@ def main() -> int:
     parser.add_argument("runtime_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
-    executable = args.build_dir.resolve() / "worldmodel_raylib"
-    if not executable.exists():
-        parser.error(f"missing executable: {executable}")
+    build_dir = args.build_dir.resolve()
+    executable = find_executable(build_dir, "worldmodel_raylib", args.config)
+    if executable is None:
+        parser.error(
+            f"missing worldmodel_raylib under {build_dir} or {build_dir / args.config}"
+        )
 
     command = [
         str(executable),

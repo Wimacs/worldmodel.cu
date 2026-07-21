@@ -1,4 +1,5 @@
 .torch_extensions/
+.pytest_cache/
 build/
 build*/
 __pycache__/

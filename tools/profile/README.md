@@ -5,6 +5,7 @@ This directory keeps profiling and diagnostic entry points out of the resident r
 - `cuda_runtime.py` enables the runtime's Transformer and VAE CUDA-event regions;
 - `cuda_gemm.cu` benchmarks the production GEMM shapes and CUTLASS variants;
 - `w8a8.cu` validates and benchmarks the experimental W8A8 boundary.
+- `world_cuda_probe_cli.c` and `world_cuda_probe.cu` provide the standalone tensor-dump and parity diagnostic built as `worldmodel_cuda`.
 
 Example end-to-end profile:
 

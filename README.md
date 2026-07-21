@@ -12,6 +12,19 @@ An experimental standalone C/CUDA runtime for [Waypoint 1.5](https://raw.githubu
 
 The runtime uses CUTLASS for GEMM, attention, and convolution kernels. It links only the CUDA runtime, without cuBLAS or cuDNN. CUDA kernels are tested against PyTorch references. The former CUDA/Vulkan implementation is preserved on the `legacy-cuda-vulkan` branch.
 
+## Architecture
+
+The CUDA backend deliberately follows a small, direct execution model instead of a generic graph or tensor framework:
+
+- `src/world_cuda.cu` owns model state, weights, KV caches, scheduling, and the explicit Transformer forward pass. It contains no CUDA kernels or launch syntax.
+- `src/world_cuda_ops.cuh` and `src/world_cuda_ops.cu` provide typed, backend-private Transformer operators over raw device pointers.
+- `src/world_cuda_vae.cuh` and `src/world_cuda_vae.cu` keep VAE state and the explicit encoder/decoder execution order behind a small opaque interface.
+- `src/world_cuda_vae_ops.cuh` and `src/world_cuda_vae_ops.cu` contain the typed VAE layout, convolution, streaming, and pixel-shuffle operators.
+- `src/world_weights.h` and `src/world_weights.c` contain the host-side safetensors/VAE loading shared by the production app and diagnostic tools.
+- `tools/tests/` links its parity extensions directly against the production Transformer and VAE operator translation units; kernels that are not production operators are isolated in the experimental test extension.
+
+There is no generic tensor object, operation enum, graph executor, or backend vtable. This keeps the network flow readable while leaving each CUDA operator easy to profile and replace independently.
+
 ## Performance
 
 Measured on an NVIDIA GeForce RTX 4090 D (48 GiB), NVIDIA driver 610.62, using Windows Release builds. Every run uses all 24 layers, 4 denoising steps, and `--cache-window 8`. A single resident runtime generates 12 consecutive chunks; RGB FPS is the average of the final four full-cache chunks, with four RGB frames emitted per chunk. Peak VRAM is the maximum `nvidia-smi memory.used` increase over the pre-launch baseline, sampled every 100 ms.
@@ -27,7 +40,7 @@ These figures measure backend throughput rather than the interactive window's di
 
 - CMake 3.24+
 - CUDA Toolkit
-- Python 3 for weight downloads and parity tests
+- Python 3 plus PyTorch, pytest, NumPy, safetensors, and PyYAML for parity tests
 - Visual Studio 2022 Build Tools on Windows
 
 ## Setup

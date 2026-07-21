@@ -1,5 +1,6 @@
-#define WORLD_CLI_NO_MAIN
-#include "world_cli.c"
+#define _FILE_OFFSET_BITS 64
+
+#include "world_weights.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -23,6 +24,9 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #ifndef _WIN32
 #include <time.h>
 #endif
@@ -116,7 +120,7 @@ static void world_thread_sleep_millis(unsigned int millis) {
 #endif
 
 typedef struct {
-    WorldModelWeights probe;
+    WorldModelWeights weights;
     WorldLayerWeights *layers;
     float *patchify_weight;
     float *denoise_fc1_weight;
@@ -349,7 +353,7 @@ static void free_loaded_model(LoadedWorldModel *m) {
     free(m->out_norm_fc_weight);
     free(m->unpatchify_weight);
     free(m->unpatchify_bias);
-    free_layer_weights(m->layers, m->probe.n_layers);
+    world_free_layer_weights(m->layers, m->weights.n_layers);
     memset(m, 0, sizeof(*m));
 }
 
@@ -363,7 +367,7 @@ static int ray_load_layer_as_f32(
     char name[256];
     int n = snprintf(name, sizeof(name), "transformer.blocks.%d.%s", layer, suffix);
     if (n < 0 || (size_t)n >= sizeof(name)) return 1;
-    return load_required_as_f32(st, name, shape, ndim, out);
+    return world_load_tensor_as_f32(st, name, shape, ndim, out);
 }
 
 static int ray_load_optional_layer_as_f32(
@@ -381,7 +385,7 @@ static int ray_load_optional_layer_as_f32(
         *out = NULL;
         return 0;
     }
-    return load_required_as_f32(st, name, shape, ndim, out);
+    return world_load_tensor_as_f32(st, name, shape, ndim, out);
 }
 
 static int load_live_model_weights(
@@ -406,14 +410,14 @@ static int load_live_model_weights(
     int64_t kv_proj_shape[2] = {kv_dim, cfg->d_model};
     int64_t unpatch_bias_shape[1] = {cfg->channels};
 
-    if (load_required_as_f32(st, "patchify.weight", patch_shape, 4, &m->patchify_weight)) return 1;
-    if (load_required_as_f32(st, "denoise_step_emb.mlp.fc1.weight", denoise_fc1_shape, 2, &m->denoise_fc1_weight)) return 1;
-    if (load_required_as_f32(st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &m->denoise_fc2_weight)) return 1;
-    if (load_required_as_f32(st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &m->ctrl_emb_fc1_weight)) return 1;
-    if (load_required_as_f32(st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &m->ctrl_emb_fc2_weight)) return 1;
-    if (load_required_as_f32(st, "out_norm.fc.weight", out_norm_shape, 2, &m->out_norm_fc_weight)) return 1;
-    if (load_required_as_f32(st, "unpatchify.weight", patch_shape, 4, &m->unpatchify_weight)) return 1;
-    if (load_required_as_f32(st, "unpatchify.bias", unpatch_bias_shape, 1, &m->unpatchify_bias)) return 1;
+    if (world_load_tensor_as_f32(st, "patchify.weight", patch_shape, 4, &m->patchify_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "denoise_step_emb.mlp.fc1.weight", denoise_fc1_shape, 2, &m->denoise_fc1_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "denoise_step_emb.mlp.fc2.weight", denoise_fc2_shape, 2, &m->denoise_fc2_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "ctrl_emb.mlp.fc1.weight", ctrl_emb_fc1_shape, 2, &m->ctrl_emb_fc1_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "ctrl_emb.mlp.fc2.weight", ctrl_emb_fc2_shape, 2, &m->ctrl_emb_fc2_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "out_norm.fc.weight", out_norm_shape, 2, &m->out_norm_fc_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "unpatchify.weight", patch_shape, 4, &m->unpatchify_weight)) return 1;
+    if (world_load_tensor_as_f32(st, "unpatchify.bias", unpatch_bias_shape, 1, &m->unpatchify_bias)) return 1;
 
     m->layers = (WorldLayerWeights *)calloc((size_t)layers_to_run, sizeof(*m->layers));
     if (!m->layers) return 1;
@@ -439,16 +443,16 @@ static int load_live_model_weights(
         if (ray_load_layer_as_f32(st, layer, "dit_mlp.fc2.weight", denoise_fc2_shape, 2, (float **)&lw->dit_mlp_fc2_weight)) return 1;
     }
 
-    m->probe.patchify_weight = m->patchify_weight;
-    m->probe.denoise_fc1_weight = m->denoise_fc1_weight;
-    m->probe.denoise_fc2_weight = m->denoise_fc2_weight;
-    m->probe.ctrl_emb_fc1_weight = m->ctrl_emb_fc1_weight;
-    m->probe.ctrl_emb_fc2_weight = m->ctrl_emb_fc2_weight;
-    m->probe.layers = m->layers;
-    m->probe.n_layers = layers_to_run;
-    m->probe.out_norm_fc_weight = m->out_norm_fc_weight;
-    m->probe.unpatchify_weight = m->unpatchify_weight;
-    m->probe.unpatchify_bias = m->unpatchify_bias;
+    m->weights.patchify_weight = m->patchify_weight;
+    m->weights.denoise_fc1_weight = m->denoise_fc1_weight;
+    m->weights.denoise_fc2_weight = m->denoise_fc2_weight;
+    m->weights.ctrl_emb_fc1_weight = m->ctrl_emb_fc1_weight;
+    m->weights.ctrl_emb_fc2_weight = m->ctrl_emb_fc2_weight;
+    m->weights.layers = m->layers;
+    m->weights.n_layers = layers_to_run;
+    m->weights.out_norm_fc_weight = m->out_norm_fc_weight;
+    m->weights.unpatchify_weight = m->unpatchify_weight;
+    m->weights.unpatchify_bias = m->unpatchify_bias;
     return 0;
 }
 
@@ -848,7 +852,7 @@ static int ray_write_ppm_frames(
     size_t frame_bytes = (size_t)width * height * bytes_per_pixel;
     if (ray_write_ppm(path, pixels, width, height, bytes_per_pixel)) return 1;
     for (int i = 0; i < frame_count; ++i) {
-        char frame_path[PATH_BUF];
+        char frame_path[WORLD_PATH_MAX];
         if (ray_make_frame_path(frame_path, sizeof(frame_path), path, i)) return 1;
         if (ray_write_ppm(frame_path, pixels + (size_t)i * frame_bytes, width, height, bytes_per_pixel)) return 1;
     }
@@ -1035,7 +1039,7 @@ int main(int argc, char **argv) {
     int noise_mode = WORLD_NOISE_NORMAL;
     int positional_model_seen = 0;
     int positional_image_seen = 0;
-    char positional_model_dir[PATH_BUF];
+    char positional_model_dir[WORLD_PATH_MAX];
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
@@ -1133,24 +1137,24 @@ int main(int argc, char **argv) {
 
     ray_enable_default_cuda_fmha();
 
-    char config_path[PATH_BUF];
-    char default_weights[PATH_BUF];
-    char default_vae_weights[PATH_BUF];
-    char model_parent[PATH_BUF];
-    char sibling_model_dir[PATH_BUF];
-    char sibling_vae_weights[PATH_BUF];
-    if (join_path(config_path, sizeof(config_path), model_dir, "config.yaml")) return 1;
+    char config_path[WORLD_PATH_MAX];
+    char default_weights[WORLD_PATH_MAX];
+    char default_vae_weights[WORLD_PATH_MAX];
+    char model_parent[WORLD_PATH_MAX];
+    char sibling_model_dir[WORLD_PATH_MAX];
+    char sibling_vae_weights[WORLD_PATH_MAX];
+    if (world_path_join(config_path, sizeof(config_path), model_dir, "config.yaml")) return 1;
     if (!weights) {
-        if (join_path(default_weights, sizeof(default_weights), model_dir, "model.safetensors")) return 1;
+        if (world_path_join(default_weights, sizeof(default_weights), model_dir, "model.safetensors")) return 1;
         weights = default_weights;
     }
     if (!vae_weights) {
-        if (join_path(default_vae_weights, sizeof(default_vae_weights), model_dir, "vae/diffusion_pytorch_model.safetensors")) return 1;
+        if (world_path_join(default_vae_weights, sizeof(default_vae_weights), model_dir, "vae/diffusion_pytorch_model.safetensors")) return 1;
         if (ray_file_exists(default_vae_weights)) {
             vae_weights = default_vae_weights;
         } else if (!ray_dirname(model_parent, sizeof(model_parent), model_dir) &&
-                   !join_path(sibling_model_dir, sizeof(sibling_model_dir), model_parent, "Waypoint-1.5-1B") &&
-                   !join_path(sibling_vae_weights, sizeof(sibling_vae_weights), sibling_model_dir,
+                   !world_path_join(sibling_model_dir, sizeof(sibling_model_dir), model_parent, "Waypoint-1.5-1B") &&
+                   !world_path_join(sibling_vae_weights, sizeof(sibling_vae_weights), sibling_model_dir,
                               "vae/diffusion_pytorch_model.safetensors") &&
                    ray_file_exists(sibling_vae_weights)) {
             vae_weights = sibling_vae_weights;
@@ -1238,7 +1242,7 @@ int main(int argc, char **argv) {
     int vae_image_w = cfg.width * cfg.patch_w * 16;
     int vae_image_h = cfg.height * cfg.patch_h * 16;
     if (seed_latent_path) {
-        if (read_f32_file_exact(seed_latent_path, seed_latent_elems, &seed_latent)) goto cleanup_before_window;
+        if (world_read_f32_file_exact(seed_latent_path, seed_latent_elems, &seed_latent)) goto cleanup_before_window;
         fprintf(stderr, "loaded seed latent: %s elems=%zu\n", seed_latent_path, seed_latent_elems);
     }
     if (seed_image_path) {
@@ -1252,8 +1256,8 @@ int main(int argc, char **argv) {
     if (load_live_model_weights(&st, &cfg, layers_to_run, &model)) goto cleanup_before_window;
     safetensors_close(&st);
     memset(&st, 0, sizeof(st));
-    if (load_vae_decoder_weights(vae_weights, &vae)) goto cleanup_before_window;
-    if (load_vae_encoder_weights(vae_weights, &vae_encoder)) goto cleanup_before_window;
+    if (world_load_vae_decoder_weights(vae_weights, &vae)) goto cleanup_before_window;
+    if (world_load_vae_encoder_weights(vae_weights, &vae_encoder)) goto cleanup_before_window;
 
     int ctrl_dim = cfg.n_buttons + 3;
     float *seed_control = (float *)calloc((size_t)ctrl_dim, sizeof(float));
@@ -1290,7 +1294,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "prewarming %s runtime for %d chunk(s) on a temporary state; displayed runtime will be reset\n",
                 WORLD_RAYLIB_BACKEND_NAME, warmup_chunks);
-        if (world_cuda_runtime_create(&prewarm_rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+        if (world_cuda_runtime_create(&prewarm_rt, &cfg, &model.weights, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
             free(seed_control);
             free(warm_control);
             goto cleanup_before_window;
@@ -1359,7 +1363,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "creating resident %s runtime\n", WORLD_RAYLIB_BACKEND_NAME);
-    if (world_cuda_runtime_create(&rt, &cfg, &model.probe, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
+    if (world_cuda_runtime_create(&rt, &cfg, &model.weights, layers_to_run, steps_to_run, frame_idx, seed, noise_mode, &vae)) {
         free(seed_control);
         free(warm_control);
         goto cleanup_before_window;
@@ -1382,8 +1386,8 @@ int main(int argc, char **argv) {
                 encoder_seconds * 1000.0f);
     }
     free_loaded_model(&model);
-    free_vae_decoder_weights(&vae);
-    free_vae_encoder_weights(&vae_encoder);
+    world_free_vae_decoder_weights(&vae);
+    world_free_vae_encoder_weights(&vae_encoder);
 
     if (seed_latent) {
         fprintf(stderr, "seeding runtime KV cache from latent\n");
@@ -1707,8 +1711,8 @@ cleanup_runtime_only:
 cleanup_before_window:
     safetensors_close(&st);
     free_loaded_model(&model);
-    free_vae_decoder_weights(&vae);
-    free_vae_encoder_weights(&vae_encoder);
+    world_free_vae_decoder_weights(&vae);
+    world_free_vae_encoder_weights(&vae_encoder);
     free(seed_image_rgb);
     free(seed_latent);
     world_cuda_runtime_destroy(rt);

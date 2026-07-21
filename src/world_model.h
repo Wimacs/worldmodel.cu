@@ -142,9 +142,6 @@ typedef struct {
     const float *unpatchify_bias;
 } WorldModelWeights;
 
-/* Compatibility name for the standalone diagnostic API. */
-typedef WorldModelWeights WorldModelProbeWeights;
-
 #ifdef __cplusplus
 }
 #endif

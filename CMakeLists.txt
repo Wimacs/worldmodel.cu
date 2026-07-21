@@ -97,27 +97,18 @@ function(world_enable_cutlass target_name)
 endfunction()
 
 add_library(worldmodel_cuda_backend STATIC
+  src/world_config.c
   src/world_cuda.cu
+  src/world_cuda_ops.cu
+  src/world_cuda_vae.cu
+  src/world_cuda_vae_ops.cu
 )
 target_include_directories(worldmodel_cuda_backend PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 world_enable_cutlass(worldmodel_cuda_backend)
 world_enable_cuda_options(worldmodel_cuda_backend)
-target_link_libraries(worldmodel_cuda_backend PUBLIC CUDA::cudart)
-
-add_executable(worldmodel_cuda
-  src/world_cli.c
-  src/world_config.c
-  src/safetensors.c
-)
-target_include_directories(worldmodel_cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(worldmodel_cuda PRIVATE
-  worldmodel_cuda_backend
-  ${WORLD_PLATFORM_LIBS}
-)
-set_property(TARGET worldmodel_cuda PROPERTY LINKER_LANGUAGE CUDA)
-world_enable_large_objects(worldmodel_cuda)
+target_link_libraries(worldmodel_cuda_backend PUBLIC CUDA::cudart ${WORLD_PLATFORM_LIBS})
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt")
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -131,7 +122,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rd/raylib/CMakeLists.txt")
 
   add_executable(worldmodel_raylib
     src/world_raylib.c
-    src/world_config.c
+    src/world_weights.c
     src/safetensors.c
   )
   target_include_directories(worldmodel_raylib PRIVATE

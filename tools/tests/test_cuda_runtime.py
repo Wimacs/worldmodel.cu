@@ -29,6 +29,16 @@ VAE_DIR = MODEL_DIR / "vae"
 VAE_WEIGHTS_PATH = VAE_DIR / "diffusion_pytorch_model.safetensors"
 
 
+def _find_executable(build_dir, name, config="Release"):
+    suffixes = (".exe", "") if os.name == "nt" else ("", ".exe")
+    for directory in (build_dir / config, build_dir):
+        for suffix in suffixes:
+            candidate = directory / f"{name}{suffix}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _load_config():
     with open(MODEL_DIR / "config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -38,11 +48,34 @@ def _load_config():
 
 
 def _build_executable():
-    subprocess.run(["cmake", "-S", str(ROOT), "-B", str(ROOT / "build"), "-DCMAKE_BUILD_TYPE=Release"], check=True)
-    subprocess.run(["cmake", "--build", str(ROOT / "build"), "-j"], check=True)
-    exe = ROOT / "build" / "worldmodel_cuda"
-    if not exe.exists():
-        raise RuntimeError(f"missing executable: {exe}")
+    subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(ROOT),
+            "-B",
+            str(ROOT / "build"),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DWORLD_BUILD_TOOLS=ON",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "cmake",
+            "--build",
+            str(ROOT / "build"),
+            "--config",
+            "Release",
+            "-j",
+            "--target",
+            "worldmodel_cuda",
+        ],
+        check=True,
+    )
+    exe = _find_executable(ROOT / "build", "worldmodel_cuda")
+    if exe is None:
+        raise RuntimeError(f"missing worldmodel_cuda under {ROOT / 'build'}")
     return exe
 
 

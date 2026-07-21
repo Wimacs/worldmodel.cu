@@ -18,6 +18,24 @@ if(BUILD_TESTING)
 endif()
 
 if(WORLD_BUILD_TOOLS)
+  add_executable(worldmodel_cuda
+    profile/world_cuda_probe_cli.c
+    profile/world_cuda_probe.cu
+    ${PROJECT_SOURCE_DIR}/src/world_weights.c
+    ${PROJECT_SOURCE_DIR}/src/safetensors.c
+  )
+  target_include_directories(worldmodel_cuda PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/profile
+  )
+  target_link_libraries(worldmodel_cuda PRIVATE
+    worldmodel_cuda_backend
+    ${WORLD_PLATFORM_LIBS}
+  )
+  set_property(TARGET worldmodel_cuda PROPERTY LINKER_LANGUAGE CUDA)
+  set_property(TARGET worldmodel_cuda PROPERTY RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  world_enable_cuda_options(worldmodel_cuda)
+
   add_executable(worldmodel_cuda_gemm_probe profile/cuda_gemm.cu)
   world_enable_cutlass(worldmodel_cuda_gemm_probe)
   world_enable_cuda_options(worldmodel_cuda_gemm_probe)

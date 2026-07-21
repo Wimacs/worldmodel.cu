@@ -21,6 +21,16 @@ DEFAULT_VAE = WORKSPACE / "Waypoint-1.5-1B" / "vae"
 DEFAULT_IMAGE = WORKSPACE / "lingbot-world-v2" / "examples" / "02" / "image.jpg"
 
 
+def _find_executable(build_dir, name, config="Release"):
+    suffixes = (".exe", "") if os.name == "nt" else ("", ".exe")
+    for directory in (build_dir / config, build_dir):
+        for suffix in suffixes:
+            candidate = directory / f"{name}{suffix}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _fixture_path(env_name, default):
     return Path(os.environ.get(env_name, default))
 
@@ -40,10 +50,32 @@ def test_native_cuda_vae_encoder_matches_pytorch(tmp_path):
             raise RuntimeError(f"missing integration fixture: {path}")
 
     subprocess.run(
-        ["cmake", "--build", str(ROOT / "build"), "-j2", "--target", "worldmodel_raylib"],
+        [
+            "cmake",
+            "-S",
+            str(ROOT),
+            "-B",
+            str(ROOT / "build"),
+            "-DCMAKE_BUILD_TYPE=Release",
+        ],
         check=True,
     )
-    executable = ROOT / "build" / "worldmodel_raylib"
+    subprocess.run(
+        [
+            "cmake",
+            "--build",
+            str(ROOT / "build"),
+            "--config",
+            "Release",
+            "-j2",
+            "--target",
+            "worldmodel_raylib",
+        ],
+        check=True,
+    )
+    executable = _find_executable(ROOT / "build", "worldmodel_raylib")
+    if executable is None:
+        raise RuntimeError(f"missing worldmodel_raylib under {ROOT / 'build'}")
     input_dump = tmp_path / "vae_input.f32"
     latent_dump = tmp_path / "vae_latent.f32"
     output_path = tmp_path / "frame.ppm"
